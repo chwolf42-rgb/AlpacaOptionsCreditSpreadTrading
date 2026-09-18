@@ -87,11 +87,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     log = logging.getLogger("alpaca_options_credit")
     log.info(
-        "cmd=%s dry_run=%s fixture=%s timeframe=%s",
+        "cmd=%s dry_run=%s fixture=%s structure_bar=%s timing_bar=%s",
         cmd,
         dry_run,
         fixture,
-        (cfg.get("timeframe") or {}).get("bar", "1Hour"),
+        (cfg.get("timeframe") or {}).get("structure_bar", "1Day"),
+        (cfg.get("timeframe") or {}).get("timing_bar", "1Hour"),
     )
 
     try:

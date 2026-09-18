@@ -20,11 +20,25 @@ log = logging.getLogger(__name__)
 def _timeframe(bar: str):
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
+    if bar in ("1Day", "1D", "Day", "daily"):
+        return TimeFrame(1, TimeFrameUnit.Day)
     if bar in ("1Hour", "1H", "60Min"):
         return TimeFrame(1, TimeFrameUnit.Hour)
     if bar in ("30Min", "30T"):
         return TimeFrame(30, TimeFrameUnit.Minute)
-    raise ValueError(f"unsupported timeframe {bar!r} — use 1Hour or 30Min")
+    raise ValueError(f"unsupported timeframe {bar!r} — use 1Day, 1Hour, or 30Min")
+
+
+def _bars_start(timeframe: str, limit: int, end: datetime) -> datetime:
+    """Lookback window long enough for daily VP (~20–30 sessions) or 1H timing."""
+    tf = str(timeframe)
+    if tf in ("1Day", "1D", "Day", "daily"):
+        return end - timedelta(days=max(limit * 3, 90))
+    if tf in ("1Hour", "1H", "60Min"):
+        return end - timedelta(days=max(21, (limit // 6) + 3))
+    if tf in ("30Min", "30T"):
+        return end - timedelta(days=max(14, (limit // 12) + 3))
+    return end - timedelta(days=30)
 
 
 class AlpacaBroker:
@@ -133,7 +147,7 @@ class AlpacaMarketData:
         feed_name = (self.cfg.get("market_data") or {}).get("stock_feed", "iex")
         feed = DataFeed.IEX if str(feed_name).lower() == "iex" else DataFeed.SIP
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=30)
+        start = _bars_start(timeframe, limit, end)
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=_timeframe(timeframe),

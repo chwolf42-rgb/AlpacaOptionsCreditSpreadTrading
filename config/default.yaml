@@ -12,22 +12,28 @@ bot:
   var_dir: var/options
   log_level: INFO
 
-# Higher-timeframe entry work. Pick ONE and keep it.
-# Default: 1Hour — slower structure, fewer fake arms than 30Min.
-# Set to 30Min if you want more frequent confirms (noisier).
+# Locked playbook: daily + 1Hour hybrid. Not 1H-only and not 30Min.
+# Daily owns trend bias (strict HH/HL or LL/LH), VP shelf, S/R, invalidation.
+# 1Hour only times the first pullback into the *daily* zone and reconfirms trend.
+# 1H dips do not cancel an arm; only a daily close through invalidation does.
 timeframe:
-  bar: 1Hour          # 1Hour | 30Min
+  structure_bar: 1Day     # bias / VP / S/R / invalidation
+  timing_bar: 1Hour       # pullback timing + 1H trend reconfirm
   swing_left: 2
   swing_right: 2
   atr_period: 14
-  # Do not chase: skip entry if price is extended this many ATRs past the zone.
+  # Skip entry if last 1H close is extended this many *daily* ATRs past the zone.
   no_chase_atr: 0.5
   volume_profile:
-    lookback_bars: 80
+    # Daily sessions (not 1H bars). Locked lookback is ~20–30 sessions.
+    lookback_bars: 25
     bin_size: 0.50          # dollars; raise for indexes if shelves are too tight
     hvn_percentile: 0.70    # bins at/above this volume percentile are HVN
-  # Arm dies only on a structure-break close through invalidation — not on a dip.
-  arm_timeout_bars: 24      # ~1–2 sessions on 1Hour
+  # Counted in *daily structure bars* after confirm_index — not 1H bars and
+  # not calendar days. Keep market_data.daily_bar_lookback larger than this
+  # so the confirm bar stays in the fetch window (a sliding window would
+  # shift the stored index). 10 daily bars ≈ two trading weeks.
+  arm_timeout_bars: 10
 
 universe:
   file: config/universe.yaml
@@ -91,7 +97,8 @@ market_data:
   stock_feed: iex
   # Option snapshots: indicative works without OPRA; opra needs a subscription.
   options_feed: indicative
-  bar_lookback: 120
+  bar_lookback: 120           # 1Hour timing bars
+  daily_bar_lookback: 60      # daily structure / VP / invalidation
 
 broker:
   paper_only: true

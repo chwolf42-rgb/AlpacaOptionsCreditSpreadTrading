@@ -13,9 +13,9 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Structures | bull put credit + bear call credit only |
 | Day-1 universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA |
 | Full A (57) | See [`config/universe.yaml`](config/universe.yaml); switch with `universe.active` |
-| Higher TF | **1Hour** (config can switch to 30Min) |
-| Entry | strict confirm → arm → **first pullback** into VP shelf **or** S/R while structure holds; **no chase** |
-| Cancel arm | structure-break **close** through invalidation; normal dips do **not** cancel |
+| Higher TF | **Daily + 1Hour hybrid** (locked; not 1H-only) |
+| Entry | daily strict confirm → arm → **first 1H pullback** into the *daily* VP shelf **or** daily S/R, then **1H reconfirm** of the daily trend; **no chase** |
+| Cancel arm | **daily** structure-break **close** through invalidation; 1H dips do **not** cancel |
 | Short strike | at/just beyond equity-style invalidation, rounded to a listed strike (not far-OTM lottery) |
 | Width | `$5.00` (or `$2.50`) |
 | DTE | 30–45 |
@@ -27,6 +27,16 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Size | max loss = width×100 − credit×100; ~0.5% of equity; one spread per underlying |
 
 Exits are **options-native** (fraction of credit). This is not the equity R-ladder.
+
+## Timeframe (locked: daily + 1Hour hybrid)
+
+Daily bars own **trend bias** (strict HH/HL or LL/LH), the **VP shelf**, and the **S/R zone / invalidation**. 1Hour bars only **time** the entry: wait for the first pullback into that daily shelf or daily S/R while daily structure still holds, then require a 1H reconfirm of the daily trend (same-side HH/HL or LL/LH, last 1H turning with the trend). Do not chase an extended 1H print.
+
+1H dips do **not** cancel an arm. Only a **daily** close through invalidation does. `timeframe.arm_timeout_bars` is counted in **daily structure bars** after confirm (not 1H bars, not calendar days). Daily VP lookback is ~20–30 sessions (`timeframe.volume_profile.lookback_bars`).
+
+Journal reasons: `daily_not_confirmed`, `waiting_1h_pullback`, `1h_reconfirm_failed`, `chase`, `daily_structure_break`.
+
+Credit-spread construction (bull put / bear call, 30–45 DTE) and options-native exits are unchanged. Observer / dry-run still places **zero** orders.
 
 ## Universe (config swap, not a code change)
 
@@ -134,8 +144,8 @@ Investigated against current **alpaca-py** + Trading API:
 pytest
 ```
 
-Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, observer places no orders, max-loss sizing, and one-spread-per-underlying.
+Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, observer places no orders, max-loss sizing, one-spread-per-underlying, and the daily + 1H hybrid entry path.
 
 ## Config
 
-See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, and the 1Hour vs 30Min switch live there.
+See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, and the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`) live there.
