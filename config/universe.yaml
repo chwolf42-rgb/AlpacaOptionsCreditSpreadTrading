@@ -1,0 +1,79 @@
+# Liquidity tiers for this options paper sleeve.
+# Switch with universe.active in config/default.yaml (day1 | full_a).
+# No code change required.
+#
+# Day-1 stays the 10 megas/indexes. Flip to full_a within 2–3 days of
+# arming — not a long soak. Raise risk.max_concurrent toward 20+ then.
+
+tiers:
+  day1:
+    - SPY
+    - QQQ
+    - IWM
+    - AAPL
+    - MSFT
+    - NVDA
+    - AMZN
+    - META
+    - GOOGL
+    - TSLA
+
+  # Full liquidity tier A (57 names). Locked list.
+  full_a:
+    - AAPL
+    - AMZN
+    - AVGO
+    - GLD
+    - GOOGL
+    - IWM
+    - NFLX
+    - NVDA
+    - ORCL
+    - SLV
+    - TLT
+    - XOM
+    - QQQ
+    - TSLA
+    - SPY
+    - NOW
+    - SMH
+    - AMD
+    - META
+    - XLF
+    - XLE
+    - MSFT
+    - AMAT
+    - NKE
+    - C
+    - BAC
+    - QCOM
+    - PEP
+    - CRM
+    - UNH
+    - JPM
+    - BA
+    - HYG
+    - KRE
+    - MCD
+    - OXY
+    - DIA
+    - WMT
+    - CSCO
+    - FCX
+    - PFE
+    - WFC
+    - EEM
+    - T
+    - CVX
+    - NEM
+    - PG
+    - VZ
+    - XLU
+    - CMCSA
+    - XOP
+    - KO
+    - PANW
+    - SLB
+    - XBI
+    - XLK
+    - ADBE

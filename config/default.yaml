@@ -1,0 +1,122 @@
+# AlpacaOptionsCreditSpreadTrading — default knobs.
+# This is a sibling paper system to AlpacaTradingBots (equity) and
+# AlpacaCryptoTrading (crypto). Do not point journal/heartbeat paths
+# at those repos. Dedicated Alpaca paper account when keys arrive.
+
+bot:
+  name: alpaca-options-credit
+  # Observer / dry-run: same signals + proposed strikes/credits, zero orders.
+  # CLI --dry-run / `observe` overrides this to true.
+  dry_run: true
+  # Isolated runtime dir (heartbeat + sqlite). Never share with equity/crypto.
+  var_dir: var/options
+  log_level: INFO
+
+# Higher-timeframe entry work. Pick ONE and keep it.
+# Default: 1Hour — slower structure, fewer fake arms than 30Min.
+# Set to 30Min if you want more frequent confirms (noisier).
+timeframe:
+  bar: 1Hour          # 1Hour | 30Min
+  swing_left: 2
+  swing_right: 2
+  atr_period: 14
+  # Do not chase: skip entry if price is extended this many ATRs past the zone.
+  no_chase_atr: 0.5
+  volume_profile:
+    lookback_bars: 80
+    bin_size: 0.50          # dollars; raise for indexes if shelves are too tight
+    hvn_percentile: 0.70    # bins at/above this volume percentile are HVN
+  # Arm dies only on a structure-break close through invalidation — not on a dip.
+  arm_timeout_bars: 24      # ~1–2 sessions on 1Hour
+
+universe:
+  file: config/universe.yaml
+  # day1 (10 megas/indexes) | full_a (57-name liquidity tier A).
+  # List swap only — no code change. Day-1 stays the 10 until you flip this.
+  # After arming: set active to full_a within 2–3 days (not a long soak),
+  # and raise risk.max_concurrent toward 20+.
+  active: day1
+
+structures:
+  # Locked playbook: these two credit spreads only.
+  allow:
+    - bull_put_credit     # bullish
+    - bear_call_credit    # bearish
+
+spreads:
+  width: 5.00                 # 2.50 or 5.00
+  dte_min: 30
+  dte_max: 45
+  min_credit_pct_of_width: 0.20   # skip if credit < ~20% of width
+  # Conservative fillable credit = short bid − long ask (not mid).
+  credit_from: natural
+  multiplier: 100
+  # Alpaca mleg limit_price is signed: negative = credit received.
+  # Entries use day TIF; options extended_hours is always false.
+  time_in_force: day
+
+exits:
+  # Options-native — NOT an equity R-multiple ladder.
+  take_profit_frac_of_credit: 0.50   # TP when debit-to-close <= 50% of credit
+  stop_multiple_of_credit: 2.0       # stop when debit-to-close >= 2× credit
+  # Stop also fires on underlying structure break (whichever first).
+  honor_structure_break: true
+  # Roll/repair stub: default is CLOSE. Flip execute only when thesis+DTE say roll.
+  roll:
+    enabled: false
+    execute: false              # scaffold never rolls unless this is true
+    min_dte_to_consider: 21
+    require_thesis_intact: true
+    note: "Close unless thesis holds AND DTE >= min_dte_to_consider AND execute is true."
+
+risk:
+  risk_per_trade_pct: 0.005     # ~0.5% of equity, sized by max loss
+  # max loss per spread = (width × multiplier) − (credit × multiplier)
+  max_concurrent: 8             # day-1 cap; raise toward 20+ when universe.active: full_a
+  max_portfolio_risk_pct: 0.10  # sum of open max-loss / equity
+  one_spread_per_underlying: true
+  # Used when the account cannot be fetched (observer --fixture).
+  paper_equity_fallback: 100000
+
+calendar:
+  # Earnings / FOMC skip. Fill config/calendar.yaml; empty = no skip.
+  file: config/calendar.yaml
+  skip_earnings: true
+  earnings_blackout_days: 3     # skip if earnings within N days of now or expiry
+  skip_fomc: true
+  fomc_blackout_days: 1
+
+market_data:
+  # Stock bars: iex is the free paper feed; sip needs a paid data plan.
+  stock_feed: iex
+  # Option snapshots: indicative works without OPRA; opra needs a subscription.
+  options_feed: indicative
+  bar_lookback: 120
+
+broker:
+  paper_only: true
+  # Encapsulated mleg: order_class=mleg, 2 legs, position_intent set.
+  # See README "Alpaca API notes".
+
+heartbeat:
+  # Engine writes var/options/heartbeat.json every loop (RTH and off-hours).
+  file: heartbeat.json
+  interval_seconds: 15
+  # US equity options RTH: 9:30–16:00 America/New_York. No extended-hours options.
+  stale_after_seconds_rth: 90
+  # Off-hours the child still heartbeats with status=idle_off_hours.
+  stale_after_seconds_off_hours: 600
+  supervise_poll_seconds: 5
+  restart_backoff_seconds: [2, 5, 15, 30]
+
+rth:
+  timezone: America/New_York
+  open: "09:30"
+  close: "16:00"
+  # Scan only during RTH (exits still evaluated if a spread is open).
+  scan_only_rth: true
+  manage_exits_off_hours: false   # equity options do not trade off RTH
+
+loop:
+  sleep_seconds_rth: 30
+  sleep_seconds_off_hours: 60

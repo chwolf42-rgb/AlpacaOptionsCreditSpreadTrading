@@ -1,0 +1,11 @@
+# Event calendar stub — fill when the paper account is live.
+# Engine skips new entries (not exits) when a blackout applies.
+
+# FOMC decision days (UTC dates). skip_fomc uses fomc_blackout_days in default.yaml.
+fomc: []
+  # - 2026-11-04
+
+# Per-underlying earnings dates (YYYY-MM-DD).
+earnings: {}
+  # AAPL: ["2026-10-30"]
+  # NVDA: []

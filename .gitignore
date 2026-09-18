@@ -1,0 +1,28 @@
+# Secrets and local runtime — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime journals / heartbeats (this bot only; do not share with equity/crypto)
+var/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor
+.idea/
+.vscode/
+*.swp
