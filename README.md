@@ -12,6 +12,7 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | --- | --- |
 | Structures | bull put credit + bear call credit only |
 | Day-1 universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA |
+| Full A (57) | See [`config/universe.yaml`](config/universe.yaml); switch with `universe.active` |
 | Higher TF | **1Hour** (config can switch to 30Min) |
 | Entry | strict confirm → arm → **first pullback** into VP shelf **or** S/R while structure holds; **no chase** |
 | Cancel arm | structure-break **close** through invalidation; normal dips do **not** cancel |
@@ -27,7 +28,24 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 
 Exits are **options-native** (fraction of credit). This is not the equity R-ladder.
 
-Full-sleeve target is ~57 liquid “A” names and **20+ concurrent** spreads. Day-1 keeps the 10 names above and `risk.max_concurrent: 8`. Enable `universe.load_extra_universe` and raise the cap when chains/sizing are proven (`config/universe_a_stub.yaml`).
+## Universe (config swap, not a code change)
+
+Lists live in [`config/universe.yaml`](config/universe.yaml) as two tiers:
+
+| `universe.active` | Names | When |
+| --- | --- | --- |
+| `day1` (default) | 10 megas/indexes: SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA | Ship and arm on this sleeve |
+| `full_a` | 57 liquid A names (AAPL … ADBE, including GLD/SLV/TLT and the sector ETFs) | **Within 2–3 days of arming — not a long soak** |
+
+Flip in [`config/default.yaml`](config/default.yaml):
+
+```yaml
+universe:
+  file: config/universe.yaml
+  active: day1    # → full_a
+```
+
+When switching to `full_a`, raise `risk.max_concurrent` toward **20+**. No Python changes.
 
 ## Observe vs supervise vs paper
 

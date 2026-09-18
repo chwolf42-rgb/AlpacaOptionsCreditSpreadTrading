@@ -30,21 +30,12 @@ timeframe:
   arm_timeout_bars: 24      # ~1–2 sessions on 1Hour
 
 universe:
-  # Day-1 sleeve. Expand via config/universe_a_stub.yaml later (~57 liquid A names).
-  # Target 20+ concurrent when the full sleeve is live (see risk.max_concurrent).
-  symbols:
-    - SPY
-    - QQQ
-    - IWM
-    - AAPL
-    - MSFT
-    - NVDA
-    - AMZN
-    - META
-    - GOOGL
-    - TSLA
-  extra_universe_file: config/universe_a_stub.yaml  # ignored until enabled
-  load_extra_universe: false
+  file: config/universe.yaml
+  # day1 (10 megas/indexes) | full_a (57-name liquidity tier A).
+  # List swap only — no code change. Day-1 stays the 10 until you flip this.
+  # After arming: set active to full_a within 2–3 days (not a long soak),
+  # and raise risk.max_concurrent toward 20+.
+  active: day1
 
 structures:
   # Locked playbook: these two credit spreads only.
@@ -81,7 +72,7 @@ exits:
 risk:
   risk_per_trade_pct: 0.005     # ~0.5% of equity, sized by max loss
   # max loss per spread = (width × multiplier) − (credit × multiplier)
-  max_concurrent: 8             # day-1 cap; raise toward 20+ with full A-sleeve
+  max_concurrent: 8             # day-1 cap; raise toward 20+ when universe.active: full_a
   max_portfolio_risk_pct: 0.10  # sum of open max-loss / equity
   one_spread_per_underlying: true
   # Used when the account cannot be fetched (observer --fixture).

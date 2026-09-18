@@ -41,18 +41,30 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     cfg = load_yaml(cfg_path)
     cfg["_config_path"] = str(cfg_path)
     cfg["_repo_root"] = str(root)
-    extra = cfg.get("universe", {}).get("extra_universe_file")
-    if extra and cfg.get("universe", {}).get("load_extra_universe"):
-        extra_path = Path(extra)
-        if not extra_path.is_absolute():
-            extra_path = root / extra_path
-        extra_cfg = load_yaml(extra_path)
-        extra_syms = extra_cfg.get("symbols") or []
-        cfg.setdefault("universe", {}).setdefault("symbols", [])
-        for s in extra_syms:
-            if s not in cfg["universe"]["symbols"]:
-                cfg["universe"]["symbols"].append(s)
+    _apply_universe(cfg, root)
     return cfg
+
+
+def _apply_universe(cfg: dict[str, Any], root: Path) -> None:
+    """Resolve universe.symbols from config/universe.yaml tiers (day1 | full_a)."""
+    uni = cfg.setdefault("universe", {})
+    uni_file = uni.get("file")
+    if not uni_file:
+        return
+    path = Path(uni_file)
+    if not path.is_absolute():
+        path = root / path
+    data = load_yaml(path)
+    tiers = data.get("tiers") or {}
+    active = str(uni.get("active") or data.get("active") or "day1")
+    if active not in tiers:
+        raise ConfigError(
+            f"universe.active={active!r} is not a tier in {path} "
+            f"(have {sorted(tiers)})"
+        )
+    uni["active"] = active
+    uni["symbols"] = list(tiers[active])
+
 
 
 def var_dir(cfg: dict[str, Any]) -> Path:

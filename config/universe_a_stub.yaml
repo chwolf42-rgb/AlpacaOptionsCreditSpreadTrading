@@ -1,9 +1,0 @@
-# Expansion stub for ~57 liquid "A" names. Not loaded until
-# universe.load_extra_universe: true in config/default.yaml.
-# Keep day-1 to the 10 names in default.yaml until chains/sizing are proven.
-symbols: []
-  # - AMD
-  # - AVGO
-  # - COST
-  # - NFLX
-  # …add liquid A-names here (target 20+ concurrent when the sleeve is live)
