@@ -44,6 +44,7 @@ def bullish_pullback_bars(symbol: str = "SPY") -> list[Bar]:
             (113.8, 111.5, 112.8, 1_000_000),
             (113.0, 110.5, 111.2, 1_000_000),
             (110.8, 108.6, 109.0, 1_200_000),
+            (110.5, 108.8, 110.1, 1_100_000),
         ]
     )
     return [
@@ -94,6 +95,8 @@ class FixtureMarketData:
         self._bars = {s: bullish_pullback_bars(s) for s in symbols}
 
     def bars(self, symbol: str, timeframe: str, limit: int) -> list[Bar]:
+        # Same synthetic geometry on daily and 1H so observe --fixture is
+        # deterministic; the engine still runs the hybrid path on both fetches.
         data = self._bars.get(symbol) or bullish_pullback_bars(symbol)
         return data[-limit:]
 

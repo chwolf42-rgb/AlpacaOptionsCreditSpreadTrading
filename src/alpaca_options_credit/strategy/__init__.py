@@ -8,12 +8,16 @@ from alpaca_options_credit.strategy.spreads import (
 from alpaca_options_credit.strategy.structure import (
     confirm_and_zone,
     first_pullback,
+    hybrid_entry,
     structure_broken,
+    timing_reconfirm,
 )
 
 __all__ = [
     "confirm_and_zone",
     "first_pullback",
+    "hybrid_entry",
+    "timing_reconfirm",
     "structure_broken",
     "pick_short_strike",
     "credit_meets_width_gate",

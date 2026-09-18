@@ -1,15 +1,26 @@
-"""Higher-TF confirm → arm → first pullback. Structure break cancels; dips do not.
+"""Daily confirm → arm → 1H first pullback + 1H reconfirm.
 
-Default timeframe is 1Hour (config). 30Min is supported via the same swing logic.
+Locked hybrid: daily bars own trend bias (strict HH/HL or LL/LH), VP shelf,
+and S/R / invalidation. 1Hour bars only time entry into that daily zone.
+1H dips do not cancel an arm; only a daily close through invalidation does.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from alpaca_options_credit.models import Bar, Side
 from alpaca_options_credit.strategy.volume_profile import hvn_shelves, nearest_shelf
+
+# Journal / log reasons for the hybrid path (locked vocabulary).
+DAILY_NOT_CONFIRMED = "daily_not_confirmed"
+WAITING_1H_PULLBACK = "waiting_1h_pullback"
+RECONFIRM_FAILED = "1h_reconfirm_failed"
+CHASE = "chase"
+DAILY_STRUCTURE_BREAK = "daily_structure_break"
+HYBRID_READY = "first_pullback_1h_reconfirmed"
 
 
 @dataclass
@@ -29,6 +40,7 @@ class StructureView:
     reason: str
     last_close: float
     atr: float
+    confirm_ts: Optional[datetime] = None
 
 
 def atr(bars: list[Bar], period: int = 14) -> float:
@@ -70,11 +82,14 @@ def confirm_and_zone(
     left: int = 2,
     right: int = 2,
     atr_period: int = 14,
-    vp_lookback: int = 80,
+    vp_lookback: int = 25,
     vp_bin: float = 0.5,
     vp_percentile: float = 0.70,
 ) -> StructureView:
-    """Strict confirm: HH+HL (bull) or LL+LH (bear), last close through the break level."""
+    """Strict confirm on the *structure* series (daily): HH+HL or LL+LH.
+
+    Last close through the break level. VP shelf + S/R become the pullback zone.
+    """
     empty = StructureView(
         side=None,
         confirmed=False,
@@ -85,6 +100,7 @@ def confirm_and_zone(
         reason="insufficient_bars",
         last_close=bars[-1].close if bars else 0.0,
         atr=atr(bars, atr_period),
+        confirm_ts=bars[-1].ts if bars else None,
     )
     if len(bars) < left + right + 8:
         return empty
@@ -118,6 +134,7 @@ def confirm_and_zone(
             reason="no_strict_confirm",
             last_close=last.close,
             atr=vol,
+            confirm_ts=last.ts,
         )
 
     # Pullback zone: VP shelf nearest the broken S/R, unioned with that S/R
@@ -136,7 +153,11 @@ def confirm_and_zone(
                 zone_low = min(sr_lo, shelf[0])
                 zone_high = max(sr_hi, shelf[1])
 
-
+    confirm_ts = (
+        bars[chosen.confirm_index].ts
+        if 0 <= chosen.confirm_index < len(bars)
+        else last.ts
+    )
     return StructureView(
         side=chosen.side,
         confirmed=True,
@@ -147,6 +168,7 @@ def confirm_and_zone(
         reason=chosen.reason,
         last_close=last.close,
         atr=vol,
+        confirm_ts=confirm_ts,
     )
 
 
@@ -182,6 +204,7 @@ def _bull_confirm(
         reason="hh_hl_close_above_broken_high",
         last_close=last.close,
         atr=0.0,
+        confirm_ts=bars[max(h2.index, l2.index)].ts,
     )
 
 
@@ -214,6 +237,7 @@ def _bear_confirm(
         reason="ll_lh_close_below_broken_low",
         last_close=last.close,
         atr=0.0,
+        confirm_ts=bars[max(h2.index, l2.index)].ts,
     )
 
 
@@ -232,22 +256,23 @@ def first_pullback(
     *,
     no_chase_atr: float = 0.5,
 ) -> tuple[bool, str]:
-    """True when the first retrace tags the VP/S-R shelf while structure holds.
+    """True when the first retrace tags the daily VP/S-R shelf while in-zone.
 
+    `bars` are the *timing* series (1H). The zone/invalidation come from daily.
     No chase: last close still inside/near the zone, not extended in trend.
+
+    Does not treat a 1H close through invalidation as a cancel — that is a
+    daily-only decision (see hybrid_entry / structure_broken on daily bars).
     """
     if not view.confirmed or view.side is None or view.zone_low is None or view.zone_high is None:
         return False, "not_confirmed"
-    last = bars[-1]
-    if structure_broken(view, last):
-        return False, "structure_break"
 
-    tagged = False
-    after = view.confirm_index
-    for bar in bars[after + 1 :]:
-        if _overlaps_zone(bar, view.zone_low, view.zone_high):
-            tagged = True
-            break
+    last = bars[-1] if bars else None
+    if last is None:
+        return False, "no_pullback_yet"
+
+    after = _bars_after_confirm(bars, view)
+    tagged = any(_overlaps_zone(bar, view.zone_low, view.zone_high) for bar in after)
     if not tagged:
         return False, "no_pullback_yet"
 
@@ -262,6 +287,127 @@ def first_pullback(
 
     # First tag is enough; subsequent tags still allow entry while in zone.
     return True, "first_pullback_into_shelf"
+
+
+def timing_reconfirm(
+    timing_bars: list[Bar],
+    side: Side,
+    *,
+    left: int = 2,
+    right: int = 2,
+) -> tuple[bool, str]:
+    """1H must reprint the daily side (HH+HL or LL+LH) and turn with it.
+
+    Last-close-through-HL/LH is *not* required — that would reject a pullback
+    into the daily zone. A still-dumping (or still-ripping) last 1H print vs
+    the prior close fails so we do not chase the first tag.
+    """
+    if len(timing_bars) < left + right + 8:
+        return False, RECONFIRM_FAILED
+    highs, lows = swing_points(timing_bars, left, right)
+    if len(highs) < 2 or len(lows) < 2:
+        return False, RECONFIRM_FAILED
+    h1, h2 = highs[-2], highs[-1]
+    l1, l2 = lows[-2], lows[-1]
+    last = timing_bars[-1]
+    prev = timing_bars[-2]
+    if side is Side.BULLISH:
+        if not (h2.price > h1.price and l2.price > l1.price):
+            return False, RECONFIRM_FAILED
+        if last.close < prev.close:
+            return False, RECONFIRM_FAILED
+        return True, "1h_reconfirmed"
+    if not (l2.price < l1.price and h2.price < h1.price):
+        return False, RECONFIRM_FAILED
+    if last.close > prev.close:
+        return False, RECONFIRM_FAILED
+    return True, "1h_reconfirmed"
+
+
+def hybrid_entry(
+    structure_bars: list[Bar],
+    timing_bars: list[Bar],
+    *,
+    left: int = 2,
+    right: int = 2,
+    atr_period: int = 14,
+    vp_lookback: int = 25,
+    vp_bin: float = 0.5,
+    vp_percentile: float = 0.70,
+    no_chase_atr: float = 0.5,
+    existing: Optional[StructureView] = None,
+) -> tuple[StructureView, bool, str]:
+    """Daily confirm + 1H first pullback into the daily zone + 1H reconfirm.
+
+    `existing` is an already-armed daily view: 1H dips do not disarm it, and
+    daily does not need to re-print a fresh HH/HL every tick. Only a daily
+    close through invalidation returns ``daily_structure_break``.
+    """
+    if existing is not None and existing.side is not None:
+        view = existing
+        if structure_bars:
+            view = StructureView(
+                side=existing.side,
+                confirmed=True,
+                invalidation=existing.invalidation,
+                zone_low=existing.zone_low,
+                zone_high=existing.zone_high,
+                confirm_index=existing.confirm_index,
+                reason=existing.reason,
+                last_close=structure_bars[-1].close,
+                atr=existing.atr or atr(structure_bars, atr_period),
+                confirm_ts=existing.confirm_ts or _confirm_ts(structure_bars, existing.confirm_index),
+            )
+    else:
+        view = confirm_and_zone(
+            structure_bars,
+            left=left,
+            right=right,
+            atr_period=atr_period,
+            vp_lookback=vp_lookback,
+            vp_bin=vp_bin,
+            vp_percentile=vp_percentile,
+        )
+        if not view.confirmed or view.side is None:
+            return view, False, DAILY_NOT_CONFIRMED
+
+    if structure_bars and structure_broken(view, structure_bars[-1]):
+        return view, False, DAILY_STRUCTURE_BREAK
+
+    pulled, why = first_pullback(timing_bars, view, no_chase_atr=no_chase_atr)
+    if not pulled:
+        return view, False, _remap_pullback_reason(why)
+
+    ok, _ = timing_reconfirm(timing_bars, view.side, left=left, right=right)
+    if not ok:
+        return view, False, RECONFIRM_FAILED
+    return view, True, HYBRID_READY
+
+
+def _remap_pullback_reason(why: str) -> str:
+    if why == "not_confirmed":
+        return DAILY_NOT_CONFIRMED
+    if why == "no_pullback_yet":
+        return WAITING_1H_PULLBACK
+    if why in {"no_chase_extended", "pullback_left_zone"}:
+        return CHASE
+    if why == "structure_break":
+        return DAILY_STRUCTURE_BREAK
+    return why
+
+
+def _confirm_ts(bars: list[Bar], index: int) -> Optional[datetime]:
+    if 0 <= index < len(bars):
+        return bars[index].ts
+    return None
+
+
+def _bars_after_confirm(bars: list[Bar], view: StructureView) -> list[Bar]:
+    if view.confirm_ts is not None:
+        return [b for b in bars if b.ts > view.confirm_ts]
+    if 0 <= view.confirm_index < len(bars):
+        return list(bars[view.confirm_index + 1 :])
+    return list(bars)
 
 
 def _overlaps_zone(bar: Bar, zone_low: float, zone_high: float) -> bool:

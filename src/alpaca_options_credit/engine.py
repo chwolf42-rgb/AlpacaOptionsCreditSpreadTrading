@@ -36,7 +36,7 @@ from alpaca_options_credit.strategy.spreads import (
     stop_hit,
     take_profit_hit,
 )
-from alpaca_options_credit.strategy.structure import confirm_and_zone, first_pullback
+from alpaca_options_credit.strategy.structure import hybrid_entry
 
 log = logging.getLogger(__name__)
 
@@ -140,10 +140,31 @@ class Engine:
     def _tf_cfg(self) -> dict[str, Any]:
         return self.cfg.get("timeframe") or {}
 
-    def _bars(self, symbol: str) -> list[Bar]:
-        tf = str(self._tf_cfg().get("bar", "1Hour"))
+    def _structure_bars(self, symbol: str) -> list[Bar]:
+        # Locked hybrid: daily owns bias / VP / S/R / invalidation.
+        # Legacy timeframe.bar (1H-only) is ignored if structure_bar is absent.
+        tf = str(self._tf_cfg().get("structure_bar") or "1Day")
+        md = self.cfg.get("market_data") or {}
+        limit = int(md.get("daily_bar_lookback") or md.get("bar_lookback") or 60)
+        return self.data.bars(symbol, tf, limit)
+
+    def _timing_bars(self, symbol: str) -> list[Bar]:
+        tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
         limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
         return self.data.bars(symbol, tf, limit)
+
+    def _hybrid_kwargs(self) -> dict[str, Any]:
+        tf = self._tf_cfg()
+        vp = tf.get("volume_profile") or {}
+        return {
+            "left": int(tf.get("swing_left", 2)),
+            "right": int(tf.get("swing_right", 2)),
+            "atr_period": int(tf.get("atr_period", 14)),
+            "vp_lookback": int(vp.get("lookback_bars", 25)),
+            "vp_bin": float(vp.get("bin_size", 0.5)),
+            "vp_percentile": float(vp.get("hvn_percentile", 0.70)),
+            "no_chase_atr": float(tf.get("no_chase_atr", 0.5)),
+        }
 
     def _scan_symbol(
         self,
@@ -152,46 +173,41 @@ class Engine:
         open_spreads: list[OpenSpread],
     ) -> tuple[Optional[Arm], Optional[SpreadProposal]]:
         tf = self._tf_cfg()
-        vp = tf.get("volume_profile") or {}
-        bars = self._bars(symbol)
-        if len(bars) < 10:
-            self.journal.log_event("scan_skip", symbol, {"reason": "not_enough_bars"})
+        daily = self._structure_bars(symbol)
+        hourly = self._timing_bars(symbol)
+        if len(daily) < 10:
+            self.journal.log_event(
+                "scan_skip", symbol, {"reason": "daily_not_confirmed", "detail": "not_enough_bars"}
+            )
             return None, None
 
-        view = confirm_and_zone(
-            bars,
-            left=int(tf.get("swing_left", 2)),
-            right=int(tf.get("swing_right", 2)),
-            atr_period=int(tf.get("atr_period", 14)),
-            vp_lookback=int(vp.get("lookback_bars", 80)),
-            vp_bin=float(vp.get("bin_size", 0.5)),
-            vp_percentile=float(vp.get("hvn_percentile", 0.70)),
-        )
         existing = self.journal.get_open_arm(symbol)
-        last = bars[-1]
+        last_daily = daily[-1]
+        armed_view = None
+        if existing:
+            armed_view = _view_from_arm(
+                existing,
+                last_daily,
+                atr_v=0.0,
+                confirm_ts=_confirm_ts_for_arm(existing, daily),
+            )
+
+        view, ready, why = hybrid_entry(daily, hourly, existing=armed_view, **self._hybrid_kwargs())
 
         if existing:
-            # Rebuild view for the armed side's invalidation; cancel only on close-through.
-            if view.invalidation is None:
-                view.invalidation = existing.invalidation
-                view.side = existing.side
-                view.zone_low = existing.zone_low
-                view.zone_high = existing.zone_high
-            broken = False
-            if existing.side is Side.BULLISH and last.close < existing.invalidation:
-                broken = True
-            if existing.side is Side.BEARISH and last.close > existing.invalidation:
-                broken = True
-            if broken:
-                self.journal.cancel_arm(existing.id, "structure_break")
-                self.journal.log_event("arm_cancel", symbol, {"reason": "structure_break"})
-                log.info("structure break cancels arm %s %s", symbol, existing.id)
+            if why == "daily_structure_break":
+                self.journal.cancel_arm(existing.id, "daily_structure_break")
+                self.journal.log_event(
+                    "arm_cancel", symbol, {"reason": "daily_structure_break"}
+                )
+                log.info("daily structure break cancels arm %s %s", symbol, existing.id)
                 return None, None
-            # Timeout in bars since confirm.
-            if last and existing.bar_index and (len(bars) - 1 - existing.bar_index) > int(
-                tf.get("arm_timeout_bars", 24)
-            ):
+            # Timeout counted in daily structure bars after confirm_index.
+            if last_daily and existing.bar_index is not None and (
+                len(daily) - 1 - existing.bar_index
+            ) > int(tf.get("arm_timeout_bars", 10)):
                 self.journal.cancel_arm(existing.id, "arm_timeout")
+                self.journal.log_event("arm_cancel", symbol, {"reason": "arm_timeout"})
                 return None, None
             arm = existing
         elif view.confirmed and view.side and view.invalidation is not None:
@@ -216,23 +232,25 @@ class Engine:
                     "invalidation": arm.invalidation,
                     "zone": [arm.zone_low, arm.zone_high],
                     "reason": arm.reason,
+                    "structure_bar": str(tf.get("structure_bar") or "1Day"),
+                    "timing_bar": str(tf.get("timing_bar") or "1Hour"),
                 },
             )
-            log.info("armed %s %s inv=%.2f", symbol, arm.side.value, arm.invalidation)
+            log.info(
+                "armed %s %s inv=%.2f reason=%s",
+                symbol,
+                arm.side.value,
+                arm.invalidation,
+                view.reason,
+            )
         else:
+            self.journal.log_event("scan_skip", symbol, {"reason": why, "detail": view.reason})
+            log.info("reject %s %s", symbol, why)
             return None, None
 
-        if existing:
-            view_for_pb = _view_from_arm(arm, last, view.atr)
-        else:
-            view_for_pb = view
-        pulled, why = first_pullback(
-            bars,
-            view_for_pb,
-            no_chase_atr=float(tf.get("no_chase_atr", 0.5)),
-        )
-        if not pulled:
+        if not ready:
             self.journal.log_event("no_entry", symbol, {"reason": why})
+            log.info("no_entry %s %s", symbol, why)
             return arm, None
 
         today = now.date() if isinstance(now, datetime) else date.today()
@@ -374,7 +392,7 @@ class Engine:
             mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
             reason = None
             thesis_intact = True
-            bars = self._bars(spread.underlying)
+            bars = self._structure_bars(spread.underlying)
             if bars and (exits_cfg.get("honor_structure_break", True)):
                 last = bars[-1]
                 if spread.kind is SpreadKind.BULL_PUT_CREDIT and last.close < spread.invalidation:
@@ -437,7 +455,13 @@ class Engine:
             time.sleep(sleep)
 
 
-def _view_from_arm(arm: Arm, last: Bar, atr_v: float):
+def _confirm_ts_for_arm(arm: Arm, daily: list[Bar]):
+    if 0 <= arm.bar_index < len(daily):
+        return daily[arm.bar_index].ts
+    return None
+
+
+def _view_from_arm(arm: Arm, last: Bar, atr_v: float, confirm_ts=None):
     from alpaca_options_credit.strategy.structure import StructureView
 
     return StructureView(
@@ -450,6 +474,7 @@ def _view_from_arm(arm: Arm, last: Bar, atr_v: float):
         reason=arm.reason,
         last_close=last.close,
         atr=atr_v,
+        confirm_ts=confirm_ts,
     )
 
 
