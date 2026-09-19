@@ -2,8 +2,8 @@
 # Switch with universe.active in config/default.yaml (day1 | full_a).
 # No code change required.
 #
-# Day-1 stays the 10 megas/indexes. Flip to full_a within 2–3 days of
-# arming — not a long soak. Raise risk.max_concurrent toward 20+ then.
+# Paper dry-run default is full_a (57 names) with risk.max_concurrent: 20.
+# day1 remains the 10 megas/indexes if you need to shrink the sleeve.
 
 tiers:
   day1:

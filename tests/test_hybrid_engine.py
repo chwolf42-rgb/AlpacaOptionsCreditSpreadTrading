@@ -74,7 +74,8 @@ def test_default_config_is_daily_1h_hybrid():
     assert "bar" not in tf
     assert 20 <= int(tf["volume_profile"]["lookback_bars"]) <= 30
     assert int(cfg["market_data"]["daily_bar_lookback"]) > int(tf["arm_timeout_bars"])
-    assert cfg["universe"]["active"] == "day1"
+    assert cfg["universe"]["active"] == "full_a"
+    assert int(cfg["risk"]["max_concurrent"]) == 20
 
 
 def test_engine_fetches_daily_and_1h(tmp_path):

@@ -38,10 +38,9 @@ timeframe:
 universe:
   file: config/universe.yaml
   # day1 (10 megas/indexes) | full_a (57-name liquidity tier A).
-  # List swap only — no code change. Day-1 stays the 10 until you flip this.
-  # After arming: set active to full_a within 2–3 days (not a long soak),
-  # and raise risk.max_concurrent toward 20+.
-  active: day1
+  # List swap only — no code change. Paper dry-run is on full_a (57 names).
+  # day1 remains available to shrink the sleeve.
+  active: full_a
 
 structures:
   # Locked playbook: these two credit spreads only.
@@ -78,7 +77,7 @@ exits:
 risk:
   risk_per_trade_pct: 0.005     # ~0.5% of equity, sized by max loss
   # max loss per spread = (width × multiplier) − (credit × multiplier)
-  max_concurrent: 8             # day-1 cap; raise toward 20+ when universe.active: full_a
+  max_concurrent: 20            # full_a paper dry-run; day-1 sleeve used 8
   max_portfolio_risk_pct: 0.10  # sum of open max-loss / equity
   one_spread_per_underlying: true
   # Used when the account cannot be fetched (observer --fixture).
