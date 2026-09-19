@@ -26,7 +26,16 @@ class ArmStatus(str, Enum):
 class SpreadStatus(str, Enum):
     PROPOSED = "proposed"
     OPEN = "open"
+    EXITING = "exiting"  # exit latched; close not yet accepted
     CLOSED = "closed"
+
+
+# Still on the book: proposed (observer), live, or close-pending.
+LIVE_SPREAD_STATUSES = (
+    SpreadStatus.PROPOSED,
+    SpreadStatus.OPEN,
+    SpreadStatus.EXITING,
+)
 
 
 @dataclass(frozen=True)
@@ -101,3 +110,6 @@ class OpenSpread:
     exit_reason: str = ""
     thesis_intact: bool = True
     expiration: str = ""
+    close_attempts: int = 0
+    exit_order_id: Optional[str] = None
+    last_close_error: str = ""

@@ -48,3 +48,37 @@ def test_journal_persists_arms_and_spreads(tmp_path: Path):
 
     j2.close_spread("sp1", "take_profit")
     assert j2.open_spreads() == []
+
+
+def test_journal_latch_keeps_spread_live_until_close(tmp_path: Path):
+    j = Journal(tmp_path / "j.sqlite")
+    j.upsert_spread(
+        OpenSpread(
+            id="sp1",
+            underlying="SPY",
+            kind=SpreadKind.BULL_PUT_CREDIT,
+            short_occ="A",
+            long_occ="B",
+            width=5.0,
+            credit=1.2,
+            qty=2,
+            max_loss=380.0,
+            invalidation=100.0,
+            status=SpreadStatus.OPEN,
+            opened_at=datetime.now(timezone.utc).isoformat(),
+        )
+    )
+    j.latch_exit("sp1", "stop_2x_credit")
+    live = j.open_spreads()
+    assert len(live) == 1
+    assert live[0].status is SpreadStatus.EXITING
+    assert live[0].exit_reason == "stop_2x_credit"
+    j.latch_exit("sp1", "take_profit")  # first reason wins
+    assert j.get_spread("sp1").exit_reason == "stop_2x_credit"
+    attempts = j.record_close_failure("sp1", "mleg reject")
+    assert attempts == 1
+    assert j.get_spread("sp1").last_close_error == "mleg reject"
+    j.record_working_close("sp1", "close-9")
+    assert j.get_spread("sp1").exit_order_id == "close-9"
+    j.close_spread("sp1", "stop_2x_credit")
+    assert j.open_spreads() == []

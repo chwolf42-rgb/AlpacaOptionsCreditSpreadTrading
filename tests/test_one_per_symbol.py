@@ -56,6 +56,22 @@ def test_one_spread_per_underlying():
     assert d.reason == "one_spread_per_underlying"
 
 
+def test_exiting_spread_still_blocks_same_underlying():
+    exiting = _open("SPY")
+    exiting.status = SpreadStatus.EXITING
+    exiting.exit_reason = "stop_2x_credit"
+    d = decide(
+        equity=100_000,
+        proposal=_proposal("SPY"),
+        open_spreads=[exiting],
+        risk_pct=0.005,
+        max_concurrent=8,
+        max_portfolio_risk_pct=0.10,
+    )
+    assert d.allow is False
+    assert d.reason == "one_spread_per_underlying"
+
+
 def test_allows_different_underlying():
     d = decide(
         equity=100_000,

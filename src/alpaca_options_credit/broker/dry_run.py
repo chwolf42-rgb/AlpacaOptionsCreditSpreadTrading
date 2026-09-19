@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from alpaca_options_credit.broker.payloads import assert_atomic_mleg
 from alpaca_options_credit.models import OpenSpread, SpreadProposal
 
 
@@ -17,7 +18,9 @@ class DryRunBroker:
         self._account_number = account_number
         self.proposed_opens: list[dict[str, Any]] = []
         self.proposed_closes: list[dict[str, Any]] = []
+        self.flattened_residuals: list[dict[str, Any]] = []
         self.submitted_order_ids: list[str] = []
+        self.positions: dict[str, int] = {}
 
     def account_equity(self) -> float:
         return self._equity
@@ -26,6 +29,7 @@ class DryRunBroker:
         return self._account_number
 
     def submit_open(self, proposal: SpreadProposal, payload: dict[str, Any]) -> Optional[str]:
+        assert_atomic_mleg(payload, intent="open")
         self.proposed_opens.append(
             {
                 "underlying": proposal.underlying,
@@ -38,14 +42,30 @@ class DryRunBroker:
         return None
 
     def submit_close(self, spread: OpenSpread, payload: dict[str, Any]) -> Optional[str]:
+        assert_atomic_mleg(payload, intent="close")
         self.proposed_closes.append(
             {
                 "underlying": spread.underlying,
                 "spread_id": spread.id,
                 "payload": payload,
+                "qty": payload.get("qty"),
             }
         )
         return None
 
     def open_order_ids(self) -> list[str]:
         return list(self.submitted_order_ids)
+
+    def cancel_order(self, order_id: str) -> None:
+        """Forbidden on this sleeve — cancel-before-replace strands a spread."""
+        raise RuntimeError(
+            "options sleeve must not cancel working exits "
+            f"(cancel-before-replace naked window; order_id={order_id})"
+        )
+
+    def option_positions(self) -> dict[str, int]:
+        return dict(self.positions)
+
+    def flatten_residual(self, occ: str, payload: dict[str, Any]) -> Optional[str]:
+        self.flattened_residuals.append({"occ": occ, "payload": payload})
+        return None
