@@ -43,9 +43,17 @@ class DryRunBroker:
                 "underlying": spread.underlying,
                 "spread_id": spread.id,
                 "payload": payload,
+                "qty": payload.get("qty"),
             }
         )
         return None
 
     def open_order_ids(self) -> list[str]:
         return list(self.submitted_order_ids)
+
+    def cancel_order(self, order_id: str) -> None:
+        """Forbidden on this sleeve — cancel-before-replace strands a spread."""
+        raise RuntimeError(
+            "options sleeve must not cancel working exits "
+            f"(cancel-before-replace naked window; order_id={order_id})"
+        )

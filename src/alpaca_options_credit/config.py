@@ -7,9 +7,30 @@ from typing import Any
 
 import yaml
 
-from alpaca_options_credit.errors import ConfigError
+from alpaca_options_credit.errors import ConfigError, ExitPolicyError
 
 DEFAULT_CONFIG_NAME = "config/default.yaml"
+
+# Only allowed options-native exit path. Equity OCO / bracket / attached
+# stop-limits are the source of held-leg, pending_cancel, and naked-window bugs.
+OPTIONS_NATIVE_EXIT_PATH = "credit_mark_and_structure"
+_FORBIDDEN_EQUITY_STOP_KEYS = frozenset(
+    {
+        "oco",
+        "bracket",
+        "equity_stop",
+        "equity_bracket",
+        "attached_stop",
+        "stop_order",
+        "stop_limit",
+        "oco_legs",
+        "bracket_legs",
+        "use_oco",
+        "use_bracket",
+        "working_stop",
+        "child_stops",
+    }
+)
 
 
 def repo_root() -> Path:
@@ -42,6 +63,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     cfg["_config_path"] = str(cfg_path)
     cfg["_repo_root"] = str(root)
     _apply_universe(cfg, root)
+    validate_exit_policy(cfg)
     return cfg
 
 
@@ -65,6 +87,54 @@ def _apply_universe(cfg: dict[str, Any], root: Path) -> None:
     uni["active"] = active
     uni["symbols"] = list(tiers[active])
 
+
+def validate_exit_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Refuse equity OCO/bracket stops. Credit-mark + structure-break only.
+
+    Called from load_config and Engine.__init__ so a mutated in-memory cfg
+    cannot re-enable the equity stop path before paper fills.
+    """
+    exits = cfg.setdefault("exits", {})
+    if not isinstance(exits, dict):
+        raise ExitPolicyError("exits must be a mapping")
+
+    forbidden = _FORBIDDEN_EQUITY_STOP_KEYS.intersection(exits)
+    if forbidden:
+        raise ExitPolicyError(
+            "equity stop keys are forbidden on this options sleeve "
+            f"(found {sorted(forbidden)}). Use credit-mark + structure-break only."
+        )
+
+    path = str(exits.get("path") or OPTIONS_NATIVE_EXIT_PATH)
+    if path != OPTIONS_NATIVE_EXIT_PATH:
+        raise ExitPolicyError(
+            f"exits.path={path!r} is forbidden. Only "
+            f"{OPTIONS_NATIVE_EXIT_PATH!r} is allowed (no equity OCO/bracket)."
+        )
+    exits["path"] = path
+
+    if exits.get("forbid_equity_oco_bracket") is False:
+        raise ExitPolicyError("forbid_equity_oco_bracket cannot be false")
+    exits["forbid_equity_oco_bracket"] = True
+
+    if exits.get("never_cancel_working_close") is False:
+        raise ExitPolicyError(
+            "never_cancel_working_close cannot be false "
+            "(cancel-before-replace leaves a naked credit spread)"
+        )
+    exits["never_cancel_working_close"] = True
+
+    broker = cfg.setdefault("broker", {})
+    if isinstance(broker, dict):
+        order_class = str(broker.get("order_class") or "mleg").lower()
+        if order_class in {"oco", "bracket", "oto", "otooco"}:
+            raise ExitPolicyError(
+                f"broker.order_class={order_class!r} is an equity bracket path. "
+                "This bot submits mleg credit-spread opens/closes only."
+            )
+        broker["order_class"] = "mleg"
+
+    return cfg
 
 
 def var_dir(cfg: dict[str, Any]) -> Path:

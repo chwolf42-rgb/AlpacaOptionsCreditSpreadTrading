@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from alpaca_options_credit.broker.payloads import (
     close_credit_spread_payload,
     open_credit_spread_payload,
@@ -30,6 +32,16 @@ def test_open_payload_is_signed_credit_mleg():
     intents = {leg["position_intent"] for leg in payload["legs"]}
     assert intents == {"sell_to_open", "buy_to_open"}
     assert all("extended_hours" not in payload for _ in [0])
+
+
+def test_close_payload_rejects_zero_qty():
+    with pytest.raises(ValueError, match="live spread size"):
+        close_credit_spread_payload(
+            short_occ="SPY260417P00100000",
+            long_occ="SPY260417P00095000",
+            qty=0,
+            debit=0.60,
+        )
 
 
 def test_close_payload_is_signed_debit():

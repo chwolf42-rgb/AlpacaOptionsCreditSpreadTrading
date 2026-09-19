@@ -21,12 +21,33 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | DTE | 30–45 |
 | Credit gate | skip if credit &lt; ~20% of width (natural: short bid − long ask) |
 | Earnings / FOMC | skip new entries via `config/calendar.yaml` stub |
-| Take profit | ~50% of credit (debit-to-close ≤ 50% of credit) |
-| Stop | ~2× credit **or** underlying structure break, whichever first |
+| Take profit | ~50% of credit (debit-to-close ≤ 50% of credit), software mark each poll |
+| Stop | ~2× credit **or** underlying structure break, whichever first — **not** an equity OCO/bracket |
 | Roll/repair | **stub** — close unless `exits.roll.execute` and thesis+DTE say otherwise |
 | Size | max loss = width×100 − credit×100; ~0.5% of equity; one spread per underlying |
 
-Exits are **options-native** (fraction of credit). This is not the equity R-ladder.
+Exits are **options-native** (fraction of credit + structure-break). This is not the equity R-ladder and **must not** reuse that bot’s OCO/bracket stop path.
+
+## Exits (options-native — no equity OCO)
+
+Equity-sleeve stop bugs that **this bot is forbidden from growing**:
+
+| Equity failure mode | Why it cannot apply here |
+| --- | --- |
+| Held OCO / bracket child legs | No `order_class=oco` or attached stop-limit. Open and close are a **single mleg** (two option legs, `position_intent` set). |
+| `pending_cancel` limbo holding qty | We never cancel a working close to free qty. A live mleg close is left alone until it fills or the broker drops it (day TIF). |
+| Cancel-before-replace naked window | `exits.never_cancel_working_close: true` is enforced. Replacement is only submitted if there is **no** working close id. |
+| qty=60 vs leftover tranche fights | Close qty is the **journaled spread qty**, always. No child-stop remainder, no partial equity tranche. |
+
+`config/default.yaml` locks `exits.path: credit_mark_and_structure` and `forbid_equity_oco_bracket: true`. `load_config` / `Engine` **refuse** equity stop keys (`oco`, `bracket`, …) and `broker.order_class` other than `mleg`.
+
+On TP, 2×-credit stop, or structure-break:
+
+1. Latch `EXITING` + reason immediately (sticky even if the mark recovers).
+2. Submit one debit-to-close mleg. Journal `CLOSED` only if the broker **accepts** the close (dry-run treats the recorded payload as success).
+3. If submit raises or returns empty: stay `EXITING`, journal `close_failed`, **ERROR** log, increment `close_attempts`. Next poll retries. Paper ticks **block new entries** while any spread is `EXITING`.
+
+Off-hours (`rth.manage_exits_off_hours: false`): options do not trade AH, so we **do not submit**. Open spreads are still flagged (`overnight_open` once per ET date + heartbeat `overnight_open=N`). Daily structure-break can latch overnight. The **first RTH poll always runs `_manage_exits` before any new entry**.
 
 ## Timeframe (locked: daily + 1Hour hybrid)
 
@@ -144,8 +165,8 @@ Investigated against current **alpaca-py** + Trading API:
 pytest
 ```
 
-Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, observer places no orders, max-loss sizing, one-spread-per-underlying, and the daily + 1H hybrid entry path.
+Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, **engine TP / 2×-stop / structure-break close**, **failed-close retry + alert**, observer places no orders, max-loss sizing, one-spread-per-underlying, and the daily + 1H hybrid entry path.
 
 ## Config
 
-See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, and the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`) live there.
+See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`), and the **locked options-native exit policy** (`exits.path`, `forbid_equity_oco_bracket`, `never_cancel_working_close`) live there.

@@ -23,3 +23,7 @@ class AccountMismatchError(BotError):
 
 class ConfigError(BotError):
     """Invalid or missing config."""
+
+
+class ExitPolicyError(ConfigError):
+    """Equity OCO/bracket (or any non-options-native stop path) is forbidden."""

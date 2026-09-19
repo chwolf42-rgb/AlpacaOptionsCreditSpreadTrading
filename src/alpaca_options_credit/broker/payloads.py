@@ -92,6 +92,10 @@ def close_credit_spread_payload(
     time_in_force: str = "day",
     client_order_id: str | None = None,
 ) -> dict[str, Any]:
+    # Close the full journaled spread qty in one mleg. No equity-style
+    # tranches (qty=60 vs leftover child-stop fights) and no OCO legs.
+    if int(qty) <= 0:
+        raise ValueError(f"close qty must be the live spread size, got {qty!r}")
     legs = [
         leg(short_occ, "buy", "buy_to_close"),
         leg(long_occ, "sell", "sell_to_close"),

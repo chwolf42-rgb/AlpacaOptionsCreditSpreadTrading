@@ -61,11 +61,21 @@ spreads:
   time_in_force: day
 
 exits:
-  # Options-native — NOT an equity R-multiple ladder.
+  # HARD LOCK: options-native software exits only. This sleeve never attaches
+  # equity-style OCO / bracket / stop-limit working orders (held OCO legs,
+  # pending_cancel qty limbo, cancel-before-replace naked windows, qty=60 vs
+  # leftover tranche fights). Engine + load_config refuse those keys.
+  path: credit_mark_and_structure
+  forbid_equity_oco_bracket: true
+  never_cancel_working_close: true
+  # TP / stop are mark-to-close vs the credit received (not an equity R-ladder).
   take_profit_frac_of_credit: 0.50   # TP when debit-to-close <= 50% of credit
   stop_multiple_of_credit: 2.0       # stop when debit-to-close >= 2× credit
   # Stop also fires on underlying structure break (whichever first).
   honor_structure_break: true
+  # On hit: submit one mleg debit-to-close for the journaled qty. If submit
+  # fails, latch EXITING, alert, retry next poll — never mark the journal
+  # closed, never cancel a working close to "replace" it.
   # Roll/repair stub: default is CLOSE. Flip execute only when thesis+DTE say roll.
   roll:
     enabled: false
@@ -101,8 +111,9 @@ market_data:
 
 broker:
   paper_only: true
-  # Encapsulated mleg: order_class=mleg, 2 legs, position_intent set.
-  # See README "Alpaca API notes".
+  # Encapsulated mleg only — never oco / bracket / oto.
+  order_class: mleg
+  # See README "Alpaca API notes" and "Exits (options-native)".
 
 heartbeat:
   # Engine writes var/options/heartbeat.json every loop (RTH and off-hours).
@@ -119,9 +130,12 @@ rth:
   timezone: America/New_York
   open: "09:30"
   close: "16:00"
-  # Scan only during RTH (exits still evaluated if a spread is open).
+  # Scan only during RTH. Off-hours: do not submit mleg closes (options
+  # do not trade AH). Open spreads are still heartbeated + journaled as
+  # overnight_open; structure-break is latched so the first RTH poll runs
+  # _manage_exits before any new entries.
   scan_only_rth: true
-  manage_exits_off_hours: false   # equity options do not trade off RTH
+  manage_exits_off_hours: false   # no AH submits; still flag + latch
 
 loop:
   sleep_seconds_rth: 30

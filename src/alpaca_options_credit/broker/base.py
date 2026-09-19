@@ -18,7 +18,11 @@ class Broker(Protocol):
         """Return broker order id, or None if nothing was sent."""
 
     def submit_close(self, spread: OpenSpread, payload: dict[str, Any]) -> Optional[str]:
-        ...
+        """Submit a single mleg debit-to-close. Do not attach OCO/bracket stops.
+
+        Return the broker order id on accept, or None if nothing was sent.
+        Never cancel a working close to replace it.
+        """
 
     def open_order_ids(self) -> list[str]:
         ...

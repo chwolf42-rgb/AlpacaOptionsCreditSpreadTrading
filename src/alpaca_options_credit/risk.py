@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from alpaca_options_credit.models import OpenSpread, SpreadProposal, SpreadStatus
+from alpaca_options_credit.models import (
+    LIVE_SPREAD_STATUSES,
+    OpenSpread,
+    SpreadProposal,
+)
 
 
 def max_loss_dollars(width: float, credit: float, multiplier: int = 100) -> float:
@@ -46,11 +50,7 @@ def decide(
     one_per_underlying: bool = True,
     multiplier: int = 100,
 ) -> RiskDecision:
-    live = [
-        s
-        for s in open_spreads
-        if s.status in (SpreadStatus.OPEN, SpreadStatus.PROPOSED)
-    ]
+    live = [s for s in open_spreads if s.status in LIVE_SPREAD_STATUSES]
     if one_per_underlying and any(s.underlying == proposal.underlying for s in live):
         return RiskDecision(False, 0, "one_spread_per_underlying", 0.0)
     if len(live) >= max_concurrent:
