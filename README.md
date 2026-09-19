@@ -41,10 +41,12 @@ Equity-sleeve stop bugs that **this bot is forbidden from growing**:
 
 `config/default.yaml` locks `exits.path: credit_mark_and_structure` and `forbid_equity_oco_bracket: true`. `load_config` / `Engine` **refuse** equity stop keys (`oco`, `bracket`, …) and `broker.order_class` other than `mleg`.
 
+**Atomic spread close only — no legging out.** Entry and exit submit `order_class=mleg` with **both** legs (short + long) in one order. Never close or cancel only the long or only the short of a healthy credit spread — that is how a naked short and a margin call happen. `exits.atomic_spread_only: true` is enforced. If a mleg only fills one side, that is **CRITICAL**: latch `naked_leg`, alert, and flatten the residual immediately (paired leftover via mleg, lone leftover via emergency flatten). Never leave a naked short resting.
+
 On TP, 2×-credit stop, or structure-break:
 
 1. Latch `EXITING` + reason immediately (sticky even if the mark recovers).
-2. Submit one debit-to-close mleg. Journal `CLOSED` only if the broker **accepts** the close (dry-run treats the recorded payload as success).
+2. Submit one **2-leg** debit-to-close mleg. Journal `CLOSED` only if the broker **accepts** the close (dry-run treats the recorded payload as success).
 3. If submit raises or returns empty: stay `EXITING`, journal `close_failed`, **ERROR** log, increment `close_attempts`. Next poll retries. Paper ticks **block new entries** while any spread is `EXITING`.
 
 Off-hours (`rth.manage_exits_off_hours: false`): options do not trade AH, so we **do not submit**. Open spreads are still flagged (`overnight_open` once per ET date + heartbeat `overnight_open=N`). Daily structure-break can latch overnight. The **first RTH poll always runs `_manage_exits` before any new entry**.

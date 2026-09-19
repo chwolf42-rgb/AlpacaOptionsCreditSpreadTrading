@@ -27,6 +27,12 @@ class Broker(Protocol):
     def open_order_ids(self) -> list[str]:
         ...
 
+    def option_positions(self) -> dict[str, int]:
+        """OCC symbol → signed qty (short negative). Empty if unknown."""
+
+    def flatten_residual(self, occ: str, payload: dict[str, Any]) -> Optional[str]:
+        """CRITICAL: flatten one leftover leg. Not a spread exit."""
+
 
 class MarketData(Protocol):
     def bars(self, symbol: str, timeframe: str, limit: int) -> list: ...

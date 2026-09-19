@@ -18,6 +18,7 @@ def test_default_config_locks_options_native_exits():
     assert exits["path"] == OPTIONS_NATIVE_EXIT_PATH
     assert exits["forbid_equity_oco_bracket"] is True
     assert exits["never_cancel_working_close"] is True
+    assert exits["atomic_spread_only"] is True
     assert cfg["rth"]["manage_exits_off_hours"] is False
     assert cfg["broker"]["order_class"] == "mleg"
     assert "oco" not in exits
@@ -42,6 +43,13 @@ def test_refuses_disabling_cancel_guard():
     cfg = load_config()
     cfg["exits"]["never_cancel_working_close"] = False
     with pytest.raises(ExitPolicyError, match="naked"):
+        validate_exit_policy(cfg)
+
+
+def test_refuses_disabling_atomic_spread():
+    cfg = load_config()
+    cfg["exits"]["atomic_spread_only"] = False
+    with pytest.raises(ExitPolicyError, match="legging"):
         validate_exit_policy(cfg)
 
 

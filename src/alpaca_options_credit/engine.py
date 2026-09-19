@@ -11,7 +11,9 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from alpaca_options_credit.broker.payloads import (
+    assert_atomic_mleg,
     close_credit_spread_payload,
+    emergency_flatten_residual_leg_payload,
     open_credit_spread_payload,
 )
 from alpaca_options_credit.calendar_stub import load_calendar, skip_new_entry
@@ -120,6 +122,8 @@ class Engine:
         # Off-hours: still latch structure-break / already-due exits; do not submit
         # (options do not trade AH). First RTH poll submits before any new entry.
         if open_spreads or submit_closes:
+            exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
+            open_spreads = self.journal.open_spreads()
             exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
             open_spreads = self.journal.open_spreads()
 
@@ -365,9 +369,12 @@ class Engine:
             return
         proposal.qty = decision.qty
         proposal.max_loss = decision.max_loss
-        payload = open_credit_spread_payload(
-            proposal,
-            time_in_force=str(sp.get("time_in_force", "day")),
+        payload = assert_atomic_mleg(
+            open_credit_spread_payload(
+                proposal,
+                time_in_force=str(sp.get("time_in_force", "day")),
+            ),
+            intent="open",
         )
         order_id = None
         if self.dry_run:
@@ -412,6 +419,191 @@ class Engine:
         arm = self.journal.get_open_arm(proposal.underlying)
         if arm:
             self.journal.mark_arm_triggered(arm.id, "spread_opened" if not self.dry_run else "observer_proposed")
+
+    def _option_positions(self) -> Optional[dict[str, int]]:
+        getter = getattr(self.broker, "option_positions", None)
+        if getter is None:
+            return {}
+        try:
+            return {str(k): int(v) for k, v in (getter() or {}).items()}
+        except Exception as exc:
+            log.error(
+                "option_positions failed (%s) — cannot confirm legs are paired",
+                type(exc).__name__,
+            )
+            return None
+
+    def _flatten_residual_leg(
+        self,
+        spread: OpenSpread,
+        occ: str,
+        qty: int,
+        *,
+        flatten_short: bool,
+        mark: Optional[float],
+    ) -> bool:
+        """CRITICAL path: flatten one leftover contract. Not a spread exit."""
+        limit = max(abs(mark or 0.0), abs(spread.credit), 0.05)
+        payload = emergency_flatten_residual_leg_payload(
+            occ=occ,
+            qty=qty,
+            flatten_short=flatten_short,
+            limit_price=limit,
+        )
+        flatten = getattr(self.broker, "flatten_residual", None)
+        if flatten is None:
+            attempts = self.journal.record_close_failure(
+                spread.id, "broker has no flatten_residual"
+            )
+            self.journal.log_event(
+                "naked_leg_critical",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "occ": occ,
+                    "qty": qty,
+                    "flatten_short": flatten_short,
+                    "error": "broker has no flatten_residual",
+                    "close_attempts": attempts,
+                },
+            )
+            return False
+        try:
+            order_id = flatten(occ, payload)
+        except Exception as exc:
+            attempts = self.journal.record_close_failure(
+                spread.id, f"{type(exc).__name__}: {exc}"
+            )
+            self.journal.log_event(
+                "naked_leg_critical",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "occ": occ,
+                    "qty": qty,
+                    "flatten_short": flatten_short,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "close_attempts": attempts,
+                },
+            )
+            log.critical(
+                "NAKED LEG FLATTEN FAILED %s %s occ=%s attempt=%s: %s",
+                spread.underlying,
+                spread.id,
+                occ,
+                attempts,
+                exc,
+            )
+            return False
+        if not order_id and not self.dry_run:
+            attempts = self.journal.record_close_failure(
+                spread.id, "flatten_residual returned empty"
+            )
+            self.journal.log_event(
+                "naked_leg_critical",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "occ": occ,
+                    "error": "flatten_residual returned empty",
+                    "close_attempts": attempts,
+                },
+            )
+            return False
+        return True
+
+    def _reconcile_naked_legs(
+        self,
+        open_spreads: list[OpenSpread],
+        now: datetime,
+        *,
+        submit: bool,
+    ) -> list[str]:
+        """If a mleg only filled one side, flatten the residual. Never rest a naked short."""
+        del now
+        positions = self._option_positions()
+        if positions is None:
+            self.journal.log_event("naked_leg_status_unknown", None, {})
+            return []
+        reasons: list[str] = []
+        for spread in open_spreads:
+            short_q = int(positions.get(spread.short_occ, 0) or 0)
+            long_q = int(positions.get(spread.long_occ, 0) or 0)
+            short_units = abs(short_q)
+            long_units = abs(long_q)
+            if short_units == 0 and long_units == 0:
+                continue
+            if short_units == long_units:
+                continue
+            self.journal.latch_exit(spread.id, "naked_leg", thesis_intact=False)
+            self.journal.log_event(
+                "naked_leg_critical",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "short_occ": spread.short_occ,
+                    "long_occ": spread.long_occ,
+                    "short_qty": short_q,
+                    "long_qty": long_q,
+                    "submit": submit,
+                },
+            )
+            log.critical(
+                "NAKED LEG %s %s short=%s qty=%s long=%s qty=%s — "
+                "atomic mleg was broken; flatten residual immediately "
+                "(never leave a naked short resting)",
+                spread.underlying,
+                spread.id,
+                spread.short_occ,
+                short_q,
+                spread.long_occ,
+                long_q,
+            )
+            if not submit:
+                reasons.append(f"{spread.underlying}:naked_leg:latched_off_hours")
+                continue
+
+            mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
+            paired = min(short_units, long_units)
+            accepted = True
+            if paired > 0:
+                payload = close_credit_spread_payload(
+                    short_occ=spread.short_occ,
+                    long_occ=spread.long_occ,
+                    qty=paired,
+                    debit=mark if mark is not None else spread.credit * 0.5,
+                )
+                accepted = self._attempt_mleg_close(spread, payload, "naked_leg", mark)
+            leftover_short = short_units - paired
+            leftover_long = long_units - paired
+            if leftover_short:
+                accepted = (
+                    self._flatten_residual_leg(
+                        spread,
+                        spread.short_occ,
+                        leftover_short,
+                        flatten_short=True,
+                        mark=mark,
+                    )
+                    and accepted
+                )
+            if leftover_long:
+                accepted = (
+                    self._flatten_residual_leg(
+                        spread,
+                        spread.long_occ,
+                        leftover_long,
+                        flatten_short=False,
+                        mark=mark,
+                    )
+                    and accepted
+                )
+            if accepted:
+                self.journal.close_spread(spread.id, "naked_leg")
+                reasons.append(f"{spread.underlying}:naked_leg")
+            else:
+                reasons.append(f"{spread.underlying}:naked_leg:close_failed")
+        return reasons
 
     def _flag_overnight_opens(self, open_spreads: list[OpenSpread], now: datetime) -> None:
         """Heartbeat + once-per-ET-date journal flag. No AH mleg submits."""
@@ -505,6 +697,7 @@ class Engine:
         Returns True only when the close was accepted (journal may then close).
         Failures stay EXITING with a loud alert so the next poll retries.
         """
+        assert_atomic_mleg(payload, intent="close")
         if self.dry_run:
             self.journal.log_event(
                 "observer_close",

@@ -7,9 +7,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from alpaca_options_credit.broker.payloads import (
+    assert_atomic_mleg,
     close_credit_spread_payload,
     open_credit_spread_payload,
 )
+from alpaca_options_credit.errors import AtomicSpreadError
 from alpaca_options_credit.credentials import Credentials, assert_expected_account
 from alpaca_options_credit.errors import PaperOnlyError
 from alpaca_options_credit.models import Bar, ContractQuote, OpenSpread, SpreadProposal
@@ -77,10 +79,45 @@ class AlpacaBroker:
         return getattr(self._account, "account_number", None)
 
     def submit_open(self, proposal: SpreadProposal, payload: dict[str, Any]) -> Optional[str]:
-        return self._submit(payload)
+        assert_atomic_mleg(payload, intent="open")
+        return self._submit_mleg(payload)
 
     def submit_close(self, spread: OpenSpread, payload: dict[str, Any]) -> Optional[str]:
-        return self._submit(payload)
+        assert_atomic_mleg(payload, intent="close")
+        return self._submit_mleg(payload)
+
+    def flatten_residual(self, occ: str, payload: dict[str, Any]) -> Optional[str]:
+        if not payload.get("emergency_flatten"):
+            raise AtomicSpreadError("flatten_residual requires emergency_flatten payload")
+        return self._submit_simple(payload)
+
+    def option_positions(self) -> dict[str, int]:
+        """OCC → signed qty. Missing/failed query returns {} (engine alerts)."""
+        try:
+            positions = self._trading.get_all_positions()
+        except Exception as exc:  # pragma: no cover - live path
+            log.error("option position query failed: %s", type(exc).__name__)
+            return {}
+        out: dict[str, int] = {}
+        for pos in positions or []:
+            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
+            symbol = str(getattr(pos, "symbol", "") or "")
+            if not symbol:
+                continue
+            if asset_class and "option" not in asset_class:
+                continue
+            try:
+                qty = int(float(getattr(pos, "qty", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            side = str(getattr(pos, "side", "") or "").lower()
+            if side in {"short", "sell"}:
+                qty = -abs(qty)
+            else:
+                qty = abs(qty) if qty > 0 else qty
+            if qty:
+                out[symbol] = qty
+        return out
 
     def open_order_ids(self) -> list[str]:
         from alpaca.trading.enums import QueryOrderStatus
@@ -90,7 +127,7 @@ class AlpacaBroker:
         orders = self._trading.get_orders(req)
         return [str(getattr(o, "id", "")) for o in orders if getattr(o, "id", None)]
 
-    def _submit(self, payload: dict[str, Any]) -> Optional[str]:
+    def _submit_mleg(self, payload: dict[str, Any]) -> Optional[str]:
         from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
 
@@ -117,6 +154,28 @@ class AlpacaBroker:
             time_in_force=tif,
             limit_price=float(payload["limit_price"]),
             legs=legs,
+            client_order_id=payload.get("client_order_id"),
+        )
+        order = self._trading.submit_order(req)
+        return str(getattr(order, "id", "") or "") or None
+
+    def _submit_simple(self, payload: dict[str, Any]) -> Optional[str]:
+        from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest
+
+        intent_map = {
+            "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+            "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+        }
+        side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
+        tif = TimeInForce.DAY if payload.get("time_in_force", "day") == "day" else TimeInForce.GTC
+        req = LimitOrderRequest(
+            symbol=payload["symbol"],
+            qty=float(payload["qty"]),
+            side=side_map[payload["side"]],
+            time_in_force=tif,
+            limit_price=float(payload["limit_price"]),
+            position_intent=intent_map[payload["position_intent"]],
             client_order_id=payload.get("client_order_id"),
         )
         order = self._trading.submit_order(req)

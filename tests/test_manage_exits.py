@@ -58,6 +58,8 @@ class PaperBroker:
         self.submitted_order_ids: list[str] = []
         self.cancel_calls: list[str] = []
         self.close_seq = 0
+        self.positions: dict[str, int] = {}
+        self.flattened_residuals: list[dict[str, Any]] = []
 
     def account_equity(self) -> float:
         return 100_000.0
@@ -89,6 +91,13 @@ class PaperBroker:
 
     def cancel_order(self, order_id: str) -> None:
         self.cancel_calls.append(order_id)
+
+    def option_positions(self) -> dict[str, int]:
+        return dict(self.positions)
+
+    def flatten_residual(self, occ: str, payload: dict[str, Any]) -> Optional[str]:
+        self.flattened_residuals.append({"occ": occ, "payload": payload})
+        return f"flatten-{occ}"
 
 
 def _engine(
@@ -176,6 +185,11 @@ def test_take_profit_closes_spread(tmp_path):
     assert closed.exit_reason == "take_profit"
     assert broker.proposed_closes
     assert broker.proposed_closes[0]["payload"]["qty"] == "2"
+    close_pl = broker.proposed_closes[0]["payload"]
+    assert close_pl["order_class"] == "mleg"
+    assert len(close_pl["legs"]) == 2
+    intents = {leg["position_intent"] for leg in close_pl["legs"]}
+    assert intents == {"buy_to_close", "sell_to_close"}
     assert engine.phase[0] == "exits"
 
 
@@ -309,6 +323,45 @@ def test_invalid_qty_does_not_invent_a_tranche(tmp_path):
     live = journal.get_spread("sp1")
     assert live.status is SpreadStatus.EXITING
     assert live.close_attempts >= 1
+
+
+def test_naked_short_flatten_is_critical(tmp_path):
+    broker = PaperBroker()
+    broker.positions = {"SPY260417P00100000": -2}  # short only — long never filled
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=1.00, credit=1.20, dry_run=False, broker=broker
+    )
+    result = engine.tick()
+    assert any(e == "SPY:naked_leg" for e in result.exits)
+    assert broker.proposed_closes == []  # no 1-leg "spread close"
+    assert broker.flattened_residuals
+    flat = broker.flattened_residuals[0]
+    assert flat["occ"] == "SPY260417P00100000"
+    assert flat["payload"]["emergency_flatten"] is True
+    assert flat["payload"]["position_intent"] == "buy_to_close"
+    assert journal.get_spread("sp1").status is SpreadStatus.CLOSED
+    assert journal.get_spread("sp1").exit_reason == "naked_leg"
+    kinds = [k for k, _, _ in _events(journal)]
+    assert "naked_leg_critical" in kinds
+    assert broker.cancel_calls == []
+
+
+def test_naked_short_off_hours_flags_without_flatten(tmp_path):
+    broker = PaperBroker()
+    broker.positions = {"SPY260417P00100000": -1}
+    engine, broker, journal, _, _ = _engine(
+        tmp_path,
+        mark=1.00,
+        credit=1.20,
+        now=OFF_HOURS,
+        dry_run=False,
+        broker=broker,
+    )
+    result = engine.tick()
+    assert any(e.endswith(":naked_leg:latched_off_hours") for e in result.exits)
+    assert broker.flattened_residuals == []
+    assert journal.get_spread("sp1").status is SpreadStatus.EXITING
+    assert "naked_leg_critical" in [k for k, _, _ in _events(journal)]
 
 
 def test_dry_run_cancel_order_is_hard_error():

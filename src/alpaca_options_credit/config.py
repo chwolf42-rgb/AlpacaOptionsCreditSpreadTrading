@@ -124,6 +124,13 @@ def validate_exit_policy(cfg: dict[str, Any]) -> dict[str, Any]:
         )
     exits["never_cancel_working_close"] = True
 
+    if exits.get("atomic_spread_only") is False:
+        raise ExitPolicyError(
+            "atomic_spread_only cannot be false "
+            "(legging out of a credit spread can leave a naked short)"
+        )
+    exits["atomic_spread_only"] = True
+
     broker = cfg.setdefault("broker", {})
     if isinstance(broker, dict):
         order_class = str(broker.get("order_class") or "mleg").lower()

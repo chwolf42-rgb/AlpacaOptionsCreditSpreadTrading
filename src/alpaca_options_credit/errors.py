@@ -27,3 +27,11 @@ class ConfigError(BotError):
 
 class ExitPolicyError(ConfigError):
     """Equity OCO/bracket (or any non-options-native stop path) is forbidden."""
+
+
+class AtomicSpreadError(BotError):
+    """Open/close must be a single 2-leg mleg. No legging out."""
+
+
+class NakedLegError(BotError):
+    """Partial fill left a residual option leg. Flatten immediately."""

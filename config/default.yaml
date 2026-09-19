@@ -68,6 +68,11 @@ exits:
   path: credit_mark_and_structure
   forbid_equity_oco_bracket: true
   never_cancel_working_close: true
+  # Atomic spread close only — no legging out. Open and close are one
+  # 2-leg mleg. Never close/cancel only the long or only the short of a
+  # healthy book (naked short → margin call). A leftover residual after a
+  # broken mleg is a CRITICAL flatten, not a normal exit.
+  atomic_spread_only: true
   # TP / stop are mark-to-close vs the credit received (not an equity R-ladder).
   take_profit_frac_of_credit: 0.50   # TP when debit-to-close <= 50% of credit
   stop_multiple_of_credit: 2.0       # stop when debit-to-close >= 2× credit
