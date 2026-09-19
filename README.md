@@ -11,8 +11,8 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Knob | Default |
 | --- | --- |
 | Structures | bull put credit + bear call credit only |
-| Day-1 universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA |
-| Full A (57) | See [`config/universe.yaml`](config/universe.yaml); switch with `universe.active` |
+| Day-1 universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA (`universe.active: day1`) |
+| Full A (57, **active**) | See [`config/universe.yaml`](config/universe.yaml); `universe.active: full_a` |
 | Higher TF | **Daily + 1Hour hybrid** (locked; not 1H-only) |
 | Entry | daily strict confirm → arm → **first 1H pullback** into the *daily* VP shelf **or** daily S/R, then **1H reconfirm** of the daily trend; **no chase** |
 | Cancel arm | **daily** structure-break **close** through invalidation; 1H dips do **not** cancel |
@@ -44,18 +44,18 @@ Lists live in [`config/universe.yaml`](config/universe.yaml) as two tiers:
 
 | `universe.active` | Names | When |
 | --- | --- | --- |
-| `day1` (default) | 10 megas/indexes: SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA | Ship and arm on this sleeve |
-| `full_a` | 57 liquid A names (AAPL … ADBE, including GLD/SLV/TLT and the sector ETFs) | **Within 2–3 days of arming — not a long soak** |
+| `day1` | 10 megas/indexes: SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA | Optional shrink-back sleeve |
+| `full_a` (default) | 57 liquid A names (AAPL … ADBE, including GLD/SLV/TLT and the sector ETFs) | **Active** paper dry-run universe |
 
 Flip in [`config/default.yaml`](config/default.yaml):
 
 ```yaml
 universe:
   file: config/universe.yaml
-  active: day1    # → full_a
+  active: full_a    # or day1 to shrink
 ```
 
-When switching to `full_a`, raise `risk.max_concurrent` toward **20+**. No Python changes.
+`risk.max_concurrent` is **20** on this sleeve. No Python changes.
 
 ## Observe vs supervise vs paper
 
