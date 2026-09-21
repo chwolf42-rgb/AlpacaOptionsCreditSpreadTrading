@@ -70,6 +70,9 @@ class ContractQuote:
     right: str  # "put" | "call"
     bid: float
     ask: float
+    # None when the feed did not send it. Quote filters treat unknown OI as
+    # "not thin" unless spreads.min_open_interest is enabled.
+    open_interest: Optional[int] = None
 
     @property
     def mid(self) -> float:

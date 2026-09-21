@@ -52,9 +52,21 @@ spreads:
   width: 5.00                 # 2.50 or 5.00
   dte_min: 30
   dte_max: 45
-  min_credit_pct_of_width: 0.20   # skip if credit < ~20% of width
+  min_credit_pct_of_width: 0.20   # skip if natural credit < ~20% of width
   # Conservative fillable credit = short bid − long ask (not mid).
+  # On uncrossed quotes the mid is >= this natural, so a debit natural is
+  # also a debit (or worse) at the mid. Quality gates run before the
+  # proposal log: missing, crossed, absurd, debit, then this 20% floor.
   credit_from: natural
+  # 0 disables. Reject a leg whose (ask−bid)/mid exceeds this.
+  max_leg_spread_pct_of_mid: 0
+  # Natural credit must be strictly below this fraction of width.
+  # A vertical cannot pay more than its width; 1.0 rejects credit >= width.
+  # 0 disables the upper bound.
+  max_credit_pct_of_width: 1.0
+  # 0 disables. When > 0, both legs need at least this open interest
+  # (unknown OI fails closed).
+  min_open_interest: 0
   multiplier: 100
   # Alpaca mleg limit_price is signed: negative = credit received.
   # Entries use day TIF; options extended_hours is always false.

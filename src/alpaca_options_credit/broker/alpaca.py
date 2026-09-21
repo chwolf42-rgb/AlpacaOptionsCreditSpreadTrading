@@ -19,6 +19,19 @@ from alpaca_options_credit.models import Bar, ContractQuote, OpenSpread, SpreadP
 log = logging.getLogger(__name__)
 
 
+def parse_open_interest(raw: Any) -> Optional[int]:
+    """Option-contract open interest. Blank / negative / non-numeric → None."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
 def _timeframe(bar: str):
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -288,6 +301,7 @@ class AlpacaMarketData:
                     right="put" if right.lower().startswith("p") else "call",
                     bid=bid,
                     ask=ask,
+                    open_interest=parse_open_interest(getattr(c, "open_interest", None)),
                 )
             )
         return out
