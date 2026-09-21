@@ -33,7 +33,10 @@ from alpaca_options_credit.models import (
 from alpaca_options_credit.risk import decide
 from alpaca_options_credit.rth import RTH_CLOSE, RTH_OPEN, as_et, is_rth, parse_hhmm
 from alpaca_options_credit.strategy.spreads import (
+    PRE_PROPOSAL_SKIP_REASONS,
     build_proposal,
+    entry_skip_event_kind,
+    mid_credit,
     should_roll,
     stop_hit,
     take_profit_hit,
@@ -317,7 +320,16 @@ class Engine:
             today=today,
             dte_min=int(sp.get("dte_min", 30)),
             dte_max=int(sp.get("dte_max", 45)),
+            max_leg_spread_pct_of_mid=float(sp.get("max_leg_spread_pct_of_mid") or 0),
+            max_credit_pct_of_width=_max_credit_pct(sp),
+            min_open_interest=int(sp.get("min_open_interest") or 0),
         )
+        # Junk / debit / thin credit never reaches the proposal log. Dry-run
+        # still places zero orders; these skips are counted by reason token.
+        if proposal.skip and proposal.skip_reason in PRE_PROPOSAL_SKIP_REASONS:
+            self._log_pre_proposal_skip(symbol, proposal, why)
+            return arm, None
+
         self.journal.log_event(
             "proposal",
             symbol,
@@ -340,6 +352,35 @@ class Engine:
             proposal.short.occ,
         )
         return arm, proposal
+
+    def _log_pre_proposal_skip(self, symbol: str, proposal: SpreadProposal, why: str) -> None:
+        kind = entry_skip_event_kind(proposal.skip_reason)
+        mid = mid_credit(proposal.short, proposal.long)
+        payload = {
+            "reason": proposal.skip_reason,
+            "skip_reason": proposal.skip_reason,
+            "spread_kind": proposal.kind.value,
+            "credit": proposal.credit,
+            "mid_credit": mid,
+            "width": proposal.width,
+            "short": proposal.short.occ,
+            "long": proposal.long.occ,
+            "short_bid": proposal.short.bid,
+            "short_ask": proposal.short.ask,
+            "long_bid": proposal.long.bid,
+            "long_ask": proposal.long.ask,
+            "pullback": why,
+        }
+        self.journal.log_event(kind, symbol, payload)
+        log.info(
+            "%s %s reason=%s credit=%.2f short=%s long=%s",
+            kind,
+            symbol,
+            proposal.skip_reason,
+            proposal.credit,
+            proposal.short.occ,
+            proposal.long.occ,
+        )
 
     def _maybe_open(
         self,
@@ -891,6 +932,14 @@ class Engine:
                 else float(loop_cfg.get("sleep_seconds_off_hours", 60))
             )
             time.sleep(sleep)
+
+
+def _max_credit_pct(sp: dict[str, Any]) -> float:
+    """Upper bound on natural credit / width. Missing → 1.0; 0 disables."""
+    raw = sp.get("max_credit_pct_of_width", 1.0)
+    if raw is None:
+        return 1.0
+    return float(raw)
 
 
 def _open_spread_detail(open_spreads: list[OpenSpread], *, prefix: str) -> str:

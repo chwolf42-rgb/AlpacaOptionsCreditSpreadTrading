@@ -19,7 +19,7 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Short strike | at/just beyond equity-style invalidation, rounded to a listed strike (not far-OTM lottery) |
 | Width | `$5.00` (or `$2.50`) |
 | DTE | 30–45 |
-| Credit gate | skip if credit &lt; ~20% of width (natural: short bid − long ask) |
+| Credit gate | natural credit = short bid − long ask. Missing, crossed, absurd, or non-positive quotes skip **before** the proposal log (`quote_missing`, `quote_crossed`, `quote_absurd`, `credit_debit`). Positive credit still skips below ~20% of width (`credit_below_min_pct`). Optional wide-market and open-interest knobs default off. |
 | Earnings / FOMC | skip new entries via `config/calendar.yaml` stub |
 | Take profit | ~50% of credit (debit-to-close ≤ 50% of credit), software mark each poll |
 | Stop | ~2× credit **or** underlying structure break, whichever first — **not** an equity OCO/bracket |
