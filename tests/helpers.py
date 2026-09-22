@@ -151,6 +151,29 @@ def flat_daily_bars(n: int = 24) -> list[Bar]:
     return [bar(i, 100.4, 99.6, 100.0, 500_000, step="day") for i in range(n)]
 
 
+def shift_bars(bars: list[Bar], delta: timedelta) -> list[Bar]:
+    return [
+        Bar(
+            ts=b.ts + delta,
+            open=b.open,
+            high=b.high,
+            low=b.low,
+            close=b.close,
+            volume=b.volume,
+        )
+        for b in bars
+    ]
+
+
+def align_bars_to(*series: list[Bar], end: datetime) -> tuple[list[Bar], ...]:
+    """Shift every series by the same delta so the newest bar lands on `end`."""
+    lasts = [s[-1].ts for s in series if s]
+    if not lasts:
+        return tuple(list(s) for s in series)
+    delta = end - max(lasts)
+    return tuple(shift_bars(s, delta) for s in series)
+
+
 class FakeMarketData:
     def __init__(
         self,
