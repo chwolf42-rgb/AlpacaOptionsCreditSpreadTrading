@@ -9,15 +9,11 @@ from alpaca_options_credit.models import Bar, ContractQuote
 from alpaca_options_credit.strategy.spreads import occ_symbol
 
 
-def _ts(i: int) -> datetime:
-    base = datetime(2026, 3, 3, 14, 30, tzinfo=timezone.utc)
-    return base + timedelta(hours=i)
-
-
-def bullish_pullback_bars(symbol: str = "SPY") -> list[Bar]:
+def bullish_pullback_bars(symbol: str = "SPY", *, as_of: Optional[datetime] = None) -> list[Bar]:
     """HH/HL confirm then first pullback into the broken-high / HVN shelf.
 
-    Same geometry as the unit-test series so `observe --fixture` is deterministic.
+    Same geometry as the unit-test series. The last bar ends one hour before
+    `as_of` (default: now) so the freshness gate accepts the fixture.
     """
     rows: list[tuple[float, float, float, float]] = []
     for _ in range(12):
@@ -47,8 +43,11 @@ def bullish_pullback_bars(symbol: str = "SPY") -> list[Bar]:
             (110.5, 108.8, 110.1, 1_100_000),
         ]
     )
+    as_of = as_of or datetime.now(timezone.utc)
+    end = as_of - timedelta(hours=1)
+    start = end - timedelta(hours=len(rows) - 1)
     return [
-        Bar(ts=_ts(i), open=c, high=h, low=l, close=c, volume=v)
+        Bar(ts=start + timedelta(hours=i), open=c, high=h, low=l, close=c, volume=v)
         for i, (h, l, c, v) in enumerate(rows)
     ]
 

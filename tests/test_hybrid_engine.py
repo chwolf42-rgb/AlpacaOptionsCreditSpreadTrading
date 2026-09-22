@@ -14,6 +14,7 @@ from alpaca_options_credit.journal import Journal
 from alpaca_options_credit.models import ArmStatus
 from tests.helpers import (
     FakeMarketData,
+    align_bars_to,
     flat_daily_bars,
     hybrid_happy_daily_hourly,
     hourly_waiting_no_tag,
@@ -28,7 +29,7 @@ def _events(journal: Journal) -> list[tuple[str, str, dict]]:
     return [(k, s, json.loads(p)) for k, s, p in rows]
 
 
-def _engine(tmp_path: Path, daily, hourly, mark: float = 0.80):
+def _engine(tmp_path: Path, daily, hourly, mark: float = 0.80, *, align: bool = True):
     cfg = load_config()
     cfg["bot"]["dry_run"] = True
     cfg["bot"]["var_dir"] = str(tmp_path / "var")
@@ -50,10 +51,12 @@ def _engine(tmp_path: Path, daily, hourly, mark: float = 0.80):
         short_bid=1.40,
         long_ask=0.25,
     )
+    now = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)
+    if align:
+        daily, hourly = align_bars_to(daily, hourly, end=now - timedelta(hours=1))
     data = FakeMarketData({"SPY": hourly}, chain, mark=mark, daily_map={"SPY": daily})
     broker = DryRunBroker(equity=100_000)
     journal = Journal(tmp_path / "journal.sqlite")
-    now = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)
     engine = Engine(
         cfg,
         journal,
@@ -155,7 +158,7 @@ def test_engine_daily_close_cancels_arm(tmp_path):
     engine.tick()
     assert journal.get_open_arm("SPY") is not None
 
-    broken = list(daily)
+    broken = list(data.daily_map["SPY"])
     last = broken[-1]
     broken[-1] = last.__class__(
         ts=last.ts + timedelta(days=1),
@@ -170,6 +173,63 @@ def test_engine_daily_close_cancels_arm(tmp_path):
     assert journal.get_open_arm("SPY") is None
     cancel_reasons = [p.get("reason") for k, _, p in _events(journal) if k == "arm_cancel"]
     assert "daily_structure_break" in cancel_reasons
+
+
+def test_stale_daily_bars_fail_closed_before_arm(tmp_path):
+    daily, hourly = hybrid_happy_daily_hourly()
+    engine, broker, journal, _ = _engine(tmp_path, daily, hourly, align=False)
+    result = engine.tick()
+    assert result.arms == []
+    assert result.proposals == []
+    assert broker.submitted_order_ids == []
+    assert broker.proposed_opens == []
+    assert journal.get_open_arm("SPY") is None
+    skips = [(k, p) for k, _, p in _events(journal) if k == "scan_skip"]
+    assert skips
+    assert skips[0][1]["reason"] == "stale_bars"
+    assert skips[0][1]["detail"].startswith("1Day:")
+    assert "arm" not in [k for k, _, _ in _events(journal)]
+
+
+def test_stale_hourly_bars_fail_closed(tmp_path):
+    daily, hourly = hybrid_happy_daily_hourly()
+    now = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)
+    (daily,) = align_bars_to(daily, end=now - timedelta(hours=1))
+    engine, broker, journal, _ = _engine(tmp_path, daily, hourly, align=False)
+    result = engine.tick()
+    assert result.arms == []
+    assert result.proposals == []
+    assert broker.proposed_opens == []
+    skips = [p for k, _, p in _events(journal) if k == "scan_skip"]
+    assert skips and skips[0]["reason"] == "stale_bars"
+    assert skips[0]["detail"].startswith("1Hour:")
+
+
+def test_stale_bars_do_not_cancel_open_arm(tmp_path):
+    daily, _ = hybrid_happy_daily_hourly()
+    hourly = hourly_waiting_no_tag(daily[27].ts)
+    engine, _, journal, data = _engine(tmp_path, daily, hourly)
+    engine.tick()
+    arm = journal.get_open_arm("SPY")
+    assert arm is not None
+
+    ancient_daily, ancient_hourly = hybrid_happy_daily_hourly()
+    data.daily_map["SPY"] = ancient_daily
+    data.bars_map["SPY"] = ancient_hourly
+    engine.tick()
+    assert journal.get_open_arm("SPY") is not None
+    assert journal.get_open_arm("SPY").id == arm.id
+    reasons = [p.get("reason") for k, _, p in _events(journal) if k == "scan_skip"]
+    assert "stale_bars" in reasons
+    assert [p.get("reason") for k, _, p in _events(journal) if k == "arm_cancel"] == []
+
+
+def test_empty_bars_are_stale(tmp_path):
+    engine, _, journal, _ = _engine(tmp_path, [], [], align=False)
+    engine.tick()
+    skips = [p for k, _, p in _events(journal) if k == "scan_skip"]
+    assert skips and skips[0]["reason"] == "stale_bars"
+    assert "empty" in skips[0]["detail"]
 
 
 def test_alpaca_timeframe_accepts_daily_and_hour():

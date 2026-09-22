@@ -29,7 +29,7 @@ from alpaca_options_credit.strategy.spreads import (
     pick_short_strike,
 )
 from alpaca_options_credit.strategy.structure import hybrid_entry
-from tests.helpers import FakeMarketData, hybrid_happy_daily_hourly
+from tests.helpers import FakeMarketData, align_bars_to, hybrid_happy_daily_hourly
 
 
 def test_default_credit_filters_keep_dry_run_and_width_floor():
@@ -265,10 +265,11 @@ def _ready_engine(tmp_path: Path, chain):
     cfg["calendar"]["skip_fomc"] = False
     cfg["calendar"]["skip_earnings"] = False
     daily, hourly = hybrid_happy_daily_hourly()
+    now = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)
+    daily, hourly = align_bars_to(daily, hourly, end=now - timedelta(hours=1))
     data = FakeMarketData({"SPY": hourly}, chain, mark=0.80, daily_map={"SPY": daily})
     broker = DryRunBroker(equity=100_000)
     journal = Journal(tmp_path / "journal.sqlite")
-    now = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)
     engine = Engine(
         cfg,
         journal,

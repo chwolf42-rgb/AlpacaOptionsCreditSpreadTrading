@@ -6,6 +6,12 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+from alpaca_options_credit.bar_quality import (
+    DAILY_TIMEFRAMES,
+    HOURLY_TIMEFRAMES,
+    MIN30_TIMEFRAMES,
+    newest_closed_bars,
+)
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
     close_credit_spread_payload,
@@ -35,23 +41,27 @@ def parse_open_interest(raw: Any) -> Optional[int]:
 def _timeframe(bar: str):
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-    if bar in ("1Day", "1D", "Day", "daily"):
+    if bar in DAILY_TIMEFRAMES:
         return TimeFrame(1, TimeFrameUnit.Day)
-    if bar in ("1Hour", "1H", "60Min"):
+    if bar in HOURLY_TIMEFRAMES:
         return TimeFrame(1, TimeFrameUnit.Hour)
-    if bar in ("30Min", "30T"):
+    if bar in MIN30_TIMEFRAMES:
         return TimeFrame(30, TimeFrameUnit.Minute)
     raise ValueError(f"unsupported timeframe {bar!r} — use 1Day, 1Hour, or 30Min")
+
+
+def _bars_end() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _bars_start(timeframe: str, limit: int, end: datetime) -> datetime:
     """Lookback window long enough for daily VP (~20–30 sessions) or 1H timing."""
     tf = str(timeframe)
-    if tf in ("1Day", "1D", "Day", "daily"):
+    if tf in DAILY_TIMEFRAMES:
         return end - timedelta(days=max(limit * 3, 90))
-    if tf in ("1Hour", "1H", "60Min"):
+    if tf in HOURLY_TIMEFRAMES:
         return end - timedelta(days=max(21, (limit // 6) + 3))
-    if tf in ("30Min", "30T"):
+    if tf in MIN30_TIMEFRAMES:
         return end - timedelta(days=max(14, (limit // 12) + 3))
     return end - timedelta(days=30)
 
@@ -218,14 +228,17 @@ class AlpacaMarketData:
 
         feed_name = (self.cfg.get("market_data") or {}).get("stock_feed", "iex")
         feed = DataFeed.IEX if str(feed_name).lower() == "iex" else DataFeed.SIP
-        end = datetime.now(timezone.utc)
+        end = _bars_end()
         start = _bars_start(timeframe, limit, end)
+        # Do not pass limit. Alpaca returns oldest-first and keeps only the
+        # oldest `limit` rows, so limit=60 over a multi-month daily window
+        # ends in the past (AMAT 2026-09-21: 60 bars ending 2026-06-21).
+        # The SDK pages the whole [start, end] window when limit is unset.
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=_timeframe(timeframe),
             start=start,
             end=end,
-            limit=limit,
             feed=feed,
         )
         result = self._stock.get_stock_bars(req)
@@ -236,7 +249,7 @@ class AlpacaMarketData:
             raw = result.get(symbol) or []
         bars: list[Bar] = []
         for b in raw:
-            ts = getattr(b, "timestamp", None) or getattr(b, "t", datetime.now(timezone.utc))
+            ts = getattr(b, "timestamp", None) or getattr(b, "t", end)
             bars.append(
                 Bar(
                     ts=ts,
@@ -247,7 +260,17 @@ class AlpacaMarketData:
                     volume=float(getattr(b, "volume", 0) or 0),
                 )
             )
-        return bars
+        selected = newest_closed_bars(bars, timeframe, limit, end)
+        if selected:
+            log.debug(
+                "bars %s %s fetched=%d kept=%d last=%s",
+                symbol,
+                timeframe,
+                len(bars),
+                len(selected),
+                selected[-1].ts,
+            )
+        return selected
 
     def chain(
         self,

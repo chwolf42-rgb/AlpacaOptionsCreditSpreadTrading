@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,11 +15,12 @@ from alpaca_options_credit.config import load_config
 from alpaca_options_credit.engine import Engine
 from alpaca_options_credit.journal import Journal
 from alpaca_options_credit.models import (
+    Bar,
     OpenSpread,
     SpreadKind,
     SpreadStatus,
 )
-from tests.helpers import FakeMarketData, bar
+from tests.helpers import FakeMarketData
 
 
 RTH = datetime(2026, 3, 4, 15, 0, tzinfo=timezone.utc)  # 10:00 ET
@@ -34,14 +35,58 @@ def _events(journal: Journal) -> list[tuple[str, Optional[str], dict]]:
     return [(k, s, json.loads(p)) for k, s, p in rows]
 
 
+def _daily_ending(n: int, close: float, end: datetime) -> list[Bar]:
+    start = end - timedelta(days=n - 1)
+    return [
+        Bar(
+            ts=start + timedelta(days=i),
+            open=close,
+            high=close + 1,
+            low=close - 1,
+            close=close,
+            volume=800_000,
+        )
+        for i in range(n)
+    ]
+
+
 def _intact_daily(close: float = 110.0) -> list:
-    return [bar(i, close + 1, close - 1, close, 800_000, step="day") for i in range(12)]
+    # Session before the engine clock (2026-03-04) so the freshness gate accepts it.
+    end = datetime(2026, 3, 2, 21, 0, tzinfo=timezone.utc)
+    return _daily_ending(12, close, end)
 
 
 def _broken_daily(invalidation: float = 100.0) -> list:
     rows = _intact_daily(110.0)
-    last_i = len(rows)
-    rows.append(bar(last_i, invalidation + 1, invalidation - 2, invalidation - 1, 1_000_000, step="day"))
+    last = rows[-1]
+    rows.append(
+        Bar(
+            ts=last.ts + timedelta(days=1),
+            open=invalidation - 1,
+            high=invalidation + 1,
+            low=invalidation - 2,
+            close=invalidation - 1,
+            volume=1_000_000,
+        )
+    )
+    return rows
+
+
+def _ancient_broken_daily(invalidation: float = 100.0) -> list:
+    """Same break geometry, but the tail is months before the engine clock."""
+    end = datetime(2026, 1, 16, 21, 0, tzinfo=timezone.utc)
+    rows = _daily_ending(12, 110.0, end)
+    last = rows[-1]
+    rows.append(
+        Bar(
+            ts=last.ts + timedelta(days=1),
+            open=invalidation - 1,
+            high=invalidation + 1,
+            low=invalidation - 2,
+            close=invalidation - 1,
+            volume=1_000_000,
+        )
+    )
     return rows
 
 
@@ -362,6 +407,46 @@ def test_naked_short_off_hours_flags_without_flatten(tmp_path):
     assert broker.flattened_residuals == []
     assert journal.get_spread("sp1").status is SpreadStatus.EXITING
     assert "naked_leg_critical" in [k for k, _, _ in _events(journal)]
+
+
+def test_stale_daily_does_not_structure_exit(tmp_path):
+    engine, broker, journal, _, _ = _engine(
+        tmp_path,
+        mark=1.00,
+        credit=1.20,
+        daily=_ancient_broken_daily(100.0),
+        invalidation=100.0,
+    )
+    result = engine.tick()
+    assert not any("structure_break" in e for e in result.exits)
+    assert broker.proposed_closes == []
+    live = journal.get_spread("sp1")
+    assert live.status is SpreadStatus.OPEN
+    assert live.exit_reason == ""
+    stale = [p for k, _, p in _events(journal) if p.get("reason") == "stale_bars"]
+    assert stale
+    assert stale[0]["detail"].startswith("1Day:")
+
+
+def test_stale_structure_bars_still_take_profit(tmp_path):
+    ancient = _ancient_broken_daily(100.0)
+    # Quiet the last close so this is a mark exit, not a structure break.
+    last = ancient[-1]
+    ancient[-1] = last.__class__(
+        ts=last.ts,
+        open=110.0,
+        high=111.0,
+        low=109.0,
+        close=110.0,
+        volume=last.volume,
+    )
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=0.60, credit=1.20, daily=ancient, invalidation=100.0
+    )
+    result = engine.tick()
+    assert any(e.startswith("SPY:take_profit") for e in result.exits)
+    assert journal.get_spread("sp1").exit_reason == "take_profit"
+    assert broker.proposed_closes
 
 
 def test_dry_run_cancel_order_is_hard_error():

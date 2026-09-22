@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+from alpaca_options_credit.bar_quality import STALE_BARS, stale_bars_detail
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
     close_credit_spread_payload,
@@ -215,6 +216,21 @@ class Engine:
         tf = self._tf_cfg()
         daily = self._structure_bars(symbol)
         hourly = self._timing_bars(symbol)
+        # Fail closed before structure / arm / entry. A stale tail must not
+        # confirm, arm, cancel, or open.
+        daily_tf = str(tf.get("structure_bar") or "1Day")
+        hourly_tf = str(tf.get("timing_bar") or "1Hour")
+        stale = stale_bars_detail(daily, daily_tf, now) or stale_bars_detail(
+            hourly, hourly_tf, now
+        )
+        if stale:
+            self.journal.log_event(
+                "scan_skip",
+                symbol,
+                {"reason": STALE_BARS, "detail": stale},
+            )
+            log.warning("stale bars %s %s", symbol, stale)
+            return None, None
         if len(daily) < 10:
             self.journal.log_event(
                 "scan_skip", symbol, {"reason": "daily_not_confirmed", "detail": "not_enough_bars"}
@@ -695,6 +711,17 @@ class Engine:
         reason: Optional[str] = None
         thesis_intact = True
         bars = self._structure_bars(spread.underlying)
+        structure_tf = str(self._tf_cfg().get("structure_bar") or "1Day")
+        stale = stale_bars_detail(bars, structure_tf, self.now_fn())
+        if stale:
+            # Do not structure-break on a stale daily tail. Mark exits still run.
+            self.journal.log_event(
+                "stale_bars",
+                spread.underlying,
+                {"reason": STALE_BARS, "detail": stale, "context": "exit_structure"},
+            )
+            log.warning("stale bars %s %s — skip structure exit", spread.underlying, stale)
+            bars = []
         if bars and exits_cfg.get("honor_structure_break", True):
             last = bars[-1]
             if spread.kind is SpreadKind.BULL_PUT_CREDIT and last.close < spread.invalidation:
