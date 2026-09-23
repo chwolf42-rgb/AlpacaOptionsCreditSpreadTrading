@@ -16,10 +16,13 @@ def test_tp_at_50pct_of_credit():
     assert captured_frac(credit, 0.60) == 0.5
 
 
-def test_stop_at_2x_credit():
+def test_stop_at_1_5x_credit():
     credit = 1.20
-    assert stop_hit(credit, 2.40, 2.0) is True
-    assert stop_hit(credit, 2.39, 2.0) is False
+    # 1.5 × 1.20 = 1.80. Default multiple follows the locked 1.5× config.
+    assert stop_hit(credit, 1.80, 1.5) is True
+    assert stop_hit(credit, 1.79, 1.5) is False
+    assert stop_hit(credit, 1.80) is True
+    assert stop_hit(credit, 1.79) is False
 
 
 def test_debit_to_close_is_short_minus_long():

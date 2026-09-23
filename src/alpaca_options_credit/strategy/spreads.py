@@ -30,6 +30,12 @@ QUOTE_THIN_OI = "quote_thin_oi"
 CREDIT_DEBIT = "credit_debit"
 CREDIT_BELOW_MIN_PCT = "credit_below_min_pct"
 
+# Managed exit tokens. EOD win/loss counts these. The credit stop used to be
+# journaled as stop_2x_credit; any stop* token is still a managed loss.
+TAKE_PROFIT_EXIT = "take_profit"
+STOP_CREDIT_EXIT = "stop_credit"
+STRUCTURE_BREAK_EXIT = "structure_break"
+
 # These fail before the proposal log. Structural skips (empty chain, DTE, …)
 # are not in this set.
 PRE_PROPOSAL_SKIP_REASONS = frozenset(
@@ -234,8 +240,8 @@ def take_profit_hit(credit: float, mark_to_close: float, tp_frac: float = 0.50) 
     return captured + 1e-12 >= tp_frac * credit
 
 
-def stop_hit(credit: float, mark_to_close: float, stop_mult: float = 2.0) -> bool:
-    """Stop when debit-to-close >= stop_mult × credit."""
+def stop_hit(credit: float, mark_to_close: float, stop_mult: float = 1.5) -> bool:
+    """Stop when debit-to-close >= stop_mult × credit (locked default 1.5×)."""
     return mark_to_close + 1e-12 >= stop_mult * credit
 
 

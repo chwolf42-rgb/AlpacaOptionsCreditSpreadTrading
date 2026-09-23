@@ -37,6 +37,8 @@ def test_default_credit_filters_keep_dry_run_and_width_floor():
     sp = cfg["spreads"]
     assert cfg["bot"]["dry_run"] is True
     assert sp["min_credit_pct_of_width"] == 0.20
+    assert cfg["exits"]["take_profit_frac_of_credit"] == 0.50
+    assert cfg["exits"]["stop_multiple_of_credit"] == 1.5
     assert sp["credit_from"] == "natural"
     assert sp["max_credit_pct_of_width"] == 1.0
     assert sp["max_leg_spread_pct_of_mid"] == 0
