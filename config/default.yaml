@@ -87,7 +87,9 @@ exits:
   atomic_spread_only: true
   # TP / stop are mark-to-close vs the credit received (not an equity R-ladder).
   take_profit_frac_of_credit: 0.50   # TP when debit-to-close <= 50% of credit
-  stop_multiple_of_credit: 2.0       # stop when debit-to-close >= 2× credit
+  # Tighter credit stop so a drawdown is cut before it consumes the edge.
+  # Take-profit stays 50% of credit. min_credit_pct_of_width stays 0.20.
+  stop_multiple_of_credit: 1.5       # stop when debit-to-close >= 1.5× credit
   # Stop also fires on underlying structure break (whichever first).
   honor_structure_break: true
   # On hit: submit one mleg debit-to-close for the journaled qty. If submit

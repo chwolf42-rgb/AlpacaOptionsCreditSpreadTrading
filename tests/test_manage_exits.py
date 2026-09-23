@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -238,13 +238,34 @@ def test_take_profit_closes_spread(tmp_path):
     assert engine.phase[0] == "exits"
 
 
-def test_stop_2x_credit_closes_spread(tmp_path):
-    engine, broker, journal, _, _ = _engine(tmp_path, mark=2.40, credit=1.20)
+def test_stop_1_5x_credit_closes_spread(tmp_path):
+    engine, broker, journal, _, _ = _engine(tmp_path, mark=1.80, credit=1.20)
     result = engine.tick()
-    assert any(e.startswith("SPY:stop_2x_credit") for e in result.exits)
+    assert any(e.startswith("SPY:stop_credit") for e in result.exits)
     assert journal.open_spreads() == []
-    assert journal.get_spread("sp1").exit_reason == "stop_2x_credit"
+    closed = journal.get_spread("sp1")
+    assert closed.exit_reason == "stop_credit"
+    assert closed.close_debit == pytest.approx(1.80)
     assert broker.proposed_closes
+    assert isinstance(broker, DryRunBroker)
+    summary = journal.summarize_managed_outcomes(
+        date(2026, 3, 4), date(2026, 3, 4), session="rth"
+    )
+    assert summary.n_wins == 0
+    assert summary.n_losses == 1
+    assert summary.win_rate == 0.0
+    # (1.20 - 1.80) * qty 2 * 100
+    assert summary.avg_loss == pytest.approx(-120.0)
+    assert summary.avg_win is None
+
+
+def test_mark_under_1_5x_does_not_stop(tmp_path):
+    engine, broker, journal, _, _ = _engine(tmp_path, mark=1.79, credit=1.20)
+    result = engine.tick()
+    assert result.exits == []
+    assert journal.open_spreads()
+    assert journal.get_spread("sp1").status is SpreadStatus.OPEN
+    assert broker.proposed_closes == []
 
 
 def test_structure_break_closes_even_when_mark_quiet(tmp_path):
@@ -268,7 +289,7 @@ def test_failed_close_retries_and_alerts(tmp_path):
     live = journal.open_spreads()
     assert len(live) == 1
     assert live[0].status is SpreadStatus.EXITING
-    assert live[0].exit_reason == "stop_2x_credit"
+    assert live[0].exit_reason == "stop_credit"
     assert live[0].close_attempts == 1
     assert live[0].last_close_error
     kinds = [k for k, _, _ in _events(journal)]
@@ -279,7 +300,7 @@ def test_failed_close_retries_and_alerts(tmp_path):
     # Mark recovers — latched exit must still retry (fail-closed).
     data.mark = 0.90
     second = engine.tick()
-    assert any(e == "SPY:stop_2x_credit" for e in second.exits)
+    assert any(e == "SPY:stop_credit" for e in second.exits)
     assert journal.open_spreads() == []
     assert journal.get_spread("sp1").status is SpreadStatus.CLOSED
     assert broker.proposed_closes
@@ -309,7 +330,7 @@ def test_working_close_is_not_cancelled_or_replaced(tmp_path):
         dry_run=False,
         broker=broker,
         status=SpreadStatus.EXITING,
-        exit_reason="stop_2x_credit",
+        exit_reason="stop_credit",
         exit_order_id="exit-working",
     )
     result = engine.tick()

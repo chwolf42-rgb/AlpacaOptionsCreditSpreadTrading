@@ -22,7 +22,7 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Credit gate | natural credit = short bid − long ask. Missing, crossed, absurd, or non-positive quotes skip **before** the proposal log (`quote_missing`, `quote_crossed`, `quote_absurd`, `credit_debit`). Positive credit still skips below ~20% of width (`credit_below_min_pct`). Optional wide-market and open-interest knobs default off. |
 | Earnings / FOMC | skip new entries via `config/calendar.yaml` stub |
 | Take profit | ~50% of credit (debit-to-close ≤ 50% of credit), software mark each poll |
-| Stop | ~2× credit **or** underlying structure break, whichever first — **not** an equity OCO/bracket |
+| Stop | ~1.5× credit **or** underlying structure break, whichever first — **not** an equity OCO/bracket |
 | Roll/repair | **stub** — close unless `exits.roll.execute` and thesis+DTE say otherwise |
 | Size | max loss = width×100 − credit×100; ~0.5% of equity; one spread per underlying |
 
@@ -43,7 +43,7 @@ Equity-sleeve stop bugs that **this bot is forbidden from growing**:
 
 **Atomic spread close only — no legging out.** Entry and exit submit `order_class=mleg` with **both** legs (short + long) in one order. Never close or cancel only the long or only the short of a healthy credit spread — that is how a naked short and a margin call happen. `exits.atomic_spread_only: true` is enforced. If a mleg only fills one side, that is **CRITICAL**: latch `naked_leg`, alert, and flatten the residual immediately (paired leftover via mleg, lone leftover via emergency flatten). Never leave a naked short resting.
 
-On TP, 2×-credit stop, or structure-break:
+On TP, 1.5×-credit stop, or structure-break:
 
 1. Latch `EXITING` + reason immediately (sticky even if the mark recovers).
 2. Submit one **2-leg** debit-to-close mleg. Journal `CLOSED` only if the broker **accepts** the close (dry-run treats the recorded payload as success).
@@ -124,6 +124,8 @@ The engine writes `var/options/heartbeat.json` **every loop**, including off-hou
 
 Journal path: `var/options/journal.sqlite` (arms, open spreads, exit state, event log). Isolated from equity/crypto `var/` trees.
 
+Closed spreads store `exit_reason`, `closed_at`, and `close_debit` (the debit-to-close mark). `Journal.summarize_managed_outcomes(start, end)` is the EOD query: managed win rate (take-profit vs credit-stop / structure-break), average win, average loss, `n_wins`, and `n_losses` for an inclusive America/New_York calendar-day range. Pass `session="rth"` to keep only weekday 09:30–16:00 ET closes. Dollars are `(credit - close_debit) × qty × multiplier` (default multiplier 100). A stop journaled before the debit column existed still counts; the helper implies the locked 1.5× stop and 50% take-profit when `close_debit` is missing. Legacy `stop_2x_credit` rows count as managed losses. `naked_leg` is not a managed outcome. Dry-run writes the same close row and still submits zero broker orders.
+
 ## Credentials (isolation)
 
 Precedence: **`OPTIONS_APCA_*` overrides inherited `APCA_*`**.
@@ -167,7 +169,7 @@ Investigated against current **alpaca-py** + Trading API:
 pytest
 ```
 
-Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, **engine TP / 2×-stop / structure-break close**, **failed-close retry + alert**, observer places no orders, max-loss sizing, one-spread-per-underlying, and the daily + 1H hybrid entry path.
+Coverage includes credential isolation, strike-near-invalidation, credit/width gate, TP/stop credit math, **engine TP / 1.5×-stop / structure-break close**, **failed-close retry + alert**, the EOD managed win/loss summary, observer places no orders, max-loss sizing, one-spread-per-underlying, and the daily + 1H hybrid entry path.
 
 ## Config
 

@@ -8,9 +8,16 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
+
+from alpaca_options_credit.rth import ET, RTH_CLOSE, RTH_OPEN, as_et
+from alpaca_options_credit.strategy.spreads import (
+    STRUCTURE_BREAK_EXIT,
+    TAKE_PROFIT_EXIT,
+)
 
 from alpaca_options_credit.models import (
     LIVE_SPREAD_STATUSES,
@@ -57,6 +64,8 @@ CREATE TABLE IF NOT EXISTS spreads (
     close_attempts INTEGER NOT NULL DEFAULT 0,
     exit_order_id TEXT,
     last_close_error TEXT NOT NULL DEFAULT '',
+    close_debit REAL,
+    closed_at TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -293,16 +302,124 @@ class Journal:
             ).fetchone()
         return int(row["close_attempts"]) if row else 0
 
-    def close_spread(self, spread_id: str, reason: str) -> None:
+    def close_spread(
+        self,
+        spread_id: str,
+        reason: str,
+        *,
+        close_debit: Optional[float] = None,
+        closed_at: Optional[str] = None,
+    ) -> None:
+        """Mark the spread closed. First close time and a later debit are kept.
+
+        ``close_debit`` is the debit-to-close mark (premium points). Realized
+        P&L for the EOD digest is ``(credit - close_debit) * qty * multiplier``.
+        """
+        stamp = closed_at or _now()
         with self._conn() as con:
             con.execute(
                 """
                 UPDATE spreads
-                SET status=?, exit_reason=?, last_close_error='', updated_at=?
+                SET status=?,
+                    exit_reason=?,
+                    last_close_error='',
+                    close_debit=COALESCE(?, close_debit),
+                    closed_at=COALESCE(closed_at, ?),
+                    updated_at=?
                 WHERE id=?
                 """,
-                (SpreadStatus.CLOSED.value, reason, _now(), spread_id),
+                (
+                    SpreadStatus.CLOSED.value,
+                    reason,
+                    close_debit,
+                    stamp,
+                    stamp,
+                    spread_id,
+                ),
             )
+
+    def summarize_managed_outcomes(
+        self,
+        start: Union[date, datetime],
+        end: Union[date, datetime],
+        *,
+        session: str = "calendar",
+        multiplier: float = 100.0,
+        take_profit_frac: float = 0.50,
+        stop_multiple: float = 1.5,
+    ) -> "ManagedOutcomeSummary":
+        """Win rate and average win/loss for managed closes in a date window.
+
+        Query path for the EOD digest. ``date`` bounds are inclusive
+        America/New_York calendar days. ``datetime`` bounds are half-open
+        ``[start, end)``. ``session="rth"`` keeps only weekday 09:30–16:00 ET
+        closes; ``session="calendar"`` (default) keeps the whole ET day.
+
+        A managed win is ``take_profit``. A managed loss is a credit stop
+        (``stop_credit``, legacy ``stop_2x_credit``, or any ``stop*`` token)
+        or ``structure_break``. Other closes, including ``naked_leg``, are
+        omitted. Dry-run journals the same row and still sends no broker order.
+
+        ``avg_win`` and ``avg_loss`` are mean realized dollars,
+        ``(credit - close_debit) * qty * multiplier``. ``avg_loss`` is signed.
+        When ``close_debit`` was not stored, take-profit and stop use the
+        locked policy (capture ``take_profit_frac`` of credit; stop at
+        ``stop_multiple`` × credit). A structure exit without a debit counts
+        in ``n_losses`` and is left out of ``avg_loss``. ``win_rate`` is
+        ``n_wins / (n_wins + n_losses)``, or None when the window is empty.
+        """
+        if session not in {"calendar", "rth"}:
+            raise ValueError(f"session must be 'calendar' or 'rth', got {session!r}")
+        window_start, window_end = _outcome_window(start, end)
+        with self._conn() as con:
+            rows = con.execute(
+                """
+                SELECT credit, qty, exit_reason, close_debit, closed_at, updated_at
+                FROM spreads
+                WHERE status=?
+                """,
+                (SpreadStatus.CLOSED.value,),
+            ).fetchall()
+
+        win_pnls: list[float] = []
+        loss_pnls: list[float] = []
+        n_wins = 0
+        n_losses = 0
+        for row in rows:
+            closed = _parse_ts(row["closed_at"]) or _parse_ts(row["updated_at"])
+            if closed is None or not _in_outcome_window(
+                closed, window_start, window_end, session
+            ):
+                continue
+            bucket = _managed_bucket(str(row["exit_reason"] or ""))
+            if bucket is None:
+                continue
+            pnl = _realized_dollars(
+                credit=float(row["credit"]),
+                qty=int(row["qty"]),
+                reason=str(row["exit_reason"] or ""),
+                close_debit=row["close_debit"],
+                multiplier=multiplier,
+                take_profit_frac=take_profit_frac,
+                stop_multiple=stop_multiple,
+            )
+            if bucket == "win":
+                n_wins += 1
+                if pnl is not None:
+                    win_pnls.append(pnl)
+            else:
+                n_losses += 1
+                if pnl is not None:
+                    loss_pnls.append(pnl)
+
+        managed = n_wins + n_losses
+        return ManagedOutcomeSummary(
+            win_rate=(n_wins / managed) if managed else None,
+            avg_win=_mean(win_pnls),
+            avg_loss=_mean(loss_pnls),
+            n_wins=n_wins,
+            n_losses=n_losses,
+        )
 
 
 def _arm_from_row(row: sqlite3.Row) -> Arm:
@@ -341,6 +458,8 @@ def _spread_from_row(row: sqlite3.Row) -> OpenSpread:
         close_attempts=int(_row_get(row, "close_attempts", 0) or 0),
         exit_order_id=_row_get(row, "exit_order_id", None),
         last_close_error=str(_row_get(row, "last_close_error", "") or ""),
+        close_debit=_optional_float(_row_get(row, "close_debit", None)),
+        closed_at=str(_row_get(row, "closed_at", "") or ""),
     )
 
 
@@ -362,3 +481,110 @@ def _migrate_spreads(con: sqlite3.Connection) -> None:
         con.execute(
             "ALTER TABLE spreads ADD COLUMN last_close_error TEXT NOT NULL DEFAULT ''"
         )
+    if "close_debit" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN close_debit REAL")
+    if "closed_at" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN closed_at TEXT")
+
+
+@dataclass(frozen=True)
+class ManagedOutcomeSummary:
+    """Managed closes for one EOD window.
+
+    ``avg_win`` and ``avg_loss`` are mean realized dollars. ``avg_loss`` is
+    signed (negative when those closes lost money). ``win_rate`` is None when
+    ``n_wins + n_losses`` is zero.
+    """
+
+    win_rate: Optional[float]
+    avg_win: Optional[float]
+    avg_loss: Optional[float]
+    n_wins: int
+    n_losses: int
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _mean(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _managed_bucket(reason: str) -> Optional[str]:
+    """``win`` for take-profit, ``loss`` for stop / structure, else unmanaged."""
+    if reason == TAKE_PROFIT_EXIT:
+        return "win"
+    if reason == STRUCTURE_BREAK_EXIT or reason.startswith("stop"):
+        return "loss"
+    return None
+
+
+def _realized_dollars(
+    *,
+    credit: float,
+    qty: int,
+    reason: str,
+    close_debit: Any,
+    multiplier: float,
+    take_profit_frac: float,
+    stop_multiple: float,
+) -> Optional[float]:
+    debit = _optional_float(close_debit)
+    if debit is None:
+        if reason == TAKE_PROFIT_EXIT:
+            debit = credit * (1.0 - take_profit_frac)
+        elif reason.startswith("stop"):
+            debit = stop_multiple * credit
+        else:
+            return None
+    return (credit - debit) * qty * multiplier
+
+
+def _parse_ts(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _outcome_window(
+    start: Union[date, datetime], end: Union[date, datetime]
+) -> tuple[datetime, datetime]:
+    if isinstance(start, datetime) and isinstance(end, datetime):
+        return _aware(start), _aware(end)
+    if isinstance(start, date) and isinstance(end, date) and not isinstance(
+        start, datetime
+    ) and not isinstance(end, datetime):
+        window_start = datetime.combine(start, time.min, tzinfo=ET)
+        window_end = datetime.combine(end + timedelta(days=1), time.min, tzinfo=ET)
+        return window_start, window_end
+    raise TypeError("start and end must both be dates or both be datetimes")
+
+
+def _aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _in_outcome_window(
+    ts: datetime, start: datetime, end: datetime, session: str
+) -> bool:
+    if not (start <= ts < end):
+        return False
+    if session == "calendar":
+        return True
+    local = as_et(ts)
+    if local.weekday() >= 5:
+        return False
+    return RTH_OPEN <= local.time() < RTH_CLOSE

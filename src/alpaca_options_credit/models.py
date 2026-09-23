@@ -116,3 +116,7 @@ class OpenSpread:
     close_attempts: int = 0
     exit_order_id: Optional[str] = None
     last_close_error: str = ""
+    # Debit-to-close at the accepted close, and when that close was journaled.
+    # EOD managed win/loss uses these; both stay empty until the spread closes.
+    close_debit: Optional[float] = None
+    closed_at: str = ""

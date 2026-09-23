@@ -59,7 +59,7 @@ def test_one_spread_per_underlying():
 def test_exiting_spread_still_blocks_same_underlying():
     exiting = _open("SPY")
     exiting.status = SpreadStatus.EXITING
-    exiting.exit_reason = "stop_2x_credit"
+    exiting.exit_reason = "stop_credit"
     d = decide(
         equity=100_000,
         proposal=_proposal("SPY"),

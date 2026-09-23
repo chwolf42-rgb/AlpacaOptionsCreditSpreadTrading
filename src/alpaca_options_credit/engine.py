@@ -35,6 +35,7 @@ from alpaca_options_credit.risk import decide
 from alpaca_options_credit.rth import RTH_CLOSE, RTH_OPEN, as_et, is_rth, parse_hhmm
 from alpaca_options_credit.strategy.spreads import (
     PRE_PROPOSAL_SKIP_REASONS,
+    STOP_CREDIT_EXIT,
     build_proposal,
     entry_skip_event_kind,
     mid_credit,
@@ -577,7 +578,6 @@ class Engine:
         submit: bool,
     ) -> list[str]:
         """If a mleg only filled one side, flatten the residual. Never rest a naked short."""
-        del now
         positions = self._option_positions()
         if positions is None:
             self.journal.log_event("naked_leg_status_unknown", None, {})
@@ -656,7 +656,12 @@ class Engine:
                     and accepted
                 )
             if accepted:
-                self.journal.close_spread(spread.id, "naked_leg")
+                self.journal.close_spread(
+                    spread.id,
+                    "naked_leg",
+                    close_debit=mark,
+                    closed_at=now.isoformat(),
+                )
                 reasons.append(f"{spread.underlying}:naked_leg")
             else:
                 reasons.append(f"{spread.underlying}:naked_leg:close_failed")
@@ -732,11 +737,11 @@ class Engine:
                 thesis_intact = False
         if reason is None and allow_mark and mark is not None:
             tp_frac = float(exits_cfg.get("take_profit_frac_of_credit", 0.50))
-            stop_mult = float(exits_cfg.get("stop_multiple_of_credit", 2.0))
+            stop_mult = float(exits_cfg.get("stop_multiple_of_credit", 1.5))
             if take_profit_hit(spread.credit, mark, tp_frac):
                 reason = "take_profit"
             elif stop_hit(spread.credit, mark, stop_mult):
-                reason = "stop_2x_credit"
+                reason = STOP_CREDIT_EXIT
         return reason, thesis_intact
 
     def _working_close_ids(self) -> Optional[set[str]]:
@@ -945,7 +950,9 @@ class Engine:
             if not accepted:
                 reasons.append(f"{live.underlying}:{reason}:close_failed")
                 continue
-            self.journal.close_spread(live.id, reason)
+            self.journal.close_spread(
+                live.id, reason, close_debit=mark, closed_at=now.isoformat()
+            )
             reasons.append(f"{live.underlying}:{reason}")
         return reasons
 
