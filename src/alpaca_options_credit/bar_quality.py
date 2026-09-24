@@ -67,6 +67,25 @@ def newest_closed_bars(
     return closed[-limit:]
 
 
+def last_completed_daily_bar(bars: list[Bar], now: datetime) -> Optional[Bar]:
+    """Daily close that entry rules may trust.
+
+    A newest bar still inside its session is forming: use the prior completed
+    session. A newest bar timestamped after `now` is kept as-is (synthetic
+    fixture tails are shifted past the clock on purpose). Live fetches already
+    drop the forming session before the engine sees them.
+    """
+    if not bars:
+        return None
+    last = max(bars, key=lambda b: _as_utc(b.ts))
+    if _as_utc(last.ts) <= _as_utc(now) and not is_bar_closed(last.ts, "1Day", now):
+        closed = [b for b in bars if b is not last and is_bar_closed(b.ts, "1Day", now)]
+        if not closed:
+            return None
+        return max(closed, key=lambda b: _as_utc(b.ts))
+    return last
+
+
 def stale_bars_detail(bars: list[Bar], timeframe: str, now: datetime) -> Optional[str]:
     """None when the newest bar is recent enough to trade. Otherwise a skip detail.
 

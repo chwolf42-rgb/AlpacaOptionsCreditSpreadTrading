@@ -218,8 +218,10 @@ def listed_chain(
     out: list[ContractQuote] = []
     for k in strikes:
         if invalidation is not None and short_bid is not None:
-            near_short = abs(k - invalidation) <= 0.76
-            near_long = abs(k - (invalidation - width if right == "put" else invalidation + width)) <= 0.76
+            # Cover the short min_short_inv_gap (1.0) will actually sell, plus
+            # one half-point strike, and the long that sits width below/above it.
+            near_short = abs(k - invalidation) <= 1.60
+            near_long = abs(k - (invalidation - width if right == "put" else invalidation + width)) <= 1.60
             if near_short:
                 b, a = short_bid, short_bid + 0.05
             elif near_long and long_ask is not None:
