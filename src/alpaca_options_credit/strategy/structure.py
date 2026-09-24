@@ -245,9 +245,22 @@ def structure_broken(view: StructureView, last: Bar) -> bool:
     """Close through invalidation. Wicks/dips that hold the close do NOT cancel."""
     if view.invalidation is None or view.side is None:
         return False
-    if view.side is Side.BULLISH:
-        return last.close < view.invalidation
-    return last.close > view.invalidation
+    return daily_close_through_invalidation(view.side, view.invalidation, last.close)
+
+
+def daily_close_through_invalidation(side: Side, invalidation: float, last_close: float) -> bool:
+    """True when a daily close is already through structure invalidation.
+
+    Bullish (bull put): close < invalidation. Bearish (bear call): close > invalidation.
+    A close exactly on the level still holds. This is the same comparison as an
+    arm-cancel / structure-break close; entry uses it on the last *completed*
+    daily bar so an aged arm cannot open underwater.
+    """
+    if side is Side.BULLISH:
+        return last_close < invalidation
+    if side is Side.BEARISH:
+        return last_close > invalidation
+    return True
 
 
 def first_pullback(

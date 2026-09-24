@@ -43,6 +43,7 @@ def test_default_credit_filters_keep_dry_run_and_width_floor():
     assert sp["max_credit_pct_of_width"] == 1.0
     assert sp["max_leg_spread_pct_of_mid"] == 0
     assert sp["min_open_interest"] == 0
+    assert sp["min_short_inv_gap"] == 1.0
 
 
 def test_credit_width_gate_20pct():
@@ -293,7 +294,9 @@ def _inv_chain(short_ba, long_ba):
     exp = date(2026, 3, 3) + timedelta(days=37)
     width = 5.0
     strikes = [round(90 + i * 0.5, 2) for i in range(0, 50)]
-    short_k = pick_short_strike(inv, strikes, adverse="down")
+    gap = float(load_config()["spreads"]["min_short_inv_gap"])
+    short_k = pick_short_strike(inv, strikes, adverse="down", min_short_inv_gap=gap)
+    assert short_k is not None
     long_k = long_strike_for(SpreadKind.BULL_PUT_CREDIT, short_k, width)
     out = []
     for k in strikes:

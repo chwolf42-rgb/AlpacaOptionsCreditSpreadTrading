@@ -16,7 +16,8 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Higher TF | **Daily + 1Hour hybrid** (locked; not 1H-only) |
 | Entry | daily strict confirm → arm → **first 1H pullback** into the *daily* VP shelf **or** daily S/R, then **1H reconfirm** of the daily trend; **no chase** |
 | Cancel arm | **daily** structure-break **close** through invalidation; 1H dips do **not** cancel |
-| Short strike | at/just beyond equity-style invalidation, rounded to a listed strike (not far-OTM lottery) |
+| Short strike | nearest listed strike that clears `spreads.min_short_inv_gap` (default **1.0** point) beyond invalidation. Inside the gap skips `short_too_close_to_inv` (do not tighten back into invalidation) |
+| Underwater open | no open and no openable proposal when the last **completed** daily close is already through invalidation (bull put: close ≥ inv, bear call: close ≤ inv). Skip `underwater_open_blocked` / `daily_close_through_inv` |
 | Width | `$5.00` (or `$2.50`) |
 | DTE | 30–45 |
 | Credit gate | natural credit = short bid − long ask. Missing, crossed, absurd, or non-positive quotes skip **before** the proposal log (`quote_missing`, `quote_crossed`, `quote_absurd`, `credit_debit`). Positive credit still skips below ~20% of width (`credit_below_min_pct`). Optional wide-market and open-interest knobs default off. |
@@ -58,6 +59,10 @@ Daily bars own **trend bias** (strict HH/HL or LL/LH), the **VP shelf**, and the
 1H dips do **not** cancel an arm. Only a **daily** close through invalidation does. `timeframe.arm_timeout_bars` is counted in **daily structure bars** after confirm (not 1H bars, not calendar days). Daily VP lookback is ~20–30 sessions (`timeframe.volume_profile.lookback_bars`).
 
 Journal reasons: `daily_not_confirmed`, `waiting_1h_pullback`, `1h_reconfirm_failed`, `chase`, `daily_structure_break`.
+
+An arm can sit for days. Before strikes are chosen and again before an observer fill or live open, the last completed daily close must still hold the armed invalidation (bull put `close >= invalidation`, bear call `close <= invalidation`). A forming session bar does not hide a prior completed close that already went through. That blocks the EEM-style open (armed with inv 68.41, later filled while the completed daily close was already under it). 1H dips still do not cancel the arm. `exits.honor_structure_break` is a separate exit and is unchanged.
+
+The short strike has to clear `spreads.min_short_inv_gap` (default 1.0) so structure-break and short-ITM are not the same print. Bull put: `short <= inv - gap`. Bear call: `short >= inv + gap`. EEM short 68 vs inv 68.41 (gap 0.41) fails a 1.0 gap. If no listed strike clears it, the skip is `short_too_close_to_inv`.
 
 Credit-spread construction (bull put / bear call, 30–45 DTE) and options-native exits are unchanged. Observer / dry-run still places **zero** orders.
 

@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
-from alpaca_options_credit.bar_quality import STALE_BARS, stale_bars_detail
+from alpaca_options_credit.bar_quality import (
+    STALE_BARS,
+    last_completed_daily_bar,
+    stale_bars_detail,
+)
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
     close_credit_spread_payload,
@@ -34,16 +38,22 @@ from alpaca_options_credit.models import (
 from alpaca_options_credit.risk import decide
 from alpaca_options_credit.rth import RTH_CLOSE, RTH_OPEN, as_et, is_rth, parse_hhmm
 from alpaca_options_credit.strategy.spreads import (
+    DAILY_CLOSE_THROUGH_INV,
     PRE_PROPOSAL_SKIP_REASONS,
     STOP_CREDIT_EXIT,
+    UNDERWATER_OPEN_BLOCKED,
     build_proposal,
     entry_skip_event_kind,
     mid_credit,
     should_roll,
+    side_for_spread,
     stop_hit,
     take_profit_hit,
 )
-from alpaca_options_credit.strategy.structure import hybrid_entry
+from alpaca_options_credit.strategy.structure import (
+    daily_close_through_invalidation,
+    hybrid_entry,
+)
 
 log = logging.getLogger(__name__)
 
@@ -316,6 +326,12 @@ class Engine:
             self.journal.log_event("calendar_skip", symbol, {"reason": skip_cal})
             return arm, None
 
+        # Aged arms: the Monday invalidation can be underwater by the time a
+        # later 1h reconfirm fires. Block before strike selection so we do not
+        # emit an openable proposal. Structure-break *exits* are unchanged.
+        if self._open_blocked_by_daily_close(symbol, arm.side, arm.invalidation, daily, now):
+            return arm, None
+
         sp = self.cfg.get("spreads") or {}
         width = float(sp.get("width", 5.0))
         right = "put" if arm.side is Side.BULLISH else "call"
@@ -340,6 +356,7 @@ class Engine:
             max_leg_spread_pct_of_mid=float(sp.get("max_leg_spread_pct_of_mid") or 0),
             max_credit_pct_of_width=_max_credit_pct(sp),
             min_open_interest=int(sp.get("min_open_interest") or 0),
+            min_short_inv_gap=float(sp.get("min_short_inv_gap", 1.0)),
         )
         # Junk / debit / thin credit never reaches the proposal log. Dry-run
         # still places zero orders; these skips are counted by reason token.
@@ -399,6 +416,56 @@ class Engine:
             proposal.long.occ,
         )
 
+    def _open_blocked_by_daily_close(
+        self,
+        symbol: str,
+        side: Side,
+        invalidation: float,
+        bars: list[Bar],
+        now: datetime,
+    ) -> bool:
+        """Refuse an open when the last completed daily close is through inv.
+
+        Does not change arm-cancel or the structure_break exit. A forming
+        session bar cannot hide a prior completed close that already broke.
+        """
+        completed = last_completed_daily_bar(bars, now)
+        if completed is None:
+            self.journal.log_event(
+                "entry_skip",
+                symbol,
+                {
+                    "reason": UNDERWATER_OPEN_BLOCKED,
+                    "detail": "no_completed_daily_bar",
+                    "skip_reason": UNDERWATER_OPEN_BLOCKED,
+                    "invalidation": invalidation,
+                    "side": side.value,
+                },
+            )
+            log.info("underwater open blocked %s — no completed daily close", symbol)
+            return True
+        if not daily_close_through_invalidation(side, invalidation, completed.close):
+            return False
+        self.journal.log_event(
+            "entry_skip",
+            symbol,
+            {
+                "reason": UNDERWATER_OPEN_BLOCKED,
+                "detail": DAILY_CLOSE_THROUGH_INV,
+                "skip_reason": UNDERWATER_OPEN_BLOCKED,
+                "invalidation": invalidation,
+                "last_daily_close": completed.close,
+                "side": side.value,
+            },
+        )
+        log.info(
+            "underwater open blocked %s close=%.4f inv=%.4f",
+            symbol,
+            completed.close,
+            invalidation,
+        )
+        return True
+
     def _maybe_open(
         self,
         proposal: SpreadProposal,
@@ -406,6 +473,18 @@ class Engine:
         now: datetime,
     ) -> None:
         if proposal.skip:
+            return
+        # Fill-time gate. A proposal built on an earlier bar must not become
+        # an observer fill or a live open after the completed daily close
+        # has gone through invalidation.
+        daily = self._structure_bars(proposal.underlying)
+        if self._open_blocked_by_daily_close(
+            proposal.underlying,
+            side_for_spread(proposal.kind),
+            proposal.invalidation,
+            daily,
+            now,
+        ):
             return
         risk_cfg = self.cfg.get("risk") or {}
         equity = self.broker.account_equity() or float(risk_cfg.get("paper_equity_fallback", 100000))

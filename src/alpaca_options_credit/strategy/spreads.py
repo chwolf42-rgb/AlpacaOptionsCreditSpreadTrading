@@ -29,6 +29,10 @@ QUOTE_WIDE = "quote_wide"
 QUOTE_THIN_OI = "quote_thin_oi"
 CREDIT_DEBIT = "credit_debit"
 CREDIT_BELOW_MIN_PCT = "credit_below_min_pct"
+# Entry locks (2026-09-24). Distinct from the structure_break *exit* token.
+SHORT_TOO_CLOSE_TO_INV = "short_too_close_to_inv"
+UNDERWATER_OPEN_BLOCKED = "underwater_open_blocked"
+DAILY_CLOSE_THROUGH_INV = "daily_close_through_inv"
 
 # Managed exit tokens. EOD win/loss counts these. The credit stop used to be
 # journaled as stop_2x_credit; any stop* token is still a managed loss.
@@ -66,16 +70,33 @@ def pick_short_strike(
     listed: Sequence[float],
     *,
     adverse: str,
+    min_short_inv_gap: float = 0.0,
 ) -> Optional[float]:
-    """Listed strike at or just beyond the structure stop (not far-OTM lottery).
+    """Listed strike beyond invalidation, not a far-OTM lottery.
 
-    adverse='down' (bull put): prefer nearest strike, stepping to <= invalidation
-    if the nearest prints inside the structure.
-    adverse='up' (bear call): prefer nearest, stepping to >= invalidation if inside.
+    adverse='down' (bull put): nearest strike at or below invalidation.
+    adverse='up' (bear call): nearest strike at or above invalidation.
+
+    When ``min_short_inv_gap`` > 0 the short must clear that many points so a
+    structure-break print and the short going ITM are not the same price:
+    bull put ``short <= invalidation - gap``, bear call ``short >= invalidation + gap``.
+    The chosen strike is the listed one closest to invalidation that still
+    clears the gap. If every listed strike is inside the gap, return None
+    (caller skips ``short_too_close_to_inv``) instead of tightening back toward
+    invalidation.
     """
     if not listed:
         return None
     unique = sorted(set(float(s) for s in listed))
+    gap = float(min_short_inv_gap or 0.0)
+    if gap > 0:
+        if adverse == "down":
+            limit = invalidation - gap
+            eligible = [s for s in unique if s <= limit + 1e-9]
+            return max(eligible) if eligible else None
+        limit = invalidation + gap
+        eligible = [s for s in unique if s >= limit - 1e-9]
+        return min(eligible) if eligible else None
     nearest = min(unique, key=lambda s: (abs(s - invalidation), s))
     if adverse == "down":
         if nearest > invalidation:
@@ -86,6 +107,14 @@ def pick_short_strike(
         beyond = [s for s in unique if s >= invalidation]
         return min(beyond) if beyond else nearest
     return nearest
+
+
+def side_for_spread(kind: SpreadKind) -> Side:
+    if kind is SpreadKind.BULL_PUT_CREDIT:
+        return Side.BULLISH
+    if kind is SpreadKind.BEAR_CALL_CREDIT:
+        return Side.BEARISH
+    raise ValueError(f"unsupported structure {kind}")
 
 
 def long_strike_for(kind: SpreadKind, short_strike: float, width: float) -> float:
@@ -277,6 +306,7 @@ def build_proposal(
     max_leg_spread_pct_of_mid: float = 0.0,
     max_credit_pct_of_width: float = 1.0,
     min_open_interest: int = 0,
+    min_short_inv_gap: float = 0.0,
 ) -> SpreadProposal:
     kind = (
         SpreadKind.BULL_PUT_CREDIT if side is Side.BULLISH else SpreadKind.BEAR_CALL_CREDIT
@@ -294,9 +324,21 @@ def build_proposal(
     slice_ = [c for c in matching if c.expiration == expiration]
     listed = [c.strike for c in slice_]
     adverse = "down" if kind is SpreadKind.BULL_PUT_CREDIT else "up"
-    short_k = pick_short_strike(invalidation, listed, adverse=adverse)
+    short_k = pick_short_strike(
+        invalidation,
+        listed,
+        adverse=adverse,
+        min_short_inv_gap=min_short_inv_gap,
+    )
     if short_k is None:
-        return _skip_proposal(underlying, kind, width, invalidation, "no_listed_short")
+        # Listed strikes that all sit inside the gap are not "no strike".
+        # Do not walk the short back toward invalidation to force a candidate.
+        reason = (
+            SHORT_TOO_CLOSE_TO_INV
+            if min_short_inv_gap > 0 and listed
+            else "no_listed_short"
+        )
+        return _skip_proposal(underlying, kind, width, invalidation, reason)
 
     long_k = long_strike_for(kind, short_k, width)
     short = _by_strike(slice_, short_k)

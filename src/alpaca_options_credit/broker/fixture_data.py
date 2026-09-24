@@ -65,8 +65,9 @@ def fixture_chain(
     long_k = invalidation - width if right == "put" else invalidation + width
     out: list[ContractQuote] = []
     for k in strikes:
-        near_short = abs(k - invalidation) <= 0.76
-        near_long = abs(k - long_k) <= 0.76
+        # Same window as tests: the 1.0-point short/inv gap steps one strike away.
+        near_short = abs(k - invalidation) <= 1.60
+        near_long = abs(k - long_k) <= 1.60
         if near_short:
             bid, ask = 1.40, 1.45
         elif near_long:
