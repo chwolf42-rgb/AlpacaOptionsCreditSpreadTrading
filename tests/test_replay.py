@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from alpaca_options_credit.models import Bar, Side
 from alpaca_options_credit.replay.credit import (
     ReplayLimits,
+    bs_delta,
     bs_price,
     friday_expiration,
     half_spread,
@@ -16,6 +17,11 @@ from alpaca_options_credit.replay.credit import (
     simulate_exit,
     spread_mid,
     strike_increment,
+)
+from alpaca_options_credit.replay.marks import (
+    census_stops,
+    classify_stop,
+    quote_path_verdict,
 )
 from alpaca_options_credit.replay.engine import StructureParams, bar_end, replay_symbol
 from alpaca_options_credit.replay.filters import (
@@ -157,6 +163,22 @@ def test_take_profit_fills_at_half_credit_not_the_wick():
     )
     assert fill.reason == "take_profit"
     assert abs(fill.debit - 0.50) < 1e-9
+    quarter = simulate_exit(
+        side=Side.BULLISH,
+        short_k=100,
+        long_k=95,
+        credit=1.00,
+        iv=0.25,
+        expiration=date(2026, 4, 17),
+        invalidation=101,
+        bars=bars,
+        start_index=0,
+        bar_end_fn=lambda bar: bar.ts + timedelta(hours=1),
+        daily_close_at=lambda _when: None,
+        limits=ReplayLimits(tp_frac=0.25),
+    )
+    assert quarter.reason == "take_profit"
+    assert abs(quarter.debit - 0.75) < 1e-9
 
 
 def test_gap_stop_uses_the_open():
@@ -189,6 +211,135 @@ def test_gap_stop_uses_the_open():
     )
     assert fill.reason == "stop_credit"
     assert fill.debit > 1.5 * 1.00
+
+
+def test_close_stop_ignores_a_wick_that_recovers():
+    start = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)
+    bars = [
+        _bar(start, 110),
+        _bar(start + timedelta(hours=1), 110, high=112, low=70),
+    ]
+    common = dict(
+        side=Side.BULLISH,
+        short_k=100,
+        long_k=95,
+        credit=1.20,
+        iv=0.30,
+        expiration=date(2026, 4, 17),
+        invalidation=101,
+        bars=bars,
+        start_index=0,
+        bar_end_fn=lambda bar: bar.ts + timedelta(hours=1),
+        daily_close_at=lambda _when: None,
+    )
+    intrabar = simulate_exit(**common, limits=ReplayLimits(stop_check="intrabar"))
+    on_close = simulate_exit(**common, limits=ReplayLimits(stop_check="close"))
+    assert intrabar.reason == "stop_credit"
+    assert on_close.reason != "stop_credit"
+    assert classify_stop(
+        ReplayTrade(
+            symbol="X",
+            side="bullish",
+            variant="baseline",
+            entry_time=start,
+            exit_time=start,
+            exit_reason="stop_credit",
+            credit=1.20,
+            debit=intrabar.debit,
+            width=5,
+            qty=1,
+            max_loss=100,
+            pnl=-50,
+            short_strike=100,
+            iv=0.3,
+            open_mid=intrabar.open_mid,
+            adverse_mid=intrabar.adverse_mid,
+            close_mid=intrabar.close_mid,
+            close_natural=intrabar.close_natural,
+        )
+    ) == "wick"
+
+
+def test_structure_only_does_not_take_the_price_stop():
+    start = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)
+    bars = [
+        _bar(start, 110),
+        _bar(start + timedelta(hours=1), 110, high=112, low=70),
+    ]
+    fill = simulate_exit(
+        side=Side.BULLISH,
+        short_k=100,
+        long_k=95,
+        credit=1.20,
+        iv=0.30,
+        expiration=date(2026, 4, 17),
+        invalidation=101,
+        bars=bars,
+        start_index=0,
+        bar_end_fn=lambda bar: bar.ts + timedelta(hours=1),
+        daily_close_at=lambda _when: None,
+        limits=ReplayLimits(stop_check="none"),
+    )
+    assert fill.reason != "stop_credit"
+
+
+def test_delta_short_is_further_out_than_the_nearest_strike():
+    when = datetime(2026, 1, 5, 21, 0, tzinfo=UTC)
+    nearest = modeled_proposal(
+        symbol="SPY",
+        side=Side.BULLISH,
+        invalidation=100,
+        spot=101,
+        when=when,
+        iv=0.25,
+        limits=ReplayLimits(),
+    )
+    further = modeled_proposal(
+        symbol="SPY",
+        side=Side.BULLISH,
+        invalidation=100,
+        spot=101,
+        when=when,
+        iv=0.25,
+        limits=ReplayLimits(target_abs_delta=0.20),
+    )
+    assert nearest is not None and further is not None
+    assert not nearest.proposal.skip
+    assert further.proposal.short.strike < nearest.proposal.short.strike
+    if not further.proposal.skip:
+        assert abs(further.short_delta) < abs(nearest.short_delta)
+    call = bs_delta(100, 100, 30 / 365, 0.20, "call")
+    put = bs_delta(100, 100, 30 / 365, 0.20, "put")
+    assert 0.45 < call < 0.65
+    assert -0.55 < put < -0.35
+
+
+def test_quote_path_and_stop_census():
+    assert quote_path_verdict(1.0, [1.2, 1.6], [1.4, 1.8]) == "confirmed"
+    assert quote_path_verdict(1.0, [1.2, 1.4], [1.4, 1.7]) == "natural_only"
+    assert quote_path_verdict(1.0, [1.0], [1.2]) == "absent"
+    trade = ReplayTrade(
+        symbol="X",
+        side="bullish",
+        variant="baseline",
+        entry_time=datetime(2026, 7, 6, tzinfo=UTC),
+        exit_time=datetime(2026, 7, 7, tzinfo=UTC),
+        exit_reason="stop_credit",
+        credit=1.0,
+        debit=1.6,
+        width=5,
+        qty=1,
+        max_loss=400,
+        pnl=-60,
+        short_strike=100,
+        iv=0.2,
+        open_mid=1.1,
+        adverse_mid=1.8,
+        close_mid=1.2,
+        close_natural=1.4,
+    )
+    assert census_stops([trade]).wick_only == 1
+    assert census_stops([trade]).close_confirmed == 0
 
 
 def test_session_windows():

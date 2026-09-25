@@ -1,12 +1,143 @@
 # Win-rate study
 
-No change is warranted. On the long window the baseline credit spread wins 19.8% [16.3%, 23.7%] of the time and expects -$72 [-$79, -$65] per spread. Every filter's difference versus that book still covers zero, including win rate. None of them raise expectancy beyond sampling noise, and none raise win rate beyond sampling noise without hurting expectancy. Jul 6–Sep 25 2026 tells the same story. Defaults stay as they are. `config/paper-live.yaml` is not in this repo and was not added.
+On the long window the baseline wins 19.8% [16.3%, 23.7%] and expects -$72 [-$79, -$65] per spread (-19.2% [-20.9%, -17.4%] of max risk). 301 of those closes are the 1.5× credit stop. 171 of those stops are through on the hourly close mid. Another 127 are back inside on the mid but still through on the natural debit. Only 3 are back inside even after crossing the spread. The loss is not a wick or a bid/ask artifact. Change the tracked default to No price stop — close only on a structure break (take-profit still 50%). It improves expectancy per unit of risk beyond sampling noise. It does not turn the sleeve into a profit. These also cleared that bar and were not stacked on top: Stop at 2× credit, take-profit still 50%; Stop at 2.5× credit, take-profit still 50%; Stop at 3× credit, take-profit still 50%. No price stop — close only on a structure break (take-profit still 50%) expects -$56 [-$68, -$45] per spread (-15.1% [-18.0%, -12.1%] of max risk). The interval sits entirely below zero. The strategy should not keep running. The entry filters from the equity and crypto bots also stay inside noise. `config/paper-live.yaml` is not in this repo. Recommended values, where any differ from today, are in the decision below and in `config/default.yaml`.
 
-Winners stay about $61 and losers about -$105. The filters do not shrink the winners. They also do not separate from the loss. Almost every spread hits the 1.5× credit stop, the 50% take-profit, or a structure break before expiration. The short strike sits just beyond invalidation, so the credit is close to the money and the stop is close in price.
+## Is the 1.5× stop a pricing artifact?
+
+The stop is judged on the spread mid, which is how the live mark works. Inside the model the natural debit (short ask minus long bid) is always at least that mid, because the half-spread is a smooth 6% of the mid clamped between $0.05 and $0.25. There is no NBBO flicker to trip the stop. A mid that is through 1.5× credit means the debit you would pay to cross the market is through it as well.
+
+Of 301 baseline credit stops on the long window, 171 are through on the hourly close mid, 116 fire only on the high or low (38.5%), and 14 gap through the open and recover on the mid by the close. Of the stops whose close mid is back inside 1.5× credit, 127 still show a natural debit (short ask minus long bid) through the stop. That leaves 3 stops where even crossing the spread at the hourly close is back inside the stop.
+
+Alpaca historical option quotes were not pulled: OPTIONS_APCA_API_KEY_ID / OPTIONS_APCA_API_SECRET_KEY are not set in this environment, and config/paper-live.yaml is not in the repo.
+
+Yahoo daily option bars are last trades for contracts that are still listed. Expired contracts return no bars. The daily close is not an NBBO mid, and the adverse bound (short high − long low) is not a simultaneous print.
+
+Yahoo matched 13 of 40 sampled spreads on the entry session and 16 on the exit session. Median Yahoo daily close minus model mid, in premium points: entry 0.02, exit -0.45. Of 7 modeled stops with a Yahoo exit day, 3 have a Yahoo spread close through 1.5× credit, 4 stay inside on the close but the short-high/long-low bound crosses, and 0 never reach 1.5× credit inside that daily range.
+
+
+## Exit, distance, and DTE levers
+
+Same entries as the baseline. One knob changes at a time. A wider stop or a further short changes how long the name stays busy, so the trade list is not a paired subset of the baseline. The difference column is still mean expectancy/max-risk minus the baseline, with a 5,000-draw percentile interval. Stop multiples and the close-versus-wick test use the intrabar mid unless the row says the close. A take-profit fills at a debit of (1 − fraction) × credit, which is half the credit at 50%. Structure break is unchanged.
+
+Distance and delta use the same strike grid and the same 20% credit gate. A 30/20/15-delta short is the listed strike past the 1-point gap whose Black-Scholes |delta| is closest to the target. DTE is the Friday the live picker already chooses, inside a different window. Avg |delta| is the mean absolute short delta at entry.
+
+| Variant | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | Expectancy / max risk (95% CI) | Avg win | Avg loss | Avg |delta| |
+| --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: |
+| Baseline — daily confirm, one HVN shelf, 60-minute reconfirm | 430 | 3.02 | 19.8% [16.3%, 23.7%] | -$72 [-$79, -$65] | -19.2% [-20.9%, -17.4%] | $61 | -$105 | 0.37 |
+| Stop at 2× credit, take-profit still 50% | 358 | 2.51 | 39.9% [34.9%, 45.0%] | -$58 [-$69, -$48] | -15.6% [-18.3%, -12.7%] | $59 | -$136 | 0.37 |
+| Stop at 2.5× credit, take-profit still 50% | 347 | 2.43 | 41.8% [36.6%, 47.0%] | -$57 [-$68, -$46] | -15.2% [-18.1%, -12.2%] | $59 | -$140 | 0.37 |
+| Stop at 3× credit, take-profit still 50% | 347 | 2.43 | 41.8% [36.6%, 47.0%] | -$57 [-$68, -$45] | -15.1% [-18.1%, -12.2%] | $59 | -$140 | 0.37 |
+| No price stop — close only on a structure break (take-profit still 50%) | 347 | 2.43 | 41.8% [36.6%, 47.0%] | -$56 [-$68, -$45] | -15.1% [-18.0%, -12.1%] | $59 | -$139 | 0.37 |
+| 1.5× stop checked on the hourly close, not the wick | 409 | 2.87 | 24.0% [19.8%, 28.1%] | -$63 [-$70, -$56] | -16.8% [-18.6%, -15.0%] | $61 | -$102 | 0.37 |
+| Take-profit at 25% of credit, stop still 1.5× | 438 | 3.07 | 25.3% [21.2%, 29.5%] | -$71 [-$77, -$66] | -19.0% [-20.5%, -17.4%] | $30 | -$106 | 0.37 |
+| Take-profit at 65% of credit, stop still 1.5× | 426 | 2.99 | 18.1% [14.6%, 21.8%] | -$72 [-$79, -$64] | -19.0% [-20.9%, -17.1%] | $80 | -$105 | 0.37 |
+| Short strike at least 2 points beyond invalidation | 338 | 2.37 | 18.0% [13.9%, 22.2%] | -$75 [-$82, -$68] | -19.8% [-21.7%, -17.9%] | $60 | -$105 | 0.37 |
+| Short strike at least 5 points beyond invalidation | 157 | 1.10 | 12.1% [7.6%, 17.2%] | -$86 [-$95, -$77] | -22.7% [-25.0%, -20.2%] | $63 | -$107 | 0.36 |
+| Friday expiration in 21–35 DTE (target 28) | 334 | 2.34 | 22.2% [18.0%, 26.6%] | -$68 [-$75, -$60] | -18.0% [-20.0%, -16.0%] | $59 | -$104 | 0.37 |
+| Friday expiration in 45–60 DTE (target 52) | 557 | 3.91 | 20.3% [16.9%, 23.7%] | -$72 [-$78, -$66] | -19.3% [-20.9%, -17.6%] | $62 | -$106 | 0.38 |
+| Short strike nearest 30 delta, still past the 1-point gap | 195 | 1.37 | 22.1% [16.4%, 28.2%] | -$65 [-$75, -$56] | -16.8% [-19.2%, -14.2%] | $57 | -$100 | 0.30 |
+| Short strike nearest 20 delta, still past the 1-point gap | 3 | 0.02 | 0.0% [0.0%, 0.0%] | -$103 [-$110, -$95] | -26.1% [-28.2%, -23.9%] | n/a | -$103 | 0.20 |
+| Short strike nearest 15 delta, still past the 1-point gap | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a |
+
+| Variant | Trades | Take-profit | Credit stop | Structure break | Expiration | Open mark |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline — daily confirm, one HVN shelf, 60-minute reconfirm | 430 | 84 | 301 | 40 | 0 | 5 |
+| Stop at 2× credit, take-profit still 50% | 358 | 142 | 97 | 113 | 0 | 6 |
+| Stop at 2.5× credit, take-profit still 50% | 347 | 144 | 17 | 180 | 0 | 6 |
+| Stop at 3× credit, take-profit still 50% | 347 | 144 | 4 | 193 | 0 | 6 |
+| No price stop — close only on a structure break (take-profit still 50%) | 347 | 144 | 0 | 197 | 0 | 6 |
+| 1.5× stop checked on the hourly close, not the wick | 409 | 97 | 267 | 41 | 0 | 4 |
+| Take-profit at 25% of credit, stop still 1.5× | 438 | 111 | 288 | 37 | 0 | 2 |
+| Take-profit at 65% of credit, stop still 1.5× | 426 | 76 | 305 | 40 | 0 | 5 |
+| Short strike at least 2 points beyond invalidation | 338 | 60 | 240 | 33 | 0 | 5 |
+| Short strike at least 5 points beyond invalidation | 157 | 19 | 120 | 18 | 0 | 0 |
+| Friday expiration in 21–35 DTE (target 28) | 334 | 73 | 225 | 33 | 0 | 3 |
+| Friday expiration in 45–60 DTE (target 52) | 557 | 113 | 385 | 52 | 0 | 7 |
+| Short strike nearest 30 delta, still past the 1-point gap | 195 | 43 | 138 | 13 | 0 | 1 |
+| Short strike nearest 20 delta, still past the 1-point gap | 3 | 0 | 3 | 0 | 0 | 0 |
+| Short strike nearest 15 delta, still past the 1-point gap | 0 | 0 | 0 | 0 | 0 | 0 |
+
+### Difference vs baseline, long window (expectancy / max risk)
+
+| Variant | Difference | 95% CI | Reads as |
+| --- | ---: | --- | --- |
+| Stop at 2× credit, take-profit still 50% | 0.036 | [0.004, 0.069] | above noise |
+| Stop at 2.5× credit, take-profit still 50% | 0.040 | [0.006, 0.074] | above noise |
+| Stop at 3× credit, take-profit still 50% | 0.041 | [0.007, 0.074] | above noise |
+| No price stop — close only on a structure break (take-profit still 50%) | 0.041 | [0.007, 0.075] | above noise |
+| 1.5× stop checked on the hourly close, not the wick | 0.024 | [-0.002, 0.049] | inside noise |
+| Take-profit at 25% of credit, stop still 1.5× | 0.002 | [-0.022, 0.025] | inside noise |
+| Take-profit at 65% of credit, stop still 1.5× | 0.002 | [-0.024, 0.026] | inside noise |
+| Short strike at least 2 points beyond invalidation | -0.006 | [-0.032, 0.019] | inside noise |
+| Short strike at least 5 points beyond invalidation | -0.035 | [-0.064, -0.004] | worse than noise |
+| Friday expiration in 21–35 DTE (target 28) | 0.012 | [-0.015, 0.039] | inside noise |
+| Friday expiration in 45–60 DTE (target 52) | -0.001 | [-0.025, 0.023] | inside noise |
+| Short strike nearest 30 delta, still past the 1-point gap | 0.024 | [-0.006, 0.054] | inside noise |
+| Short strike nearest 20 delta, still past the 1-point gap | -0.069 | [-0.096, -0.043] | worse than noise |
+| Short strike nearest 15 delta, still past the 1-point gap | n/a | n/a | too few trades |
+
+### Recent window (2026-07-06 to 2026-09-25)
+
+| Variant | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | Expectancy / max risk (95% CI) | Avg win | Avg loss |
+| --- | ---: | ---: | --- | --- | --- | ---: | ---: |
+| Baseline — daily confirm, one HVN shelf, 60-minute reconfirm | 55 | 4.70 | 20.0% [10.9%, 30.9%] | -$68 [-$86, -$50] | -18.2% [-23.0%, -13.1%] | $61 | -$101 |
+| Stop at 2× credit, take-profit still 50% | 42 | 3.59 | 38.1% [23.8%, 52.4%] | -$58 [-$87, -$27] | -15.3% [-23.2%, -7.2%] | $59 | -$129 |
+| Stop at 2.5× credit, take-profit still 50% | 38 | 3.24 | 42.1% [26.3%, 57.9%] | -$53 [-$87, -$20] | -14.1% [-23.3%, -5.2%] | $59 | -$135 |
+| Stop at 3× credit, take-profit still 50% | 38 | 3.24 | 42.1% [26.3%, 57.9%] | -$54 [-$90, -$20] | -14.4% [-23.8%, -5.3%] | $59 | -$137 |
+| No price stop — close only on a structure break (take-profit still 50%) | 38 | 3.24 | 42.1% [26.3%, 57.9%] | -$53 [-$87, -$19] | -14.0% [-23.2%, -5.1%] | $59 | -$134 |
+| 1.5× stop checked on the hourly close, not the wick | 50 | 4.27 | 28.0% [16.0%, 40.0%] | -$55 [-$75, -$33] | -14.6% [-19.9%, -8.8%] | $61 | -$100 |
+| Take-profit at 25% of credit, stop still 1.5× | 57 | 4.87 | 28.1% [17.5%, 40.4%] | -$66 [-$83, -$49] | -17.7% [-22.1%, -13.1%] | $32 | -$105 |
+| Take-profit at 65% of credit, stop still 1.5× | 54 | 4.61 | 16.7% [7.4%, 27.8%] | -$70 [-$89, -$50] | -18.7% [-23.8%, -13.3%] | $78 | -$100 |
+| Short strike at least 2 points beyond invalidation | 47 | 4.01 | 14.9% [6.4%, 25.5%] | -$74 [-$91, -$55] | -19.6% [-24.3%, -14.4%] | $63 | -$98 |
+| Short strike at least 5 points beyond invalidation | 24 | 2.05 | 16.7% [4.2%, 33.3%] | -$80 [-$105, -$49] | -21.2% [-28.3%, -12.6%] | $75 | -$111 |
+| Friday expiration in 21–35 DTE (target 28) | 42 | 3.59 | 26.2% [14.3%, 40.5%] | -$59 [-$81, -$36] | -15.7% [-21.6%, -9.4%] | $59 | -$101 |
+| Friday expiration in 45–60 DTE (target 52) | 72 | 6.15 | 18.1% [9.7%, 27.8%] | -$71 [-$86, -$55] | -19.2% [-23.4%, -14.9%] | $59 | -$100 |
+| Short strike nearest 30 delta, still past the 1-point gap | 17 | 1.45 | 29.4% [11.8%, 52.9%] | -$48 [-$81, -$13] | -12.7% [-21.5%, -3.6%] | $56 | -$91 |
+| Short strike nearest 20 delta, still past the 1-point gap | 1 | 0.09 | 0.0% [0.0%, 0.0%] | -$103 [-$103, -$103] | -26.1% [-26.1%, -26.1%] | n/a | -$103 |
+| Short strike nearest 15 delta, still past the 1-point gap | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a |
+
+### Difference vs baseline, recent window (expectancy / max risk)
+
+| Variant | Difference | 95% CI | Reads as |
+| --- | ---: | --- | --- |
+| Stop at 2× credit, take-profit still 50% | 0.029 | [-0.067, 0.124] | inside noise |
+| Stop at 2.5× credit, take-profit still 50% | 0.041 | [-0.068, 0.144] | inside noise |
+| Stop at 3× credit, take-profit still 50% | 0.038 | [-0.073, 0.143] | inside noise |
+| No price stop — close only on a structure break (take-profit still 50%) | 0.042 | [-0.067, 0.145] | inside noise |
+| 1.5× stop checked on the hourly close, not the wick | 0.036 | [-0.038, 0.113] | inside noise |
+| Take-profit at 25% of credit, stop still 1.5× | 0.005 | [-0.063, 0.072] | inside noise |
+| Take-profit at 65% of credit, stop still 1.5× | -0.006 | [-0.078, 0.068] | inside noise |
+| Short strike at least 2 points beyond invalidation | -0.014 | [-0.085, 0.056] | inside noise |
+| Short strike at least 5 points beyond invalidation | -0.030 | [-0.118, 0.066] | inside noise |
+| Friday expiration in 21–35 DTE (target 28) | 0.025 | [-0.054, 0.104] | inside noise |
+| Friday expiration in 45–60 DTE (target 52) | -0.010 | [-0.076, 0.055] | inside noise |
+| Short strike nearest 30 delta, still past the 1-point gap | 0.055 | [-0.051, 0.161] | inside noise |
+| Short strike nearest 20 delta, still past the 1-point gap | -0.079 | [-0.131, -0.031] | worse than noise |
+| Short strike nearest 15 delta, still past the 1-point gap | n/a | n/a | too few trades |
+
+### Decision
+
+- **Adopt — Stop at 2× credit, take-profit still 50%.** On the long window, expectancy per unit of risk beats the baseline and the 95% interval on that difference sits entirely above zero. Jul–Sep difference in expectancy/risk is 0.029 [-0.067, 0.124].
+- **Adopt — Stop at 2.5× credit, take-profit still 50%.** On the long window, expectancy per unit of risk beats the baseline and the 95% interval on that difference sits entirely above zero. Jul–Sep difference in expectancy/risk is 0.041 [-0.068, 0.144].
+- **Adopt — Stop at 3× credit, take-profit still 50%.** On the long window, expectancy per unit of risk beats the baseline and the 95% interval on that difference sits entirely above zero. Jul–Sep difference in expectancy/risk is 0.038 [-0.073, 0.143].
+- **Adopt — No price stop — close only on a structure break (take-profit still 50%).** On the long window, expectancy per unit of risk beats the baseline and the 95% interval on that difference sits entirely above zero. Jul–Sep difference in expectancy/risk is 0.042 [-0.067, 0.145].
+- **Do not adopt — 1.5× stop checked on the hourly close, not the wick.** Expectancy per unit of risk differs by 0.024 [-0.002, 0.049]. That interval covers zero. Win rate differs by 0.042 [-0.014, 0.097].
+- **Do not adopt — Take-profit at 25% of credit, stop still 1.5×.** Expectancy per unit of risk differs by 0.002 [-0.022, 0.025]. That interval covers zero. Average win falls from $61 to $30.
+- **Do not adopt — Take-profit at 65% of credit, stop still 1.5×.** Expectancy per unit of risk differs by 0.002 [-0.024, 0.026]. That interval covers zero. Win rate differs by -0.017 [-0.068, 0.032].
+- **Do not adopt — Short strike at least 2 points beyond invalidation.** Expectancy per unit of risk differs by -0.006 [-0.032, 0.019]. That interval covers zero. Win rate differs by -0.017 [-0.073, 0.037].
+- **Do not adopt — Short strike at least 5 points beyond invalidation.** Expectancy per unit of risk differs by -0.035 [-0.064, -0.004]. That interval sits entirely below zero. Win rate differs by -0.077 [-0.138, -0.011].
+- **Do not adopt — Friday expiration in 21–35 DTE (target 28).** Expectancy per unit of risk differs by 0.012 [-0.015, 0.039]. That interval covers zero. Win rate differs by 0.024 [-0.035, 0.082].
+- **Do not adopt — Friday expiration in 45–60 DTE (target 52).** Expectancy per unit of risk differs by -0.001 [-0.025, 0.023]. That interval covers zero. Win rate differs by 0.005 [-0.047, 0.055].
+- **Do not adopt — Short strike nearest 30 delta, still past the 1-point gap.** Expectancy per unit of risk differs by 0.024 [-0.006, 0.054]. That interval covers zero. Win rate differs by 0.023 [-0.047, 0.092].
+- **Do not adopt — Short strike nearest 20 delta, still past the 1-point gap.** 3 trades on the long window is below 30, so the bootstrap interval cannot justify a default change.
+- **Do not adopt — Short strike nearest 15 delta, still past the 1-point gap.** 0 trades on the long window is below 30, so the bootstrap interval cannot justify a default change.
+
+The tracked default follows **No price stop — close only on a structure break (take-profit still 50%)**. Copy the same values into `config/paper-live.yaml` on the machine that places paper orders. Other rows that also cleared the bar were not stacked on top.
+
 
 ## What was held fixed
 
-Entries stay a daily strict confirm plus a volume-profile shelf, then the first timing-bar pullback and a timing-bar reconfirm. Exits stay take-profit at 50% of credit, stop at 1.5× credit, and a daily close through invalidation. Sizing stays 0.5% of equity per spread and 10% open risk, one spread per name, $5 wide, 30–45 DTE, natural credit at least 20% of width, short strike at least 1 point beyond invalidation.
+Entries stay a daily strict confirm plus a volume-profile shelf, then the first timing-bar pullback and a timing-bar reconfirm. The applied exit change is No price stop — close only on a structure break (take-profit still 50%). Every other exit knob stays at the baseline. Sizing stays 0.5% of equity per spread and 10% open risk, one spread per name, $5 wide, natural credit at least 20% of width.
 
 Checked-in `config/default.yaml` allows 20 concurrent spreads. The request described a 5-spread cap and a `config/paper-live.yaml` that is not in the tree. The decision uses the per-spread book (no cross-name cap). The 5-spread and 20-spread books are reported beside it; a filter that only looks good because of the cap does not get a default change.
 

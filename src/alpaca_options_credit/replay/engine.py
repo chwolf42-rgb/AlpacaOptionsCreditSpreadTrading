@@ -26,6 +26,8 @@ from alpaca_options_credit.replay.credit import (
     modeled_proposal,
     realized_vol,
     simulate_exit,
+    spread_mid,
+    year_fraction,
 )
 from alpaca_options_credit.replay.filters import (
     EMA_PERIOD,
@@ -162,8 +164,13 @@ def replay_symbol(
     minutes: int,
     limits: ReplayLimits,
     structure: StructureParams,
+    limits_by_variant: Optional[dict[str, ReplayLimits]] = None,
 ) -> tuple[list[ReplayTrade], dict[str, VariantDiag]]:
-    """Walk one name. Returns every filled spread (all dates) plus diagnostics."""
+    """Walk one name. Returns every filled spread (all dates) plus diagnostics.
+
+    ``limits_by_variant`` overrides entry or exit knobs for named variants.
+    Variants that share the entry knobs share one priced proposal.
+    """
     if len(daily) < 10 or len(timing) < structure.left + structure.right + 8:
         return [], {name: VariantDiag() for name in variants}
 
@@ -172,6 +179,12 @@ def replay_symbol(
     blocks = four_hour_blocks(timing, minutes)
     trades: list[ReplayTrade] = []
     cache: dict = {}
+    price_cache: dict = {}
+
+    def limits_for(name: str) -> ReplayLimits:
+        if limits_by_variant and name in limits_by_variant:
+            return limits_by_variant[name]
+        return limits
     d_ptr = 0
     b_ptr = 0
     completed: list[Bar] = []
@@ -225,7 +238,19 @@ def replay_symbol(
             if not _allow_before_strike(slot, features_base):
                 slot.diag.filter_reject += 1
                 continue
-            priced = _price(symbol, view, bar.close, end, completed, limits)
+            slot_limits = limits_for(slot.name)
+            price_key = (
+                view.side,
+                round(float(view.invalidation), 4),
+                round(bar.close, 4),
+                end,
+                _entry_key(slot_limits),
+            )
+            if price_key not in price_cache:
+                price_cache[price_key] = _price(
+                    symbol, view, bar.close, end, completed, slot_limits
+                )
+            priced = price_cache[price_key]
             if priced is None or priced.proposal.skip:
                 slot.diag.credit_skip += 1
                 continue
@@ -258,7 +283,7 @@ def replay_symbol(
                 slot.name,
                 view,
                 priced,
-                limits,
+                slot_limits,
                 timing,
                 i,
                 minutes,
@@ -285,6 +310,7 @@ def replay_universe(
     limits: ReplayLimits,
     structure: StructureParams,
     spy_symbol: str = "SPY",
+    limits_by_variant: Optional[dict[str, ReplayLimits]] = None,
 ) -> tuple[dict[str, list[ReplayTrade]], dict[str, VariantDiag]]:
     spy_daily = bars_by_symbol.get(spy_symbol, {}).get("1d") or []
     grouped: dict[str, list[ReplayTrade]] = {name: [] for name in variants}
@@ -303,6 +329,7 @@ def replay_universe(
             minutes=minutes,
             limits=limits,
             structure=structure,
+            limits_by_variant=limits_by_variant,
         )
         for trade in trades:
             grouped[trade.variant].append(trade)
@@ -454,6 +481,20 @@ def _hybrid(cache, structure_bars, timing_bars, existing, kwargs):
     return hit
 
 
+def _entry_key(limits: ReplayLimits) -> tuple:
+    """Entry knobs only. Stop and take-profit do not change the credit."""
+    return (
+        limits.width,
+        limits.dte_min,
+        limits.dte_max,
+        limits.dte_target,
+        round(limits.min_credit_pct, 6),
+        round(limits.max_credit_pct, 6),
+        round(limits.min_short_inv_gap, 6),
+        limits.target_abs_delta,
+    )
+
+
 def _price(symbol, view, spot, when, completed, limits: ReplayLimits) -> Optional[PricedSpread]:
     rv = realized_vol([bar.close for bar in completed])
     if rv is None:
@@ -501,6 +542,16 @@ def _open_trade(
             return None
         return daily_by_date.get(local.date())
 
+    right = "put" if view.side is Side.BULLISH else "call"
+    bar_close = timing[index].close
+    entry_mid = spread_mid(
+        bar_close,
+        proposal.short.strike,
+        proposal.long.strike,
+        year_fraction(bar_end(timing[index], minutes), priced.expiration),
+        priced.iv,
+        right,
+    )
     fill: ExitFill = simulate_exit(
         side=view.side,
         short_k=proposal.short.strike,
@@ -532,4 +583,15 @@ def _open_trade(
         pnl=pnl,
         short_strike=proposal.short.strike,
         iv=priced.iv,
+        long_strike=proposal.long.strike,
+        expiration=priced.expiration,
+        entry_spot=bar_close,
+        entry_mid=entry_mid,
+        short_delta=priced.short_delta,
+        open_mid=fill.open_mid,
+        adverse_mid=fill.adverse_mid,
+        close_mid=fill.close_mid,
+        open_natural=fill.open_natural,
+        adverse_natural=fill.adverse_natural,
+        close_natural=fill.close_natural,
     )

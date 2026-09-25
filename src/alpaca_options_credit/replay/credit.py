@@ -8,11 +8,16 @@ legs with Black-Scholes and then applies the same gates the engine uses:
 - natural credit is short bid − long ask (not the mid)
 - credit must be at least ``min_credit_pct_of_width`` of the width
 - take-profit and stop are judged on the spread mid, matching ``spread_mark``
-- the take-profit fill is exactly half the credit (a poll that catches the
-  cross, not the far side of an hourly wick)
-- a stop that gaps through the open fills at the open's natural debit;
-  a stop that trades through fills at 1.5× credit plus the bid/ask at that
-  spot, and never better than the bar's worst natural debit
+- the take-profit fill is a debit of ``(1 - tp_frac)`` × credit (a poll
+  that catches the cross, not the far side of an hourly wick). At 50%
+  that debit is half the credit
+- ``stop_check="intrabar"`` (the live-style default): a stop that gaps
+  through the open fills at the open's natural debit; a stop that trades
+  through fills at ``stop_mult`` × credit plus the bid/ask at that spot,
+  and never better than the bar's worst natural debit
+- ``stop_check="close"`` fires only when the bar's close mid is through
+  the stop. ``stop_check="none"`` leaves the price stop off and keeps
+  take-profit, structure break, and expiration
 - structure-break and the final mark pay the natural debit (cross the spread)
 - expiration settles at intrinsic
 
@@ -88,6 +93,12 @@ class ReplayLimits:
     min_short_inv_gap: float = 1.0
     tp_frac: float = 0.50
     stop_mult: float = 1.5
+    # intrabar: open and the adverse extreme. close: bar close only.
+    # none: structure break, take-profit, and expiration, with no price stop.
+    stop_check: str = "intrabar"
+    # When set, the short is the listed strike beyond the gap whose |delta|
+    # is closest to this value. None keeps the nearest-strike rule.
+    target_abs_delta: Optional[float] = None
     multiplier: int = 100
     equity: float = 100_000.0
     risk_pct: float = 0.005
@@ -100,6 +111,7 @@ class PricedSpread:
     expiration: date
     right: str
     spot: float
+    short_delta: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,14 @@ class ExitFill:
     reason: str
     debit: float
     when: datetime
+    # Mids and natural debits on the bar that produced a credit stop.
+    # Zero on every other exit. Used to separate a wick from a close.
+    open_mid: float = 0.0
+    adverse_mid: float = 0.0
+    close_mid: float = 0.0
+    open_natural: float = 0.0
+    adverse_natural: float = 0.0
+    close_natural: float = 0.0
 
 
 def norm_cdf(x: float) -> float:
@@ -169,6 +189,34 @@ def realized_vol(closes: Sequence[float], lookback: int = RV_LOOKBACK) -> Option
 
 def implied_vol(rv: float) -> float:
     return min(IV_CAP, max(IV_FLOOR, rv * IV_PREMIUM))
+
+
+def bs_delta(
+    spot: float,
+    strike: float,
+    t_years: float,
+    sigma: float,
+    right: str,
+    *,
+    rate: float = RATE,
+    div: float = DIVIDEND,
+) -> float:
+    """Black-Scholes delta. A put is negative. Expired options are ±1 or 0."""
+    if spot <= 0 or strike <= 0:
+        return 0.0
+    if t_years <= 1e-8 or sigma <= 1e-8:
+        intrinsic = _intrinsic_leg(spot, strike, right)
+        if intrinsic <= 0:
+            return 0.0
+        return 1.0 if right == "call" else -1.0
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (rate - div + 0.5 * sigma * sigma) * t_years) / (
+        sigma * sqrt_t
+    )
+    discount = math.exp(-div * t_years)
+    if right == "call":
+        return discount * norm_cdf(d1)
+    return discount * (norm_cdf(d1) - 1.0)
 
 
 def half_spread(mid: float) -> float:
@@ -320,10 +368,27 @@ def modeled_proposal(
         return None
     step = strike_increment(symbol, spot)
     right = "put" if side is Side.BULLISH else "call"
-    lo = invalidation - limits.width * 3
-    hi = invalidation + limits.width * 3
+    if limits.target_abs_delta is not None:
+        chosen = _strike_for_delta(
+            symbol=symbol,
+            side=side,
+            invalidation=invalidation,
+            spot=spot,
+            t_years=t_years,
+            iv=iv,
+            right=right,
+            limits=limits,
+        )
+        strikes = []
+        if chosen is not None:
+            long_k = chosen - limits.width if right == "put" else chosen + limits.width
+            strikes = [chosen, round(long_k, 2)]
+    else:
+        lo = invalidation - limits.width * 3
+        hi = invalidation + limits.width * 3
+        strikes = strike_grid(max(step, lo), hi, step)
     quotes: list[ContractQuote] = []
-    for strike in strike_grid(max(step, lo), hi, step):
+    for strike in strikes:
         mid = bs_price(spot, strike, t_years, iv, right)
         bid, ask = leg_bid_ask(mid)
         quotes.append(
@@ -349,7 +414,56 @@ def modeled_proposal(
         max_credit_pct_of_width=limits.max_credit_pct,
         min_short_inv_gap=limits.min_short_inv_gap,
     )
-    return PricedSpread(proposal=proposal, iv=iv, expiration=expiration, right=right, spot=spot)
+    delta = 0.0
+    if not proposal.skip:
+        delta = bs_delta(spot, proposal.short.strike, t_years, iv, right)
+    return PricedSpread(
+        proposal=proposal,
+        iv=iv,
+        expiration=expiration,
+        right=right,
+        spot=spot,
+        short_delta=delta,
+    )
+
+
+def _strike_for_delta(
+    *,
+    symbol: str,
+    side: Side,
+    invalidation: float,
+    spot: float,
+    t_years: float,
+    iv: float,
+    right: str,
+    limits: ReplayLimits,
+) -> Optional[float]:
+    """Listed strike past the gap whose absolute delta is closest to the target."""
+    target = limits.target_abs_delta
+    if target is None:
+        return None
+    step = strike_increment(symbol, spot)
+    span = max(limits.width * 12.0, spot * 0.20)
+    gap = float(limits.min_short_inv_gap or 0.0)
+    if side is Side.BULLISH:
+        lo = max(step, min(invalidation, spot) - span)
+        hi = invalidation - gap
+    else:
+        lo = invalidation + gap
+        hi = max(invalidation, spot) + span
+    best: Optional[float] = None
+    best_key: Optional[tuple[float, float]] = None
+    for strike in strike_grid(lo, hi, step):
+        if side is Side.BULLISH and strike > invalidation - gap + 1e-9:
+            continue
+        if side is Side.BEARISH and strike < invalidation + gap - 1e-9:
+            continue
+        delta = abs(bs_delta(spot, strike, t_years, iv, right))
+        key = (abs(delta - target), abs(strike - invalidation))
+        if best_key is None or key < best_key:
+            best_key = key
+            best = strike
+    return best
 
 
 def simulate_exit(
@@ -450,20 +564,48 @@ def _exit_on_bar(
     def debit_at(spot: float) -> float:
         return natural_debit(spot, short_k, long_k, t_years, iv, right)
 
-    # Gap through the stop on the open: fill at the open, not at 1.5×.
-    if stop_hit(credit, mid_at(bar.open), limits.stop_mult):
-        return ExitFill("stop_credit", debit_at(bar.open), when)
+    check = limits.stop_check
+    if check not in {"intrabar", "close", "none"}:
+        raise ValueError(f"unknown stop_check {check!r}")
 
-    if stop_hit(credit, mid_at(adverse), limits.stop_mult):
-        mid_adv = mid_at(adverse)
-        nat_adv = debit_at(adverse)
-        slip = max(0.0, nat_adv - mid_adv)
-        # Poll-level stop plus the spread, capped by the bar's worst debit.
-        filled = min(nat_adv, limits.stop_mult * credit + slip)
-        return ExitFill("stop_credit", filled, when)
+    open_mid = mid_at(bar.open)
+    adverse_mid = mid_at(adverse)
+    close_mid_ = mid_at(bar.close)
+    open_nat = debit_at(bar.open)
+    adverse_nat = debit_at(adverse)
+    close_nat = debit_at(bar.close)
+
+    def _stop(debit: float) -> ExitFill:
+        return ExitFill(
+            "stop_credit",
+            debit,
+            when,
+            open_mid=open_mid,
+            adverse_mid=adverse_mid,
+            close_mid=close_mid_,
+            open_natural=open_nat,
+            adverse_natural=adverse_nat,
+            close_natural=close_nat,
+        )
+
+    if check == "intrabar":
+        # Gap through the stop on the open: fill at the open, not at the multiple.
+        if stop_hit(credit, open_mid, limits.stop_mult):
+            return _stop(open_nat)
+        if stop_hit(credit, adverse_mid, limits.stop_mult):
+            slip = max(0.0, adverse_nat - adverse_mid)
+            # Poll-level stop plus the spread, capped by the bar's worst debit.
+            filled = min(adverse_nat, limits.stop_mult * credit + slip)
+            return _stop(filled)
+    elif check == "close" and stop_hit(credit, close_mid_, limits.stop_mult):
+        slip = max(0.0, close_nat - close_mid_)
+        filled = min(close_nat, limits.stop_mult * credit + slip)
+        return _stop(filled)
 
     if take_profit_hit(credit, mid_at(favorable), limits.tp_frac):
-        return ExitFill("take_profit", limits.tp_frac * credit, when)
+        # Capturing tp_frac of the credit leaves a debit of the rest.
+        # At the default 50% the debit is half the credit.
+        return ExitFill("take_profit", (1.0 - limits.tp_frac) * credit, when)
 
     if daily_close is not None and _structure_broken(side, invalidation, daily_close):
         return ExitFill("structure_break", debit_at(daily_close), when)

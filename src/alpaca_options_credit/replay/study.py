@@ -11,7 +11,9 @@ does not contradict it. See ``adoption_reason``.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional, Sequence
 
 from alpaca_options_credit.config import load_config
@@ -30,6 +32,13 @@ from alpaca_options_credit.replay.stats import (
     summarize,
 )
 from alpaca_options_credit.replay.credit import ReplayLimits
+from alpaca_options_credit.replay.marks import (
+    MarketCompare,
+    StopCensus,
+    alpaca_quote_sample,
+    census_stops,
+    compare_yahoo,
+)
 from alpaca_options_credit.rth import as_et
 
 LONG_START = date(2024, 1, 2)
@@ -63,7 +72,62 @@ VARIANT_BLURB = {
     "confirm_volume": "Confirmation bar volume above its prior 20-bar average",
     "rs_4h_volume": "Relative strength, 4-hour EMA50, and confirmation volume together",
     "confirm_15m": "Same rules, 15-minute reconfirm instead of 60-minute",
+    "stop_2x": "Stop at 2× credit, take-profit still 50%",
+    "stop_2_5x": "Stop at 2.5× credit, take-profit still 50%",
+    "stop_3x": "Stop at 3× credit, take-profit still 50%",
+    "stop_structure_only": "No price stop — close only on a structure break (take-profit still 50%)",
+    "stop_on_close": "1.5× stop checked on the hourly close, not the wick",
+    "tp_25": "Take-profit at 25% of credit, stop still 1.5×",
+    "tp_65": "Take-profit at 65% of credit, stop still 1.5×",
+    "gap_2": "Short strike at least 2 points beyond invalidation",
+    "gap_5": "Short strike at least 5 points beyond invalidation",
+    "dte_21_35": "Friday expiration in 21–35 DTE (target 28)",
+    "dte_45_60": "Friday expiration in 45–60 DTE (target 52)",
+    "delta_30": "Short strike nearest 30 delta, still past the 1-point gap",
+    "delta_20": "Short strike nearest 20 delta, still past the 1-point gap",
+    "delta_15": "Short strike nearest 15 delta, still past the 1-point gap",
 }
+
+EXIT_ORDER = (
+    "stop_2x",
+    "stop_2_5x",
+    "stop_3x",
+    "stop_structure_only",
+    "stop_on_close",
+    "tp_25",
+    "tp_65",
+    "gap_2",
+    "gap_5",
+    "dte_21_35",
+    "dte_45_60",
+    "delta_30",
+    "delta_20",
+    "delta_15",
+)
+
+
+def _always(_features) -> bool:
+    return True
+
+
+def exit_overrides(base: ReplayLimits) -> dict[str, ReplayLimits]:
+    """One knob away from the checked-in playbook. Baseline is not in here."""
+    return {
+        "stop_2x": replace(base, stop_mult=2.0),
+        "stop_2_5x": replace(base, stop_mult=2.5),
+        "stop_3x": replace(base, stop_mult=3.0),
+        "stop_structure_only": replace(base, stop_check="none"),
+        "stop_on_close": replace(base, stop_check="close"),
+        "tp_25": replace(base, tp_frac=0.25),
+        "tp_65": replace(base, tp_frac=0.65),
+        "gap_2": replace(base, min_short_inv_gap=2.0),
+        "gap_5": replace(base, min_short_inv_gap=5.0),
+        "dte_21_35": replace(base, dte_min=21, dte_max=35, dte_target=28),
+        "dte_45_60": replace(base, dte_min=45, dte_max=60, dte_target=52),
+        "delta_30": replace(base, target_abs_delta=0.30),
+        "delta_20": replace(base, target_abs_delta=0.20),
+        "delta_15": replace(base, target_abs_delta=0.15),
+    }
 
 
 def predicates() -> dict:
@@ -228,11 +292,15 @@ def adoption_reason(
                 f" Win rate differs by {wr_diff.point:.3f} "
                 f"[{wr_diff.low:.3f}, {wr_diff.high:.3f}]."
             )
+        if long_diff.high < 0:
+            cover = "That interval sits entirely below zero."
+        else:
+            cover = "That interval covers zero."
         return (
             False,
             f"Expectancy per unit of risk differs by {long_diff.point:.3f} "
             f"[{long_diff.low:.3f}, {long_diff.high:.3f}]. "
-            f"That interval covers zero.{wr_note}",
+            f"{cover}{wr_note}",
         )
 
     if recent_var.n < MIN_RECENT or recent_base.n < MIN_RECENT:
@@ -324,42 +392,20 @@ def render(ctx: dict) -> str:
     base = ctx["long_rows"][0]
     add("# Win-rate study")
     add("")
-    if adopted:
-        names = ", ".join(VARIANT_BLURB[name] for name in adopted)
-        add(
-            f"Change the defaults. {names} beat the baseline by more than sampling "
-            "noise on the long window, and Jul–Sep 2026 does not reverse that."
-        )
-    else:
-        exp = _fmt_ci(base.expectancy, "usd")
-        wr = _fmt_ci(base.win_rate, "pct")
-        add(
-            "No change is warranted. On the long window the baseline credit spread "
-            f"wins {wr} of the time and expects {exp} per spread. Every filter's "
-            "difference versus that book still covers zero, including win rate. "
-            "None of them raise expectancy beyond sampling noise, and none raise "
-            "win rate beyond sampling noise without hurting expectancy. "
-            "Jul 6–Sep 25 2026 tells the same story. Defaults stay as they are. "
-            "`config/paper-live.yaml` is not in this repo and was not added."
-        )
+    add(_lead(ctx))
     add("")
-    add(
-        f"Winners stay about {_money(base.avg_win)} and losers about {_money(base.avg_loss)}. "
-        "The filters do not shrink the winners. They also do not separate from the loss. "
-        "Almost every spread hits the 1.5× credit stop, the 50% take-profit, or a "
-        "structure break before expiration. The short strike sits just beyond "
-        "invalidation, so the credit is close to the money and the stop is close in price."
-    )
+    add(_mark_section(ctx))
+    add("")
+    add(_exit_section(ctx))
     add("")
     add("## What was held fixed")
     add("")
     add(
         "Entries stay a daily strict confirm plus a volume-profile shelf, then the "
-        "first timing-bar pullback and a timing-bar reconfirm. Exits stay "
-        "take-profit at 50% of credit, stop at 1.5× credit, and a daily close "
-        "through invalidation. Sizing stays 0.5% of equity per spread and 10% "
-        "open risk, one spread per name, $5 wide, 30–45 DTE, natural credit at "
-        "least 20% of width, short strike at least 1 point beyond invalidation."
+        "first timing-bar pullback and a timing-bar reconfirm. "
+        + _exit_held_fixed(ctx)
+        + " Sizing stays 0.5% of equity per spread and 10% open risk, one spread "
+        "per name, $5 wide, natural credit at least 20% of width."
     )
     add("")
     add(
@@ -616,7 +662,277 @@ def _cap_section(grouped: dict[str, list[ReplayTrade]], risk: dict) -> str:
     return "\n".join(lines)
 
 
-def build_report(cfg: dict, bars: dict[str, dict[str, list]]) -> str:
+def _lead(ctx: dict) -> str:
+    base = ctx["long_rows"][0]
+    census: StopCensus = ctx["census"]
+    exit_adopted: list[str] = ctx["exit_adopted"]
+    best: BookStats = ctx["best_exit"]
+    parts = [
+        (
+            f"On the long window the baseline wins {_fmt_ci(base.win_rate, 'pct')} "
+            f"and expects {_fmt_ci(base.expectancy, 'usd')} per spread "
+            f"({_fmt_ci(base.expectancy_r, 'r')} of max risk). "
+            f"{census.n_stops} of those closes are the 1.5× credit stop."
+        )
+    ]
+    if census.n_stops:
+        recovered = max(
+            0,
+            census.n_stops
+            - census.close_confirmed
+            - census.close_mid_inside_natural_through,
+        )
+        parts.append(
+            f"{census.close_confirmed} of those stops are through on the hourly "
+            f"close mid. Another {census.close_mid_inside_natural_through} are "
+            "back inside on the mid but still through on the natural debit. "
+            f"Only {recovered} are back inside even after crossing the spread. "
+            "The loss is not a wick or a bid/ask artifact."
+        )
+    if exit_adopted:
+        applied = ctx.get("applied_exit")
+        others = [name for name in exit_adopted if name != applied]
+        if applied:
+            parts.append(
+                f"Change the tracked default to {VARIANT_BLURB[applied]}. "
+                "It improves expectancy per unit of risk beyond sampling noise. "
+                "It does not turn the sleeve into a profit."
+            )
+        if others:
+            parts.append(
+                "These also cleared that bar and were not stacked on top: "
+                + "; ".join(VARIANT_BLURB[name] for name in others)
+                + "."
+            )
+    else:
+        parts.append(
+            "No exit, distance, or DTE variant improves expectancy beyond sampling "
+            "noise. Defaults stay as they are."
+        )
+    parts.append(_keep_running(best))
+    if ctx["adopted"]:
+        names = ", ".join(VARIANT_BLURB[name] for name in ctx["adopted"])
+        parts.append(f"Entry filters that clear the same bar: {names}.")
+    else:
+        parts.append(
+            "The entry filters from the equity and crypto bots also stay inside "
+            "noise. `config/paper-live.yaml` is not in this repo. Recommended "
+            "values, where any differ from today, are in the decision below and "
+            "in `config/default.yaml`."
+        )
+    return " ".join(parts)
+
+
+def _keep_running(best: BookStats) -> str:
+    if best.expectancy is None or best.expectancy_r is None:
+        return "Expectancy could not be measured, so the sleeve should not keep running."
+    label = VARIANT_BLURB.get(best.label, best.label)
+    numbers = (
+        f"{label} expects {_fmt_ci(best.expectancy, 'usd')} per spread "
+        f"({_fmt_ci(best.expectancy_r, 'r')} of max risk)."
+    )
+    if best.expectancy.low > 0:
+        return numbers + " That interval sits above zero, so that version can keep running."
+    if best.expectancy.high < 0:
+        return (
+            numbers
+            + " The interval sits entirely below zero. The strategy should not keep running."
+        )
+    return (
+        numbers
+        + " The interval still covers a loss. The strategy should not keep running."
+    )
+
+
+def _exit_held_fixed(ctx: dict) -> str:
+    chosen = ctx.get("applied_exit")
+    if not chosen:
+        return (
+            "Exits stay take-profit at 50% of credit, stop at 1.5× credit on the "
+            "intrabar mid, and a daily close through invalidation. Short strike "
+            "stays at least 1 point beyond invalidation, DTE stays 30–45."
+        )
+    return (
+        f"The applied exit change is {VARIANT_BLURB[chosen]}. "
+        "Every other exit knob stays at the baseline."
+    )
+
+
+def _mark_section(ctx: dict) -> str:
+    census: StopCensus = ctx["census"]
+    market: MarketCompare = ctx["market"]
+    alpaca_counts: dict = ctx["alpaca_counts"]
+    lines = [
+        "## Is the 1.5× stop a pricing artifact?",
+        "",
+        "The stop is judged on the spread mid, which is how the live mark works. "
+        "Inside the model the natural debit (short ask minus long bid) is always "
+        "at least that mid, because the half-spread is a smooth 6% of the mid "
+        "clamped between $0.05 and $0.25. There is no NBBO flicker to trip the "
+        "stop. A mid that is through 1.5× credit means the debit you would pay "
+        "to cross the market is through it as well.",
+        "",
+        (
+            f"Of {census.n_stops} baseline credit stops on the long window, "
+            f"{census.close_confirmed} are through on the hourly close mid, "
+            f"{census.wick_only} fire only on the high or low "
+            f"({100 * census.wick_share:.1f}%), and {census.gap_recovered} gap "
+            f"through the open and recover on the mid by the close. "
+            f"Of the stops whose close mid is back inside 1.5× credit, "
+            f"{census.close_mid_inside_natural_through} still show a natural "
+            f"debit (short ask minus long bid) through the stop. "
+            f"That leaves {max(0, census.n_stops - census.close_confirmed - census.close_mid_inside_natural_through)} "
+            "stops where even crossing the spread at the hourly close is back inside the stop."
+        ),
+        "",
+        market.alpaca_note,
+        "",
+        market.note,
+        "",
+    ]
+    if alpaca_counts:
+        lines.append(
+            "Alpaca NBBO sample around the modeled stop bar: "
+            + ", ".join(f"{key} {value}" for key, value in alpaca_counts.items())
+            + "."
+        )
+        lines.append("")
+    gap = market.median_entry_gap
+    exit_gap = market.median_exit_gap
+    lines.append(
+        f"Yahoo matched {market.n_entry} of {market.n_sampled} sampled spreads "
+        f"on the entry session and {market.n_exit} on the exit session. "
+        "Median Yahoo daily close minus model mid, in premium points: "
+        f"entry {_points(gap)}, exit {_points(exit_gap)}. "
+        f"Of {market.stops_compared} modeled stops with a Yahoo exit day, "
+        f"{market.stops_close_confirmed} have a Yahoo spread close through 1.5× credit, "
+        f"{market.stops_intraday_only} stay inside on the close but the "
+        f"short-high/long-low bound crosses, and {market.stops_not_in_range} "
+        "never reach 1.5× credit inside that daily range."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _points(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    sign = "-" if value < 0 else ""
+    return f"{sign}{abs(value):.2f}"
+
+
+def _mean_abs_delta(trades: Sequence[ReplayTrade]) -> Optional[float]:
+    vals = [abs(t.short_delta) for t in trades if t.short_delta]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _exit_section(ctx: dict) -> str:
+    lines = [
+        "## Exit, distance, and DTE levers",
+        "",
+        "Same entries as the baseline. One knob changes at a time. A wider stop "
+        "or a further short changes how long the name stays busy, so the trade "
+        "list is not a paired subset of the baseline. The difference column is "
+        "still mean expectancy/max-risk minus the baseline, with a 5,000-draw "
+        "percentile interval. Stop multiples and the close-versus-wick test use "
+        "the intrabar mid unless the row says the close. A take-profit fills at "
+        "a debit of (1 − fraction) × credit, which is half the credit at 50%. "
+        "Structure break is unchanged.",
+        "",
+        "Distance and delta use the same strike grid and the same 20% credit gate. "
+        "A 30/20/15-delta short is the listed strike past the 1-point gap whose "
+        "Black-Scholes |delta| is closest to the target. DTE is the Friday the "
+        "live picker already chooses, inside a different window. Avg |delta| is "
+        "the mean absolute short delta at entry.",
+        "",
+        "| Variant | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | "
+        "Expectancy / max risk (95% CI) | Avg win | Avg loss | Avg |delta| |",
+        "| --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: |",
+    ]
+    deltas = ctx["exit_deltas"]
+    for stats in ctx["exit_long_rows"]:
+        delta = deltas.get(stats.label)
+        delta_txt = "n/a" if delta is None else f"{delta:.2f}"
+        row = stats_row(stats).rstrip()
+        if row.endswith("|"):
+            row = row[:-1].rstrip()
+        lines.append(f"{row} | {delta_txt} |")
+    lines.extend(
+        [
+            "",
+            "| Variant | Trades | Take-profit | Credit stop | Structure break | Expiration | Open mark |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for stats in ctx["exit_long_rows"]:
+        lines.append(exit_row(stats).replace(" | ", " | ", 1))
+    lines.extend(
+        [
+            "",
+            "### Difference vs baseline, long window (expectancy / max risk)",
+            "",
+            "| Variant | Difference | 95% CI | Reads as |",
+            "| --- | ---: | --- | --- |",
+        ]
+    )
+    for name, diff in ctx["exit_long_diffs"]:
+        if diff is None:
+            lines.append(f"| {VARIANT_BLURB[name]} | n/a | n/a | too few trades |")
+            continue
+        lines.append(
+            f"| {VARIANT_BLURB[name]} | {diff.point:.3f} | "
+            f"[{diff.low:.3f}, {diff.high:.3f}] | {_diff_words(diff)} |"
+        )
+    lines.extend(["", "### Recent window (2026-07-06 to 2026-09-25)", ""])
+    lines.append(
+        "| Variant | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | "
+        "Expectancy / max risk (95% CI) | Avg win | Avg loss |"
+    )
+    lines.append("| --- | ---: | ---: | --- | --- | --- | ---: | ---: |")
+    for stats in ctx["exit_recent_rows"]:
+        lines.append(stats_row(stats))
+    lines.extend(
+        [
+            "",
+            "### Difference vs baseline, recent window (expectancy / max risk)",
+            "",
+            "| Variant | Difference | 95% CI | Reads as |",
+            "| --- | ---: | --- | --- |",
+        ]
+    )
+    for name, diff in ctx["exit_recent_diffs"]:
+        if diff is None:
+            lines.append(f"| {VARIANT_BLURB[name]} | n/a | n/a | too few trades |")
+            continue
+        lines.append(
+            f"| {VARIANT_BLURB[name]} | {diff.point:.3f} | "
+            f"[{diff.low:.3f}, {diff.high:.3f}] | {_diff_words(diff)} |"
+        )
+    lines.extend(["", "### Decision", ""])
+    for name, ok, reason in ctx["exit_decisions"]:
+        status = "Adopt" if ok else "Do not adopt"
+        lines.append(f"- **{status} — {VARIANT_BLURB[name]}.** {reason}")
+    applied = ctx.get("applied_exit")
+    lines.append("")
+    if applied:
+        lines.append(
+            f"The tracked default follows **{VARIANT_BLURB[applied]}**. "
+            "Copy the same values into `config/paper-live.yaml` on the machine "
+            "that places paper orders. Other rows that also cleared the bar were "
+            "not stacked on top."
+        )
+    else:
+        lines.append(
+            "Nothing in this table clears the bar, so `config/default.yaml` keeps "
+            "the 1.5× stop, the 50% take-profit, the 1-point gap, and 30–45 DTE."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_report(cfg: dict, bars: dict[str, dict[str, list]], cache: Path) -> str:
     symbols = list((cfg.get("universe") or {}).get("symbols") or [])
     usable = [
         s
@@ -626,15 +942,24 @@ def build_report(cfg: dict, bars: dict[str, dict[str, list]]) -> str:
     ]
     limits = limits_from_config(cfg)
     structure = structure_from_config(cfg)
-    print(f"replaying {len(usable)} symbols on 60-minute bars", flush=True)
+    overrides = exit_overrides(limits)
+    variants = predicates()
+    for name in EXIT_ORDER:
+        variants[name] = _always
+    print(
+        f"replaying {len(usable)} symbols on 60-minute bars "
+        f"({len(variants)} variants)",
+        flush=True,
+    )
     grouped, diags = replay_universe(
         bars,
         usable,
-        predicates(),
+        variants,
         timing_key="1h",
         minutes=60,
         limits=limits,
         structure=structure,
+        limits_by_variant=overrides,
     )
     base = grouped["baseline"]
     long_rows = []
@@ -681,6 +1006,60 @@ def build_report(cfg: dict, bars: dict[str, dict[str, list]]) -> str:
             adopted.append(name)
         decisions.append((name, ok, reason))
 
+    exit_long_rows = [_book(base, "baseline", LONG_START, LONG_END)]
+    exit_recent_rows = [_book(base, "baseline", RECENT_START, RECENT_END)]
+    exit_long_diffs = []
+    exit_recent_diffs = []
+    exit_decisions = []
+    exit_adopted: list[str] = []
+    exit_deltas = {
+        "baseline": _mean_abs_delta(in_dates(base, LONG_START, LONG_END)),
+    }
+    for name in EXIT_ORDER:
+        long_stats = _book(grouped[name], name, LONG_START, LONG_END)
+        recent_stats = _book(grouped[name], name, RECENT_START, RECENT_END)
+        exit_long_rows.append(long_stats)
+        exit_recent_rows.append(recent_stats)
+        exit_deltas[name] = _mean_abs_delta(in_dates(grouped[name], LONG_START, LONG_END))
+        d_long = _diff(grouped[name], base, LONG_START, LONG_END)
+        d_recent = _diff(grouped[name], base, RECENT_START, RECENT_END)
+        exit_long_diffs.append((name, d_long))
+        exit_recent_diffs.append((name, d_recent))
+        ok, reason = adoption_reason(
+            name,
+            exit_long_rows[0],
+            long_stats,
+            d_long,
+            exit_recent_rows[0],
+            recent_stats,
+            d_recent,
+            wr_diff=None,
+        )
+        if ok:
+            for cap in (5, int((cfg.get("risk") or {}).get("max_concurrent", 20))):
+                veto = risk_veto(
+                    _capped_stats(base, cap, cfg, LONG_START, LONG_END),
+                    _capped_stats(grouped[name], cap, cfg, LONG_START, LONG_END),
+                    cap=cap,
+                )
+                if veto:
+                    ok = False
+                    reason = veto
+                    break
+        if ok:
+            exit_adopted.append(name)
+        exit_decisions.append((name, ok, reason))
+    applied_exit = _best_adopted(exit_adopted, exit_long_rows)
+    best_exit = _best_book(exit_long_rows)
+
+    print("comparing modeled stops with market option prints", flush=True)
+    baseline_long = in_dates(base, LONG_START, LONG_END)
+    census = census_stops(baseline_long)
+    recent_first = sorted(baseline_long, key=lambda t: t.entry_time, reverse=True)
+    market = compare_yahoo(recent_first, cache / "yahoo-options", limit=40)
+    alpaca_note, alpaca_counts = alpaca_quote_sample(recent_first)
+    market = replace(market, alpaca_note=alpaca_note)
+
     print("replaying 15-minute confirmation", flush=True)
     m15_symbols = [
         s
@@ -722,12 +1101,49 @@ def build_report(cfg: dict, bars: dict[str, dict[str, list]]) -> str:
         "m15_start": m15_start,
         "symbols_used": len(usable),
         "diags": diags,
+        "exit_long_rows": exit_long_rows,
+        "exit_recent_rows": exit_recent_rows,
+        "exit_long_diffs": exit_long_diffs,
+        "exit_recent_diffs": exit_recent_diffs,
+        "exit_decisions": exit_decisions,
+        "exit_adopted": exit_adopted,
+        "exit_deltas": exit_deltas,
+        "applied_exit": applied_exit,
+        "best_exit": best_exit,
+        "census": census,
+        "market": market,
+        "alpaca_counts": alpaca_counts,
     }
     text = render(ctx)
     # Diagnostics sit after the decision so a reader sees the counts that
     # explain a thin filter without opening the code.
     text += _diag_section(diags)
     return text.replace("## Signal counts", "\n## Signal counts")
+
+
+def _best_adopted(names: Sequence[str], rows: Sequence[BookStats]) -> Optional[str]:
+    """Highest long-window expectancy per unit of risk among adopted rows."""
+    by_label = {row.label: row for row in rows}
+    best_name: Optional[str] = None
+    best_point: Optional[float] = None
+    for name in names:
+        row = by_label.get(name)
+        if row is None or row.expectancy_r is None:
+            continue
+        if best_point is None or row.expectancy_r.point > best_point:
+            best_point = row.expectancy_r.point
+            best_name = name
+    return best_name
+
+
+def _best_book(rows: Sequence[BookStats]) -> BookStats:
+    best = rows[0]
+    for row in rows[1:]:
+        if row.expectancy_r is None or best.expectancy_r is None:
+            continue
+        if row.expectancy_r.point > best.expectancy_r.point:
+            best = row
+    return best
 
 
 def _capped_stats(trades, cap, cfg, start, end) -> BookStats:
@@ -821,7 +1237,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(f"loading bars for {len(symbols)} symbols", flush=True)
     bars = ensure_universe(Path(args.cache), symbols, include_15m=True)
-    text = build_report(cfg, bars)
+    text = build_report(cfg, bars, Path(args.cache))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

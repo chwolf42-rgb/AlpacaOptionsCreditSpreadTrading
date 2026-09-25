@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Sequence
 
 from alpaca_options_credit.risk import size_contracts
@@ -37,6 +37,18 @@ class ReplayTrade:
     pnl: float
     short_strike: float
     iv: float
+    long_strike: float = 0.0
+    expiration: Optional[date] = None
+    entry_spot: float = 0.0
+    entry_mid: float = 0.0
+    short_delta: float = 0.0
+    # Populated on credit-stop exits so a wick can be separated from the close.
+    open_mid: float = 0.0
+    adverse_mid: float = 0.0
+    close_mid: float = 0.0
+    open_natural: float = 0.0
+    adverse_natural: float = 0.0
+    close_natural: float = 0.0
 
     @property
     def r_multiple(self) -> float:

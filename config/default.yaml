@@ -93,10 +93,19 @@ exits:
   # broken mleg is a CRITICAL flatten, not a normal exit.
   atomic_spread_only: true
   # TP / stop are mark-to-close vs the credit received (not an equity R-ladder).
-  take_profit_frac_of_credit: 0.50   # TP when debit-to-close <= 50% of credit
-  # Tighter credit stop so a drawdown is cut before it consumes the edge.
-  # Take-profit stays 50% of credit. min_credit_pct_of_width stays 0.20.
-  stop_multiple_of_credit: 1.5       # stop when debit-to-close >= 1.5× credit
+  take_profit_frac_of_credit: 0.50   # TP when captured credit >= 50% (debit <= half)
+  # The 1.5× credit stop is off. On the 2024-01-02–2026-09-25 replay it was
+  # the exit on 301 of 430 spreads and the long-window expectancy was -19% of
+  # max risk. Turning the price stop off (structure break and the 50%
+  # take-profit remain) was the least-bad row that beat that baseline beyond
+  # sampling noise, and it is still a loss (about -15% of max risk). See
+  # docs/win-rate-study.md. Stop multiples of 2×, 2.5×, and 3× were the same
+  # finding; 2.5× and 3× barely ever fire once structure break is allowed.
+  # The sleeve should not keep running. If it does, copy credit_stop: false
+  # into config/paper-live.yaml. Restoring the old rule is credit_stop: true
+  # with the multiple below.
+  credit_stop: false
+  stop_multiple_of_credit: 1.5       # used only when credit_stop is true
   # Stop also fires on underlying structure break (whichever first).
   honor_structure_break: true
   # On hit: submit one mleg debit-to-close for the journaled qty. If submit

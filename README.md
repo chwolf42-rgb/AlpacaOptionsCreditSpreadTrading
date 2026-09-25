@@ -23,7 +23,7 @@ Keys are not in this repo. Copy `.env.example` → `.env` when they arrive. Miss
 | Credit gate | natural credit = short bid − long ask. Missing, crossed, absurd, or non-positive quotes skip **before** the proposal log (`quote_missing`, `quote_crossed`, `quote_absurd`, `credit_debit`). Positive credit still skips below ~20% of width (`credit_below_min_pct`). Optional wide-market and open-interest knobs default off. |
 | Earnings / FOMC | skip new entries via `config/calendar.yaml` stub |
 | Take profit | ~50% of credit (debit-to-close ≤ 50% of credit), software mark each poll |
-| Stop | ~1.5× credit **or** underlying structure break, whichever first — **not** an equity OCO/bracket |
+| Stop | structure break, with the 50% take-profit still on. The 1.5× credit stop is off (`exits.credit_stop: false`); turning it back on uses `stop_multiple_of_credit`. Not an equity OCO/bracket. The sleeve still loses money and should not keep running — see `docs/win-rate-study.md`. |
 | Roll/repair | **stub** — close unless `exits.roll.execute` and thesis+DTE say otherwise |
 | Size | max loss = width×100 − credit×100; ~0.5% of equity; one spread per underlying |
 
@@ -44,7 +44,7 @@ Equity-sleeve stop bugs that **this bot is forbidden from growing**:
 
 **Atomic spread close only — no legging out.** Entry and exit submit `order_class=mleg` with **both** legs (short + long) in one order. Never close or cancel only the long or only the short of a healthy credit spread — that is how a naked short and a margin call happen. `exits.atomic_spread_only: true` is enforced. If a mleg only fills one side, that is **CRITICAL**: latch `naked_leg`, alert, and flatten the residual immediately (paired leftover via mleg, lone leftover via emergency flatten). Never leave a naked short resting.
 
-On TP, 1.5×-credit stop, or structure-break:
+On TP or structure-break (and on the 1.5× credit stop only when `exits.credit_stop` is true):
 
 1. Latch `EXITING` + reason immediately (sticky even if the mark recovers).
 2. Submit one **2-leg** debit-to-close mleg.
