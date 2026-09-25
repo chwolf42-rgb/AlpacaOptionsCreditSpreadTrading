@@ -217,6 +217,7 @@ def _engine(
     broker=None,
     qty: int = 2,
     credit: float = 1.20,
+    credit_stop: bool = True,
     invalidation: float = 100.0,
     kind: SpreadKind = SpreadKind.BULL_PUT_CREDIT,
     status: SpreadStatus = SpreadStatus.OPEN,
@@ -224,6 +225,7 @@ def _engine(
     exit_order_id: Optional[str] = None,
 ):
     cfg = load_config()
+    cfg["exits"]["credit_stop"] = credit_stop
     cfg["bot"]["dry_run"] = dry_run
     cfg["bot"]["var_dir"] = str(tmp_path / "var")
     cfg["_repo_root"] = str(tmp_path)
@@ -324,6 +326,16 @@ def test_stop_1_5x_credit_closes_spread(tmp_path):
     # (1.20 - 1.80) * qty 2 * 100
     assert summary.avg_loss == pytest.approx(-120.0)
     assert summary.avg_win is None
+
+
+def test_default_credit_stop_off_does_not_stop_on_the_mark(tmp_path):
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=1.80, credit=1.20, credit_stop=False
+    )
+    result = engine.tick()
+    assert not any("stop_credit" in e for e in result.exits)
+    assert journal.open_spreads()
+    assert broker.proposed_closes == []
 
 
 def test_mark_under_1_5x_does_not_stop(tmp_path):

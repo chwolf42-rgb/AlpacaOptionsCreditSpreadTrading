@@ -815,7 +815,9 @@ class Engine:
             stop_mult = float(exits_cfg.get("stop_multiple_of_credit", 1.5))
             if take_profit_hit(spread.credit, mark, tp_frac):
                 reason = "take_profit"
-            elif stop_hit(spread.credit, mark, stop_mult):
+            elif exits_cfg.get("credit_stop", True) and stop_hit(
+                spread.credit, mark, stop_mult
+            ):
                 reason = STOP_CREDIT_EXIT
         return reason, thesis_intact
 
