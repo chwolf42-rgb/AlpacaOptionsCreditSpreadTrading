@@ -120,3 +120,11 @@ class OpenSpread:
     # EOD managed win/loss uses these; both stay empty until the spread closes.
     close_debit: Optional[float] = None
     closed_at: str = ""
+    # quote | fill | backfill | missing | "" (legacy, before this column).
+    close_price_source: str = ""
+    # Cumulative mleg contracts filled across partial close orders.
+    close_filled_qty: int = 0
+    # Sum of (net debit × filled qty) so a later fill can finish the average.
+    close_fill_notional: Optional[float] = None
+    # Journal updated_at. Legacy closes stored the close clock only here.
+    updated_at: str = ""

@@ -48,6 +48,11 @@ def test_journal_persists_arms_and_spreads(tmp_path: Path):
 
     j2.close_spread("sp1", "take_profit")
     assert j2.open_spreads() == []
+    closed = j2.get_spread("sp1")
+    assert closed is not None
+    assert closed.close_debit is None
+    assert closed.closed_at
+    assert closed.close_price_source == "missing"
 
 
 def test_journal_latch_keeps_spread_live_until_close(tmp_path: Path):

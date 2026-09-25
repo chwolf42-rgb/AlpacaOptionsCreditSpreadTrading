@@ -6,13 +6,25 @@ Isolated under var/options/ — never share with equity or crypto bots.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
+from alpaca_options_credit.close_prices import (
+    CLOSE_DEBIT_BACKFILLED,
+    CLOSE_PARTIAL,
+    CLOSE_PRICE_MISSING,
+    SOURCE_BACKFILL,
+    SOURCE_FILL,
+    SOURCE_MISSING,
+    SOURCE_QUOTE,
+    CloseOrderView,
+    as_debit,
+)
 from alpaca_options_credit.rth import ET, RTH_CLOSE, RTH_OPEN, as_et
 from alpaca_options_credit.strategy.spreads import (
     STRUCTURE_BREAK_EXIT,
@@ -28,6 +40,9 @@ from alpaca_options_credit.models import (
     SpreadKind,
     SpreadStatus,
 )
+
+log = logging.getLogger(__name__)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS arms (
@@ -66,6 +81,11 @@ CREATE TABLE IF NOT EXISTS spreads (
     last_close_error TEXT NOT NULL DEFAULT '',
     close_debit REAL,
     closed_at TEXT,
+    close_price_source TEXT NOT NULL DEFAULT '',
+    close_filled_qty INTEGER NOT NULL DEFAULT 0,
+    close_fill_notional REAL,
+    close_order_filled_seen INTEGER NOT NULL DEFAULT 0,
+    close_order_notional_seen REAL,
     updated_at TEXT NOT NULL
 );
 
@@ -162,6 +182,13 @@ class Journal:
             )
 
     def upsert_spread(self, spread: OpenSpread) -> None:
+        # status=closed is not written here. record_close is the only closer.
+        closing = spread.status is SpreadStatus.CLOSED
+        if closing:
+            spread = replace(
+                spread,
+                status=SpreadStatus.EXITING if spread.exit_reason else SpreadStatus.OPEN,
+            )
         with self._conn() as con:
             con.execute(
                 """
@@ -202,6 +229,14 @@ class Journal:
                     spread.last_close_error,
                     _now(),
                 ),
+            )
+        if closing:
+            self.record_close(
+                spread.id,
+                spread.exit_reason or "closed",
+                close_debit=spread.close_debit,
+                closed_at=spread.closed_at or None,
+                source=spread.close_price_source,
             )
 
     def get_spread(self, spread_id: str) -> Optional[OpenSpread]:
@@ -267,11 +302,16 @@ class Journal:
             )
 
     def record_working_close(self, spread_id: str, order_id: str) -> None:
+        """Remember the working mleg id. Seen-fill counters reset for this order."""
         with self._conn() as con:
             con.execute(
                 """
                 UPDATE spreads
-                SET exit_order_id=?, last_close_error='', updated_at=?
+                SET exit_order_id=?,
+                    last_close_error='',
+                    close_order_filled_seen=0,
+                    close_order_notional_seen=0,
+                    updated_at=?
                 WHERE id=? AND status!=?
                 """,
                 (order_id, _now(), spread_id, SpreadStatus.CLOSED.value),
@@ -309,34 +349,330 @@ class Journal:
         *,
         close_debit: Optional[float] = None,
         closed_at: Optional[str] = None,
+        source: str = "",
     ) -> None:
-        """Mark the spread closed. First close time and a later debit are kept.
+        """Close a spread. Alias of :meth:`record_close` — the only closer."""
+        self.record_close(
+            spread_id,
+            reason,
+            close_debit=close_debit,
+            closed_at=closed_at,
+            source=source,
+        )
 
-        ``close_debit`` is the debit-to-close mark (premium points). Realized
-        P&L for the EOD digest is ``(credit - close_debit) * qty * multiplier``.
+    def record_close(
+        self,
+        spread_id: str,
+        reason: str,
+        *,
+        close_debit: Optional[float] = None,
+        closed_at: Optional[str] = None,
+        source: str = "",
+    ) -> None:
+        """The only writer of ``status=closed``.
+
+        Always sets ``closed_at`` (first stamp wins). Writes ``close_debit``
+        when a finite premium is passed; a later debit replaces an earlier
+        one. When no price can be obtained, leaves ``close_debit`` NULL,
+        sets ``close_price_source='missing'``, logs ``close_price_missing``,
+        and warns. Realized P&L is ``(credit - close_debit) * qty * multiplier``.
         """
-        stamp = closed_at or _now()
+        debit = as_debit(close_debit)
+        missing_event: Optional[dict[str, Any]] = None
+        symbol: Optional[str] = None
         with self._conn() as con:
+            row = con.execute(
+                "SELECT * FROM spreads WHERE id=?",
+                (spread_id,),
+            ).fetchone()
+            if row is None:
+                return
+            symbol = row["underlying"]
+            existing = as_debit(row["close_debit"])
+            stored = debit if debit is not None else existing
+            prior_source = str(row["close_price_source"] or "")
+            if stored is None:
+                source_out = SOURCE_MISSING
+                if prior_source != SOURCE_MISSING:
+                    missing_event = {
+                        "spread_id": spread_id,
+                        "reason": reason,
+                        "source": SOURCE_MISSING,
+                    }
+            elif debit is not None:
+                source_out = source or prior_source or SOURCE_QUOTE
+            else:
+                source_out = prior_source or SOURCE_QUOTE
+            stamp = str(row["closed_at"] or "") or closed_at or _now()
             con.execute(
                 """
                 UPDATE spreads
                 SET status=?,
                     exit_reason=?,
                     last_close_error='',
-                    close_debit=COALESCE(?, close_debit),
-                    closed_at=COALESCE(closed_at, ?),
+                    close_debit=?,
+                    closed_at=?,
+                    close_price_source=?,
                     updated_at=?
                 WHERE id=?
                 """,
                 (
                     SpreadStatus.CLOSED.value,
                     reason,
-                    close_debit,
+                    stored,
                     stamp,
+                    source_out,
                     stamp,
                     spread_id,
                 ),
             )
+        if missing_event is not None:
+            log.warning(
+                "close price missing spread=%s underlying=%s reason=%s — "
+                "closed-trade stats count this in n_missing_price",
+                spread_id,
+                symbol,
+                reason,
+            )
+            self.log_event(CLOSE_PRICE_MISSING, symbol, missing_event)
+
+    def apply_close_fill(
+        self,
+        spread_id: str,
+        reason: str,
+        order: CloseOrderView,
+        *,
+        target_qty: int,
+    ) -> str:
+        """Fold one broker fill snapshot into the journal.
+
+        Returns ``closed``, ``unpriced``, ``working``, ``partial``, or ``dead``.
+
+        ``filled_avg_price`` on an order is the average of that order's fills,
+        so each poll replaces that order's contribution instead of adding the
+        average again. A terminal short fill increments ``close_attempts`` and
+        clears ``exit_order_id`` so the next poll can submit the remainder.
+        A still-working partial is left alone (no cancel, no attempt bump).
+        """
+        outcome = "working"
+        debit_out: Optional[float] = None
+        filled_at = order.filled_at
+        partial_event: Optional[dict[str, Any]] = None
+        symbol: Optional[str] = None
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT * FROM spreads WHERE id=?",
+                (spread_id,),
+            ).fetchone()
+            if row is None:
+                return "dead"
+            symbol = row["underlying"]
+            if row["status"] == SpreadStatus.CLOSED.value:
+                return "closed" if as_debit(row["close_debit"]) is not None else "unpriced"
+
+            seen_qty = int(row["close_order_filled_seen"] or 0)
+            seen_notional = float(row["close_order_notional_seen"] or 0.0)
+            filled_qty = int(row["close_filled_qty"] or 0)
+            notional = row["close_fill_notional"]
+            cumulative = float(notional) if notional is not None else 0.0
+            same_order = str(row["exit_order_id"] or "") == str(order.order_id or "")
+            if not same_order:
+                seen_qty = 0
+                seen_notional = 0.0
+
+            reported = max(int(order.filled_qty), 0)
+            price = as_debit(order.net_debit)
+            if reported > seen_qty and price is not None:
+                order_notional = price * reported
+                cumulative += order_notional - seen_notional
+                filled_qty += reported - seen_qty
+                seen_qty = reported
+                seen_notional = order_notional
+            elif reported > seen_qty and price is None and order.state in {"filled", "partial"}:
+                # Contracts filled but the broker sent no price. Count qty so
+                # we do not resubmit them; the close itself is unpriced.
+                filled_qty += reported - seen_qty
+                seen_qty = reported
+
+            target = max(int(target_qty), 0)
+            terminal = order.state in {"filled", "partial", "dead"}
+            reached = target > 0 and filled_qty >= target
+            now = _now()
+            con.execute(
+                """
+                UPDATE spreads
+                SET close_filled_qty=?,
+                    close_fill_notional=?,
+                    close_order_filled_seen=?,
+                    close_order_notional_seen=?,
+                    updated_at=?
+                WHERE id=? AND status!=?
+                """,
+                (
+                    filled_qty,
+                    cumulative if filled_qty else None,
+                    seen_qty,
+                    seen_notional if seen_qty else 0.0,
+                    now,
+                    spread_id,
+                    SpreadStatus.CLOSED.value,
+                ),
+            )
+            if reached and filled_qty > 0 and (price is not None or cumulative != 0):
+                debit_out = cumulative / filled_qty
+                outcome = "closed"
+            elif reached and order.state == "filled":
+                outcome = "unpriced"
+                filled_at = filled_at or now
+            elif order.state == "open" or not terminal:
+                outcome = "working"
+            elif reported > 0 or filled_qty > 0:
+                attempts = int(row["close_attempts"] or 0) + 1
+                con.execute(
+                    """
+                    UPDATE spreads
+                    SET status=?,
+                        close_attempts=?,
+                        last_close_error=?,
+                        exit_order_id=NULL,
+                        close_order_filled_seen=0,
+                        close_order_notional_seen=0,
+                        updated_at=?
+                    WHERE id=? AND status!=?
+                    """,
+                    (
+                        SpreadStatus.EXITING.value,
+                        attempts,
+                        f"partial fill {filled_qty}/{target}",
+                        now,
+                        spread_id,
+                        SpreadStatus.CLOSED.value,
+                    ),
+                )
+                outcome = "partial"
+                partial_event = {
+                    "spread_id": spread_id,
+                    "reason": reason,
+                    "order_id": order.order_id,
+                    "filled_qty": filled_qty,
+                    "target_qty": target,
+                    "net_debit": price,
+                    "close_attempts": attempts,
+                }
+            else:
+                attempts = int(row["close_attempts"] or 0) + 1
+                con.execute(
+                    """
+                    UPDATE spreads
+                    SET status=?,
+                        close_attempts=?,
+                        last_close_error=?,
+                        exit_order_id=NULL,
+                        close_order_filled_seen=0,
+                        close_order_notional_seen=0,
+                        updated_at=?
+                    WHERE id=? AND status!=?
+                    """,
+                    (
+                        SpreadStatus.EXITING.value,
+                        attempts,
+                        f"close order {order.state} with no fill",
+                        now,
+                        spread_id,
+                        SpreadStatus.CLOSED.value,
+                    ),
+                )
+                outcome = "dead"
+
+        if outcome == "closed" and debit_out is not None:
+            self.record_close(
+                spread_id,
+                reason,
+                close_debit=debit_out,
+                closed_at=filled_at,
+                source=SOURCE_FILL,
+            )
+        elif outcome == "unpriced":
+            self.record_close(
+                spread_id,
+                reason,
+                close_debit=None,
+                closed_at=filled_at,
+                source=SOURCE_MISSING,
+            )
+        elif partial_event is not None:
+            log.error(
+                "PARTIAL CLOSE %s %s filled %s/%s — remainder stays EXITING, "
+                "close_attempts=%s, retry next poll",
+                symbol,
+                spread_id,
+                partial_event["filled_qty"],
+                partial_event["target_qty"],
+                partial_event["close_attempts"],
+            )
+            self.log_event(CLOSE_PARTIAL, symbol, partial_event)
+        return outcome
+
+    def write_backfilled_close(
+        self,
+        spread_id: str,
+        close_debit: float,
+        closed_at: str,
+        *,
+        underlying: str = "",
+        exit_reason: str = "",
+    ) -> bool:
+        """Fill a NULL close_debit on an already-closed row. Never overwrites.
+
+        ``updated_at`` is left as the original close clock. ``closed_at`` is
+        set from that clock when it was empty. The row is tagged
+        ``close_price_source=backfill`` and an estimated event is logged.
+        Returns False when the row already had a debit or was not closed.
+        """
+        debit = as_debit(close_debit)
+        if debit is None:
+            return False
+        with self._conn() as con:
+            cur = con.execute(
+                """
+                UPDATE spreads
+                SET close_debit=?,
+                    closed_at=COALESCE(closed_at, ?),
+                    close_price_source=?
+                WHERE id=? AND status=? AND close_debit IS NULL
+                """,
+                (
+                    debit,
+                    closed_at,
+                    SOURCE_BACKFILL,
+                    spread_id,
+                    SpreadStatus.CLOSED.value,
+                ),
+            )
+            wrote = cur.rowcount == 1
+        if not wrote:
+            return False
+        self.log_event(
+            CLOSE_DEBIT_BACKFILLED,
+            underlying or None,
+            {
+                "spread_id": spread_id,
+                "close_debit": debit,
+                "closed_at": closed_at,
+                "estimated": True,
+                "source": SOURCE_BACKFILL,
+                "exit_reason": exit_reason,
+            },
+        )
+        return True
+
+    def closed_spreads(self) -> list[OpenSpread]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT * FROM spreads WHERE status=? ORDER BY opened_at",
+                (SpreadStatus.CLOSED.value,),
+            ).fetchall()
+        return [_spread_from_row(r) for r in rows]
 
     def summarize_managed_outcomes(
         self,
@@ -362,11 +698,15 @@ class Journal:
 
         ``avg_win`` and ``avg_loss`` are mean realized dollars,
         ``(credit - close_debit) * qty * multiplier``. ``avg_loss`` is signed.
-        When ``close_debit`` was not stored, take-profit and stop use the
-        locked policy (capture ``take_profit_frac`` of credit; stop at
-        ``stop_multiple`` × credit). A structure exit without a debit counts
-        in ``n_losses`` and is left out of ``avg_loss``. ``win_rate`` is
-        ``n_wins / (n_wins + n_losses)``, or None when the window is empty.
+        ``pnl`` is the sum of those dollars. Backfilled (estimated) rows are
+        included. When ``close_debit`` was not stored, take-profit and stop
+        use the locked policy (capture ``take_profit_frac`` of credit; stop
+        at ``stop_multiple`` × credit) and still count in ``n_missing_price``.
+        A structure exit without a debit counts in ``n_losses`` and
+        ``n_missing_price`` and is left out of ``avg_loss`` and ``pnl``.
+        ``win_rate`` is ``n_wins / (n_wins + n_losses)``, or None when the
+        window is empty. ``n_estimated`` counts managed closes tagged
+        ``backfill``.
         """
         if session not in {"calendar", "rth"}:
             raise ValueError(f"session must be 'calendar' or 'rth', got {session!r}")
@@ -374,7 +714,8 @@ class Journal:
         with self._conn() as con:
             rows = con.execute(
                 """
-                SELECT credit, qty, exit_reason, close_debit, closed_at, updated_at
+                SELECT credit, qty, exit_reason, close_debit, closed_at, updated_at,
+                       close_price_source
                 FROM spreads
                 WHERE status=?
                 """,
@@ -383,8 +724,11 @@ class Journal:
 
         win_pnls: list[float] = []
         loss_pnls: list[float] = []
+        pnl_values: list[float] = []
         n_wins = 0
         n_losses = 0
+        n_missing_price = 0
+        n_estimated = 0
         for row in rows:
             closed = _parse_ts(row["closed_at"]) or _parse_ts(row["updated_at"])
             if closed is None or not _in_outcome_window(
@@ -394,6 +738,10 @@ class Journal:
             bucket = _managed_bucket(str(row["exit_reason"] or ""))
             if bucket is None:
                 continue
+            if _optional_float(row["close_debit"]) is None:
+                n_missing_price += 1
+            if str(_row_get(row, "close_price_source", "") or "") == SOURCE_BACKFILL:
+                n_estimated += 1
             pnl = _realized_dollars(
                 credit=float(row["credit"]),
                 qty=int(row["qty"]),
@@ -403,6 +751,8 @@ class Journal:
                 take_profit_frac=take_profit_frac,
                 stop_multiple=stop_multiple,
             )
+            if pnl is not None:
+                pnl_values.append(pnl)
             if bucket == "win":
                 n_wins += 1
                 if pnl is not None:
@@ -419,6 +769,9 @@ class Journal:
             avg_loss=_mean(loss_pnls),
             n_wins=n_wins,
             n_losses=n_losses,
+            n_missing_price=n_missing_price,
+            n_estimated=n_estimated,
+            pnl=sum(pnl_values) if pnl_values else None,
         )
 
 
@@ -460,6 +813,10 @@ def _spread_from_row(row: sqlite3.Row) -> OpenSpread:
         last_close_error=str(_row_get(row, "last_close_error", "") or ""),
         close_debit=_optional_float(_row_get(row, "close_debit", None)),
         closed_at=str(_row_get(row, "closed_at", "") or ""),
+        close_price_source=str(_row_get(row, "close_price_source", "") or ""),
+        close_filled_qty=int(_row_get(row, "close_filled_qty", 0) or 0),
+        close_fill_notional=_optional_float(_row_get(row, "close_fill_notional", None)),
+        updated_at=str(_row_get(row, "updated_at", "") or ""),
     )
 
 
@@ -485,6 +842,22 @@ def _migrate_spreads(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE spreads ADD COLUMN close_debit REAL")
     if "closed_at" not in cols:
         con.execute("ALTER TABLE spreads ADD COLUMN closed_at TEXT")
+    if "close_price_source" not in cols:
+        con.execute(
+            "ALTER TABLE spreads ADD COLUMN close_price_source TEXT NOT NULL DEFAULT ''"
+        )
+    if "close_filled_qty" not in cols:
+        con.execute(
+            "ALTER TABLE spreads ADD COLUMN close_filled_qty INTEGER NOT NULL DEFAULT 0"
+        )
+    if "close_fill_notional" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN close_fill_notional REAL")
+    if "close_order_filled_seen" not in cols:
+        con.execute(
+            "ALTER TABLE spreads ADD COLUMN close_order_filled_seen INTEGER NOT NULL DEFAULT 0"
+        )
+    if "close_order_notional_seen" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN close_order_notional_seen REAL")
 
 
 @dataclass(frozen=True)
@@ -501,6 +874,12 @@ class ManagedOutcomeSummary:
     avg_loss: Optional[float]
     n_wins: int
     n_losses: int
+    # Managed closes in the window whose close_debit is still NULL.
+    n_missing_price: int = 0
+    # Managed closes tagged close_price_source=backfill (estimated).
+    n_estimated: int = 0
+    # Sum of (credit - close_debit) * qty * multiplier for priced managed closes.
+    pnl: Optional[float] = None
 
 
 def _optional_float(value: Any) -> Optional[float]:

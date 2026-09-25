@@ -11,6 +11,7 @@ from typing import Any, Optional
 import pytest
 
 from alpaca_options_credit.broker.dry_run import DryRunBroker
+from alpaca_options_credit.close_prices import CloseOrderView
 from alpaca_options_credit.config import load_config
 from alpaca_options_credit.engine import Engine
 from alpaca_options_credit.journal import Journal
@@ -91,13 +92,32 @@ def _ancient_broken_daily(invalidation: float = 100.0) -> list:
 
 
 class PaperBroker:
-    """Paper-path broker: dry_run=False so empty/raised closes are failures."""
+    """Paper-path broker: dry_run=False so empty/raised closes are failures.
+
+    A successful submit is a fill when ``fill_immediately`` is set. The engine
+    must journal ``filled_avg_price`` (``fill_debit`` or the limit) and the
+    fill time, not the live quote. ``fill_plan`` yields
+    ``(state, filled_qty, net_debit)`` per submit for partial-fill tests.
+    """
 
     dry_run = False
 
-    def __init__(self, *, fails_left: int = 0, empty_once: bool = False):
+    def __init__(
+        self,
+        *,
+        fails_left: int = 0,
+        empty_once: bool = False,
+        fill_immediately: bool = True,
+        fill_debit: Optional[float] = None,
+        filled_at: str = "2026-03-04T15:00:05+00:00",
+        fill_plan: Optional[list[tuple[str, int, Optional[float]]]] = None,
+    ):
         self.fails_left = fails_left
         self.empty_once = empty_once
+        self.fill_immediately = fill_immediately
+        self.fill_debit = fill_debit
+        self.filled_at = filled_at
+        self.fill_plan = list(fill_plan or [])
         self.proposed_opens: list[dict[str, Any]] = []
         self.proposed_closes: list[dict[str, Any]] = []
         self.submitted_order_ids: list[str] = []
@@ -105,6 +125,7 @@ class PaperBroker:
         self.close_seq = 0
         self.positions: dict[str, int] = {}
         self.flattened_residuals: list[dict[str, Any]] = []
+        self.orders: dict[str, CloseOrderView] = {}
 
     def account_equity(self) -> float:
         return 100_000.0
@@ -125,6 +146,23 @@ class PaperBroker:
             return None
         self.close_seq += 1
         oid = f"close-{self.close_seq}"
+        qty = int(payload.get("qty") or spread.qty)
+        if self.fill_plan:
+            state, filled_qty, debit = self.fill_plan.pop(0)
+        elif self.fill_immediately:
+            state, filled_qty, debit = "filled", qty, self.fill_debit
+        else:
+            state, filled_qty, debit = "open", 0, None
+        if debit is None and state == "filled":
+            debit = float(payload["limit_price"])
+        self.orders[oid] = CloseOrderView(
+            order_id=oid,
+            state=state,
+            filled_qty=int(filled_qty),
+            order_qty=qty,
+            net_debit=debit,
+            filled_at=self.filled_at if state != "open" else None,
+        )
         self.proposed_closes.append(
             {"spread_id": spread.id, "payload": payload, "qty": payload.get("qty")}
         )
@@ -132,7 +170,31 @@ class PaperBroker:
         return oid
 
     def open_order_ids(self) -> list[str]:
-        return list(self.submitted_order_ids)
+        live = [oid for oid, view in self.orders.items() if view.state == "open"]
+        for oid in self.submitted_order_ids:
+            if oid not in self.orders and oid not in live:
+                live.append(oid)
+        return live
+
+    def get_close_order(self, order_id: str) -> Optional[CloseOrderView]:
+        return self.orders.get(order_id)
+
+    def mark_filled(
+        self,
+        order_id: str,
+        *,
+        debit: Optional[float] = None,
+        filled_at: Optional[str] = None,
+    ) -> None:
+        view = self.orders[order_id]
+        self.orders[order_id] = CloseOrderView(
+            order_id=order_id,
+            state="filled",
+            filled_qty=view.order_qty,
+            order_qty=view.order_qty,
+            net_debit=view.net_debit if debit is None else debit,
+            filled_at=filled_at or self.filled_at,
+        )
 
     def cancel_order(self, order_id: str) -> None:
         self.cancel_calls.append(order_id)
@@ -228,6 +290,9 @@ def test_take_profit_closes_spread(tmp_path):
     assert closed is not None
     assert closed.status is SpreadStatus.CLOSED
     assert closed.exit_reason == "take_profit"
+    assert closed.close_debit == pytest.approx(0.60)
+    assert closed.closed_at == RTH.isoformat()
+    assert closed.close_price_source == "quote"
     assert broker.proposed_closes
     assert broker.proposed_closes[0]["payload"]["qty"] == "2"
     close_pl = broker.proposed_closes[0]["payload"]
@@ -246,6 +311,8 @@ def test_stop_1_5x_credit_closes_spread(tmp_path):
     closed = journal.get_spread("sp1")
     assert closed.exit_reason == "stop_credit"
     assert closed.close_debit == pytest.approx(1.80)
+    assert closed.closed_at == RTH.isoformat()
+    assert closed.close_price_source == "quote"
     assert broker.proposed_closes
     assert isinstance(broker, DryRunBroker)
     summary = journal.summarize_managed_outcomes(
@@ -275,7 +342,11 @@ def test_structure_break_closes_even_when_mark_quiet(tmp_path):
     result = engine.tick()
     assert any(e.startswith("SPY:structure_break") for e in result.exits)
     assert journal.open_spreads() == []
-    assert journal.get_spread("sp1").exit_reason == "structure_break"
+    closed = journal.get_spread("sp1")
+    assert closed.exit_reason == "structure_break"
+    assert closed.close_debit == pytest.approx(1.00)
+    assert closed.closed_at == RTH.isoformat()
+    assert closed.close_price_source == "quote"
     assert broker.proposed_closes
 
 
@@ -359,6 +430,8 @@ def test_off_hours_flags_and_latches_without_submit(tmp_path):
     live = journal.get_spread("sp1")
     assert live.status is SpreadStatus.EXITING
     assert live.exit_reason == "structure_break"
+    assert live.close_debit is None
+    assert live.closed_at == ""
     kinds = [k for k, _, _ in _events(journal)]
     assert kinds.count("overnight_open") == 1
     engine.tick()
@@ -370,7 +443,11 @@ def test_off_hours_flags_and_latches_without_submit(tmp_path):
     assert second.status == "rth_scan"
     assert engine.phase[0] == "exits"
     assert broker.proposed_closes
-    assert journal.get_spread("sp1").status is SpreadStatus.CLOSED
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit == pytest.approx(1.00)
+    assert closed.close_price_source == "fill"
+    assert closed.closed_at
 
 
 def test_rth_runs_exits_before_scan(tmp_path):
@@ -405,8 +482,12 @@ def test_naked_short_flatten_is_critical(tmp_path):
     assert flat["occ"] == "SPY260417P00100000"
     assert flat["payload"]["emergency_flatten"] is True
     assert flat["payload"]["position_intent"] == "buy_to_close"
-    assert journal.get_spread("sp1").status is SpreadStatus.CLOSED
-    assert journal.get_spread("sp1").exit_reason == "naked_leg"
+    naked = journal.get_spread("sp1")
+    assert naked.status is SpreadStatus.CLOSED
+    assert naked.exit_reason == "naked_leg"
+    assert naked.close_debit == pytest.approx(1.00)
+    assert naked.closed_at == RTH.isoformat()
+    assert naked.close_price_source == "quote"
     kinds = [k for k, _, _ in _events(journal)]
     assert "naked_leg_critical" in kinds
     assert broker.cancel_calls == []
@@ -474,3 +555,144 @@ def test_dry_run_cancel_order_is_hard_error():
     broker = DryRunBroker()
     with pytest.raises(RuntimeError, match="must not cancel"):
         broker.cancel_order("any")
+
+
+def test_structure_break_without_mark_records_missing_price(tmp_path, caplog):
+    engine, _, journal, _, _ = _engine(
+        tmp_path,
+        mark=None,
+        credit=1.20,
+        daily=_broken_daily(100.0),
+        invalidation=100.0,
+    )
+    with caplog.at_level("WARNING"):
+        result = engine.tick()
+    assert any(e.startswith("SPY:structure_break") for e in result.exits)
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit is None
+    assert closed.closed_at == RTH.isoformat()
+    assert closed.close_price_source == "missing"
+    kinds = [k for k, _, _ in _events(journal)]
+    assert "close_price_missing" in kinds
+    assert "close price missing" in caplog.text
+    summary = journal.summarize_managed_outcomes(
+        date(2026, 3, 4), date(2026, 3, 4), session="rth"
+    )
+    assert summary.n_losses == 1
+    assert summary.n_missing_price == 1
+    assert summary.avg_loss is None
+    assert summary.pnl is None
+
+
+def test_live_fill_records_broker_debit_not_quote(tmp_path):
+    fill_at = "2026-03-04T15:00:05+00:00"
+    broker = PaperBroker(fill_immediately=False, fill_debit=2.25, filled_at=fill_at)
+    engine, broker, journal, data, _ = _engine(
+        tmp_path, mark=1.80, credit=1.20, dry_run=False, broker=broker
+    )
+    first = engine.tick()
+    assert any(e.endswith(":exit_working") for e in first.exits)
+    pending = journal.get_spread("sp1")
+    assert pending.status is SpreadStatus.EXITING
+    assert pending.close_debit is None
+    assert pending.exit_order_id
+    assert broker.proposed_closes
+    data.mark = 0.10
+    broker.mark_filled(pending.exit_order_id, debit=2.25, filled_at=fill_at)
+    second = engine.tick()
+    assert any(e == "SPY:stop_credit" for e in second.exits)
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit == pytest.approx(2.25)
+    assert closed.closed_at == fill_at
+    assert closed.close_price_source == "fill"
+    assert len(broker.proposed_closes) == 1
+
+
+def test_live_partial_fill_retries_remainder_and_averages_debit(tmp_path):
+    broker = PaperBroker(
+        fill_plan=[
+            ("partial", 1, 1.50),
+            ("filled", 1, 1.70),
+        ]
+    )
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=2.40, credit=1.20, qty=2, dry_run=False, broker=broker
+    )
+    first = engine.tick()
+    assert any(e.endswith(":partial_fill") for e in first.exits)
+    mid = journal.get_spread("sp1")
+    assert mid.status is SpreadStatus.EXITING
+    assert mid.close_attempts == 1
+    assert mid.close_filled_qty == 1
+    assert mid.close_debit is None
+    assert mid.exit_order_id is None
+    assert broker.proposed_closes[0]["payload"]["qty"] == "2"
+    assert "close_partial" in [k for k, _, _ in _events(journal)]
+
+    second = engine.tick()
+    assert any(e == "SPY:stop_credit" for e in second.exits)
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit == pytest.approx(1.60)
+    assert closed.close_price_source == "fill"
+    assert closed.closed_at
+    assert broker.proposed_closes[1]["payload"]["qty"] == "1"
+    assert closed.close_attempts == 1
+
+
+def test_working_partial_is_not_replaced(tmp_path):
+    broker = PaperBroker(fill_immediately=False, fill_debit=1.60)
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=2.40, credit=1.20, qty=2, dry_run=False, broker=broker
+    )
+    engine.tick()
+    live = journal.get_spread("sp1")
+    oid = live.exit_order_id
+    broker.orders[oid] = CloseOrderView(
+        order_id=oid,
+        state="open",
+        filled_qty=1,
+        order_qty=2,
+        net_debit=1.50,
+        filled_at=None,
+    )
+    again = engine.tick()
+    assert any(e.endswith(":exit_working") for e in again.exits)
+    held = journal.get_spread("sp1")
+    assert held.status is SpreadStatus.EXITING
+    assert held.close_attempts == 0
+    assert held.close_filled_qty == 1
+    assert len(broker.proposed_closes) == 1
+    broker.mark_filled(oid, debit=1.60)
+    engine.tick()
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit == pytest.approx(1.60)
+    assert closed.close_price_source == "fill"
+
+
+def test_dead_close_order_retries_on_the_next_poll(tmp_path):
+    broker = PaperBroker(
+        fill_plan=[
+            ("dead", 0, None),
+            ("filled", 2, 1.80),
+        ]
+    )
+    engine, broker, journal, _, _ = _engine(
+        tmp_path, mark=2.40, credit=1.20, qty=2, dry_run=False, broker=broker
+    )
+    first = engine.tick()
+    assert any(e.endswith(":close_failed") for e in first.exits)
+    live = journal.get_spread("sp1")
+    assert live.status is SpreadStatus.EXITING
+    assert live.close_attempts == 1
+    assert live.close_debit is None
+    assert "close_failed" in [k for k, _, _ in _events(journal)]
+    second = engine.tick()
+    assert any(e == "SPY:stop_credit" for e in second.exits)
+    closed = journal.get_spread("sp1")
+    assert closed.status is SpreadStatus.CLOSED
+    assert closed.close_debit == pytest.approx(1.80)
+    assert closed.close_price_source == "fill"

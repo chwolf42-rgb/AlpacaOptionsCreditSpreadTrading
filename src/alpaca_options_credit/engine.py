@@ -22,6 +22,7 @@ from alpaca_options_credit.broker.payloads import (
     open_credit_spread_payload,
 )
 from alpaca_options_credit.calendar_stub import load_calendar, skip_new_entry
+from alpaca_options_credit.close_prices import SOURCE_FILL, SOURCE_QUOTE, CloseOrderView, as_debit
 from alpaca_options_credit.config import validate_exit_policy, var_dir
 from alpaca_options_credit.heartbeat import Heartbeat, HeartbeatWriter
 from alpaca_options_credit.journal import Journal
@@ -735,12 +736,7 @@ class Engine:
                     and accepted
                 )
             if accepted:
-                self.journal.close_spread(
-                    spread.id,
-                    "naked_leg",
-                    close_debit=mark,
-                    closed_at=now.isoformat(),
-                )
+                self._record_quote_close(spread, "naked_leg", mark, now)
                 reasons.append(f"{spread.underlying}:naked_leg")
             else:
                 reasons.append(f"{spread.underlying}:naked_leg:close_failed")
@@ -956,6 +952,12 @@ class Engine:
                     {"would_roll": True, "instead": "close_unless_execute", "dte": dte},
                 )
 
+            if not self.dry_run and live.exit_order_id:
+                resolution = self._settle_live_close(live, reason, working_ids)
+                if resolution != "submit":
+                    reasons.append(self._exit_token(live, reason, resolution))
+                    continue
+
             if not submit:
                 reasons.append(f"{live.underlying}:{reason}:latched_off_hours")
                 log.info(
@@ -989,51 +991,154 @@ class Engine:
                 reasons.append(f"{live.underlying}:{reason}:invalid_qty")
                 continue
 
-            if live.exit_order_id:
-                if working_ids is None:
-                    self.journal.log_event(
-                        "close_status_unknown",
-                        live.underlying,
-                        {
-                            "spread_id": live.id,
-                            "exit_order_id": live.exit_order_id,
-                            "reason": reason,
-                        },
+            fresh = self.journal.get_spread(live.id) or live
+            remaining = qty - int(fresh.close_filled_qty or 0)
+            if remaining <= 0:
+                if (
+                    fresh.close_filled_qty > 0
+                    and fresh.close_fill_notional is not None
+                ):
+                    self.journal.record_close(
+                        fresh.id,
+                        reason,
+                        close_debit=fresh.close_fill_notional / fresh.close_filled_qty,
+                        closed_at=now.isoformat(),
+                        source=SOURCE_FILL,
                     )
-                    log.error(
-                        "working close %s for %s unconfirmed (order-list failed) — "
-                        "not cancelling, not replacing",
-                        live.exit_order_id,
-                        live.underlying,
-                    )
-                    reasons.append(f"{live.underlying}:{reason}:working_unconfirmed")
-                    continue
-                if live.exit_order_id in working_ids:
-                    log.info(
-                        "working mleg close %s still live for %s qty=%s — "
-                        "not cancelling, not replacing",
-                        live.exit_order_id,
-                        live.underlying,
-                        qty,
-                    )
-                    reasons.append(f"{live.underlying}:{reason}:exit_working")
-                    continue
+                    reasons.append(f"{fresh.underlying}:{reason}")
+                else:
+                    reasons.append(f"{fresh.underlying}:{reason}:invalid_qty")
+                continue
 
             payload = close_credit_spread_payload(
-                short_occ=live.short_occ,
-                long_occ=live.long_occ,
-                qty=qty,
-                debit=mark if mark is not None else live.credit * 0.5,
+                short_occ=fresh.short_occ,
+                long_occ=fresh.long_occ,
+                qty=remaining,
+                debit=mark if mark is not None else fresh.credit * 0.5,
             )
-            accepted = self._attempt_mleg_close(live, payload, reason, mark)
+            accepted = self._attempt_mleg_close(fresh, payload, reason, mark)
             if not accepted:
-                reasons.append(f"{live.underlying}:{reason}:close_failed")
+                reasons.append(f"{fresh.underlying}:{reason}:close_failed")
                 continue
-            self.journal.close_spread(
-                live.id, reason, close_debit=mark, closed_at=now.isoformat()
+            if self.dry_run:
+                # Observer: the close debit is the mid of the two legs (the
+                # same mark that tripped TP / stop). No broker fill exists.
+                self._record_quote_close(fresh, reason, mark, now)
+                reasons.append(f"{fresh.underlying}:{reason}")
+                continue
+            filled = self.journal.get_spread(fresh.id) or fresh
+            resolution = self._settle_live_close(
+                filled, reason, self._working_close_ids()
             )
-            reasons.append(f"{live.underlying}:{reason}")
+            reasons.append(self._exit_token(filled, reason, resolution))
         return reasons
+
+    def _record_quote_close(
+        self,
+        spread: OpenSpread,
+        reason: str,
+        mark: Optional[float],
+        now: datetime,
+    ) -> None:
+        """Dry-run and naked-leg closes: journal the quote, or a missing marker."""
+        self.journal.record_close(
+            spread.id,
+            reason,
+            close_debit=as_debit(mark),
+            closed_at=now.isoformat(),
+            source=SOURCE_QUOTE,
+        )
+
+    def _fetch_close_order(self, order_id: str) -> Optional[CloseOrderView]:
+        getter = getattr(self.broker, "get_close_order", None)
+        if getter is None:
+            return None
+        try:
+            view = getter(order_id)
+        except Exception as exc:
+            log.error(
+                "close order lookup failed %s (%s) — will not replace a working close",
+                order_id,
+                type(exc).__name__,
+            )
+            return None
+        if view is None:
+            return None
+        return view
+
+    def _settle_live_close(
+        self,
+        spread: OpenSpread,
+        reason: str,
+        working_ids: Optional[set[str]],
+    ) -> str:
+        """Apply a live mleg fill. Returns closed|working|unknown|partial|dead|submit."""
+        order_id = spread.exit_order_id
+        if not order_id:
+            return "submit"
+        view = self._fetch_close_order(order_id)
+        if view is None:
+            if working_ids is None or order_id in working_ids:
+                return "unknown" if working_ids is None else "working"
+            return "unknown"
+        result = self.journal.apply_close_fill(
+            spread.id,
+            reason,
+            view,
+            target_qty=int(spread.qty),
+        )
+        if result in {"closed", "unpriced"}:
+            return "closed"
+        if result == "working":
+            return "working"
+        if result == "partial":
+            return "partial"
+        if result == "dead":
+            self.journal.log_event(
+                "close_failed",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "reason": reason,
+                    "error": "close order ended with no fill",
+                    "order_id": order_id,
+                },
+            )
+            return "dead"
+        return "unknown"
+
+    def _exit_token(self, spread: OpenSpread, reason: str, resolution: str) -> str:
+        base = f"{spread.underlying}:{reason}"
+        if resolution == "closed":
+            return base
+        if resolution == "working":
+            log.info(
+                "working mleg close %s still live for %s qty=%s — "
+                "not cancelling, not replacing",
+                spread.exit_order_id,
+                spread.underlying,
+                spread.qty,
+            )
+            return f"{base}:exit_working"
+        if resolution == "partial":
+            return f"{base}:partial_fill"
+        if resolution == "dead":
+            return f"{base}:close_failed"
+        self.journal.log_event(
+            "close_status_unknown",
+            spread.underlying,
+            {
+                "spread_id": spread.id,
+                "exit_order_id": spread.exit_order_id,
+                "reason": reason,
+            },
+        )
+        log.error(
+            "working close %s for %s unconfirmed — not cancelling, not replacing",
+            spread.exit_order_id,
+            spread.underlying,
+        )
+        return f"{base}:working_unconfirmed"
 
     def run_forever(self) -> None:
         loop_cfg = self.cfg.get("loop") or {}
