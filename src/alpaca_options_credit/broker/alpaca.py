@@ -20,6 +20,16 @@ from alpaca_options_credit.broker.payloads import (
 from alpaca_options_credit.errors import AtomicSpreadError
 from alpaca_options_credit.credentials import Credentials, assert_expected_account
 from alpaca_options_credit.errors import PaperOnlyError
+from alpaca_options_credit.close_prices import (
+    BAR_MAX_AGE,
+    QUOTE_MAX_AGE,
+    CloseOrderView,
+    bar_closes_from_prints,
+    close_order_view_from_broker_order,
+    leg_price_at,
+    quote_mids_from_prints,
+    spread_debit,
+)
 from alpaca_options_credit.models import Bar, ContractQuote, OpenSpread, SpreadProposal
 
 log = logging.getLogger(__name__)
@@ -141,6 +151,17 @@ class AlpacaBroker:
             if qty:
                 out[symbol] = qty
         return out
+
+    def get_close_order(self, order_id: str) -> Optional[CloseOrderView]:
+        """Filled net debit and qty for one mleg close. None if the lookup fails."""
+        try:
+            order = self._trading.get_order_by_id(order_id)
+        except Exception as exc:  # pragma: no cover - live path
+            log.error("close order lookup failed: %s", type(exc).__name__)
+            return None
+        if order is None:
+            return None
+        return close_order_view_from_broker_order(order)
 
     def open_order_ids(self) -> list[str]:
         from alpaca.trading.enums import QueryOrderStatus
@@ -329,6 +350,92 @@ class AlpacaMarketData:
             )
         return out
 
+    def historical_spread_debit(
+        self,
+        short_occ: str,
+        long_occ: str,
+        at: datetime,
+    ) -> Optional[float]:
+        """Per-spread debit at ``at`` from historical quotes, then minute bars.
+
+        Quote mid is preferred within 30 minutes. Otherwise the last minute-bar
+        close within 18 hours. Returns None when either leg has no print.
+        """
+        when = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+        short_px = self._historical_leg_price(short_occ, when)
+        long_px = self._historical_leg_price(long_occ, when)
+        return spread_debit(short_px, long_px)
+
+    def _historical_leg_price(self, occ: str, at: datetime) -> Optional[float]:
+        quote_start = at - QUOTE_MAX_AGE
+        bar_start = at - BAR_MAX_AGE
+        end = at + timedelta(minutes=1)
+        quotes = self._option_quote_mids(occ, quote_start, end)
+        bars = self._option_bar_closes(occ, bar_start, end)
+        return leg_price_at(quotes=quotes, bars=bars, at=at)
+
+    def _option_quote_mids(
+        self,
+        occ: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[datetime, float]]:
+        # alpaca-py wraps latest quotes and bars, not historical quotes.
+        # /v1beta1/options/quotes is the historical NBBO. sort=desc so a
+        # short page is the tail nearest the close, not the oldest prints.
+        feed_name = str(
+            (self.cfg.get("market_data") or {}).get("options_feed", "indicative")
+        ).lower()
+        params: dict[str, Any] = {
+            "symbols": occ,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "limit": 1000,
+            "sort": "desc",
+            "feed": feed_name,
+        }
+        try:
+            response = self._opt_data.get("/options/quotes", data=params)
+        except Exception as exc:  # pragma: no cover - live path
+            params.pop("feed", None)
+            try:
+                response = self._opt_data.get("/options/quotes", data=params)
+            except Exception as retry_exc:  # pragma: no cover - live path
+                log.warning(
+                    "option quotes failed for %s: %s",
+                    occ,
+                    type(retry_exc).__name__ if retry_exc else type(exc).__name__,
+                )
+                return []
+        payload = response if isinstance(response, dict) else {}
+        quotes = payload.get("quotes") or {}
+        rows = quotes.get(occ) or []
+        return quote_mids_from_prints(rows)
+
+    def _option_bar_closes(
+        self,
+        occ: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[datetime, float]]:
+        from alpaca.data.requests import OptionBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        # OptionBarsRequest has no feed field in alpaca-py; the data client
+        # uses the account's entitled option feed.
+        try:
+            req = OptionBarsRequest(
+                symbol_or_symbols=occ,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=end,
+            )
+            result = self._opt_data.get_option_bars(req)
+        except Exception as exc:  # pragma: no cover - live path
+            log.warning("option bars failed for %s: %s", occ, type(exc).__name__)
+            return []
+        return bar_closes_from_prints(_series_for_symbol(result, occ))
+
     def spread_mark(self, short_occ: str, long_occ: str) -> Optional[float]:
         snaps = self._snapshots([short_occ, long_occ])
         if short_occ not in snaps or long_occ not in snaps:
@@ -370,6 +477,24 @@ class AlpacaMarketData:
                 ask = float(getattr(quote, "ask_price", 0) or getattr(quote, "ap", 0) or 0)
                 out[str(occ)] = (bid, ask)
         return out
+
+
+def _series_for_symbol(result: Any, symbol: str) -> list[Any]:
+    """Alpaca BarSet / QuoteSet → list of prints for one OCC symbol."""
+    data = getattr(result, "data", result)
+    raw: Any = None
+    if hasattr(data, "get"):
+        raw = data.get(symbol)
+        if raw is None and hasattr(data, "keys"):
+            for key in list(data.keys()):
+                if str(key) == symbol:
+                    raw = data.get(key)
+                    break
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    return list(raw)
 
 
 # Re-export payload helpers so engine never imports alpaca-py.

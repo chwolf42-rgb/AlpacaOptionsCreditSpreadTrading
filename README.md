@@ -47,8 +47,14 @@ Equity-sleeve stop bugs that **this bot is forbidden from growing**:
 On TP, 1.5×-credit stop, or structure-break:
 
 1. Latch `EXITING` + reason immediately (sticky even if the mark recovers).
-2. Submit one **2-leg** debit-to-close mleg. Journal `CLOSED` only if the broker **accepts** the close (dry-run treats the recorded payload as success).
-3. If submit raises or returns empty: stay `EXITING`, journal `close_failed`, **ERROR** log, increment `close_attempts`. Next poll retries. Paper ticks **block new entries** while any spread is `EXITING`.
+2. Submit one **2-leg** debit-to-close mleg.
+3. Journal `CLOSED` only through `Journal.record_close`, which always writes `closed_at` and a `close_debit` when a price exists.
+   - **Dry-run / observer:** the debit is the spread mid (short mid − long mid), the same mark that tripped the exit. Zero orders.
+   - **Live paper:** wait for the mleg **fill**. `close_debit` is the order's net debit (`filled_avg_price`, not the quote) and `closed_at` is the fill time. A still-working order is left alone. A terminal partial fill increments `close_attempts`, keeps the filled contracts, and the next poll submits only the remainder. The stored debit is the qty-weighted average of those fills.
+4. If submit raises or returns empty, or the order dies with no fill: stay `EXITING`, journal `close_failed`, **ERROR** log, increment `close_attempts`. Next poll retries. Paper ticks **block new entries** while any spread is `EXITING`.
+5. If the close is real but no price can be read, the row still closes, `close_price_source` is `missing`, and a `close_price_missing` event plus a warning are written. Stats count that row in `n_missing_price`.
+
+There is no separate expiry/DTE closer. The roll stub still closes through this same recorder when an exit fires. Off-hours only latches (`EXITING`); the first RTH poll submits, then records the fill. Naked-leg flattens also go through `record_close` (quote mid).
 
 Off-hours (`rth.manage_exits_off_hours: false`): options do not trade AH, so we **do not submit**. Open spreads are still flagged (`overnight_open` once per ET date + heartbeat `overnight_open=N`). Daily structure-break can latch overnight. The **first RTH poll always runs `_manage_exits` before any new entry**.
 
@@ -112,6 +118,7 @@ alpaca-options-credit run --config config/default.yaml
 | `supervise --dry-run` | never | child as above | **yes** |
 | `run` (no dry-run) | paper mleg | Alpaca | no |
 | `supervise` (no dry-run) | paper mleg | Alpaca | **yes** |
+| `backfill-close-debits` | never (writes journal debits only) | historical option quotes/bars | no |
 
 `--once` (on `run` / `observe`) ticks a single loop — useful for smoke tests.
 
@@ -129,7 +136,22 @@ The engine writes `var/options/heartbeat.json` **every loop**, including off-hou
 
 Journal path: `var/options/journal.sqlite` (arms, open spreads, exit state, event log). Isolated from equity/crypto `var/` trees.
 
-Closed spreads store `exit_reason`, `closed_at`, and `close_debit` (the debit-to-close mark). `Journal.summarize_managed_outcomes(start, end)` is the EOD query: managed win rate (take-profit vs credit-stop / structure-break), average win, average loss, `n_wins`, and `n_losses` for an inclusive America/New_York calendar-day range. Pass `session="rth"` to keep only weekday 09:30–16:00 ET closes. Dollars are `(credit - close_debit) × qty × multiplier` (default multiplier 100). A stop journaled before the debit column existed still counts; the helper implies the locked 1.5× stop and 50% take-profit when `close_debit` is missing. Legacy `stop_2x_credit` rows count as managed losses. `naked_leg` is not a managed outcome. Dry-run writes the same close row and still submits zero broker orders.
+Closed spreads store `exit_reason`, `closed_at`, `close_debit` (per-spread debit, premium points), and `close_price_source` (`quote`, `fill`, `backfill`, or `missing`). `Journal.summarize_managed_outcomes(start, end)` is the EOD query: managed win rate (take-profit vs credit-stop / structure-break), average win, average loss, `pnl`, `n_wins`, `n_losses`, `n_estimated`, and `n_missing_price` for an inclusive America/New_York calendar-day range. Pass `session="rth"` to keep only weekday 09:30–16:00 ET closes. Dollars are `(credit - close_debit) × qty × multiplier` (default multiplier 100). Backfilled rows are included and counted in `n_estimated`. A stop journaled before the debit column existed still counts; the helper implies the locked 1.5× stop and 50% take-profit when `close_debit` is missing, and those rows are still reported in `n_missing_price`. A structure exit with no debit counts as a loss and is left out of `avg_loss` / `pnl`. Legacy `stop_2x_credit` rows count as managed losses. `naked_leg` is not a managed outcome. Dry-run writes the same close row and still submits zero broker orders.
+
+### Backfill close debits
+
+Closes journaled before `close_debit` existed (or any closed row still NULL) can be filled from historical option quotes, then minute bars, at `closed_at` or, when that is empty, `updated_at`. The debit is short price − long price. The row is tagged `close_price_source=backfill` and a `close_debit_backfilled` event with `estimated: true`. Rows that already have `close_debit` are never touched. `--dry-run` previews and writes nothing. This command does **not** read `bot.dry_run` and does not flip the engine into paper orders.
+
+```bash
+# Preview only.
+python -m alpaca_options_credit backfill-close-debits --dry-run
+
+# Write the paper journal (needs OPTIONS_APCA_* keys).
+python -m alpaca_options_credit backfill-close-debits --config config/default.yaml
+
+# Another sqlite file.
+python -m alpaca_options_credit backfill-close-debits --journal var/options/journal.sqlite
+```
 
 ## Credentials (isolation)
 

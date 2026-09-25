@@ -85,6 +85,10 @@ def test_calendar_day_and_rth_session(tmp_path: Path):
     assert calendar.avg_win == pytest.approx(130.0)
     # (-0.60 + -0.40 + -1.00) * 100 / 3
     assert calendar.avg_loss == pytest.approx(-200.0 / 3)
+    assert calendar.n_missing_price == 0
+    assert calendar.n_estimated == 0
+    # 60 + 200 - 60 - 40 - 100
+    assert calendar.pnl == pytest.approx(60.0)
 
     rth = journal.summarize_managed_outcomes(DAY, DAY, session="rth")
     assert rth.n_wins == 2
@@ -92,6 +96,7 @@ def test_calendar_day_and_rth_session(tmp_path: Path):
     assert rth.win_rate == pytest.approx(0.5)
     assert rth.avg_win == pytest.approx(130.0)
     assert rth.avg_loss == pytest.approx(-50.0)
+    assert rth.pnl == pytest.approx(160.0)
 
     weekend = journal.summarize_managed_outcomes(date(2026, 3, 7), date(2026, 3, 7))
     assert weekend.n_wins == 1
@@ -117,6 +122,10 @@ def test_legacy_stop_and_unpriced_structure(tmp_path: Path):
     assert summary.avg_win == pytest.approx(50.0)
     # Implied 1.5× stop on 1.20; unpriced structure is counted but not averaged.
     assert summary.avg_loss == pytest.approx(-60.0)
+    assert summary.n_missing_price == 3
+    assert summary.n_estimated == 0
+    # Implied stop -60 plus implied take-profit +50. Structure has no dollars.
+    assert summary.pnl == pytest.approx(-10.0)
 
 
 def test_empty_window_and_half_open_datetimes(tmp_path: Path):
@@ -183,3 +192,28 @@ def test_old_journal_gains_close_columns(tmp_path: Path):
     summary = journal.summarize_managed_outcomes(DAY, DAY, session="rth")
     assert summary.n_wins == 1
     assert summary.avg_win == pytest.approx(60.0)
+
+
+def test_backfilled_rows_are_in_the_digest(tmp_path: Path):
+    journal = Journal(tmp_path / "j.sqlite")
+    _close(journal, "est", "structure_break", credit=1.00, qty=2, closed_at=RTH)
+    _close(journal, "gap", "stop_credit", credit=1.20, qty=1, closed_at=RTH)
+    assert journal.write_backfilled_close(
+        "est",
+        1.40,
+        RTH,
+        underlying="SPY",
+        exit_reason="structure_break",
+    )
+    # A second write must not replace the estimated debit.
+    assert journal.write_backfilled_close("est", 9.99, RTH) is False
+
+    summary = journal.summarize_managed_outcomes(DAY, DAY, session="rth")
+    assert summary.n_estimated == 1
+    assert summary.n_missing_price == 1
+    assert summary.n_losses == 2
+    # Backfill (1.00 - 1.40) * 2 * 100 = -80. Implied stop is not in this average
+    # alongside it: the stop row is still missing a stored debit, so the
+    # locked 1.5× policy supplies -60, and the mean is (-80 + -60) / 2.
+    assert summary.avg_loss == pytest.approx(-70.0)
+    assert summary.pnl == pytest.approx(-140.0)
