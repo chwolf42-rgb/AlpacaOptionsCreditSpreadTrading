@@ -1,6 +1,6 @@
 # Strategy redesign
 
-Keep the bot paused. No precommitted design has a positive expectancy out of sample beyond sampling noise. No design cleared the train window, so nothing was sent to the test as a winner. The live book is still the PR #10 sleeve with the price stop off, and that sleeve loses money. Appendix rows that look less bad on the test window were not the selection.
+Keep the bot paused. No precommitted design has a positive expectancy out of sample beyond sampling noise. No design cleared the train window. The live book is still the PR #10 sleeve with the price stop off, and that sleeve loses money. Appendix rows that look less bad on the test window were not the selection. Train picked `d16_osc`. The test sample is 23 trades, under 30, so the out-of-sample interval is not a claim. MACD and Stochastic RSI do not clear sampling noise.
 
 ## How a design was allowed to win
 
@@ -8,7 +8,9 @@ Train is 2024-01-02 through 2025-06-30. Test is 2025-07-01 through 2026-09-25. T
 
 A train row needs at least 50 trades. Both the dollar expectancy and the expectancy divided by that spread's max loss need a 95% bootstrap interval entirely above zero. The winner is the eligible row with the highest expectancy per unit of risk. That one row then has to clear the same bar on the test window with at least 30 trades, show a positive point estimate on 2025 H2 and on 2026 when those slices have at least 10 trades, not have a Jul–Sep 2026 interval entirely below zero when that slice has at least 15 trades, and show a positive dollar point estimate on the 5-spread book.
 
-There are 53 searchable designs. The train intervals are not adjusted for that search. The test interval is one look at the precommitted winner. A different design that looks good only on the test window is listed in the appendix and is not implemented.
+There are 65 searchable designs. The train intervals are not adjusted for that search. The test interval is one look at the precommitted winner. A different design that looks good only on the test window is listed in the appendix and is not implemented.
+
+MACD and Stochastic RSI are in that same search, so a row that clears the bar can still be the winner. Separately, the oscillator settings are ranked on the train window by expectancy per unit of risk among rows with at least 30 trades. That one setting is then compared with its matched shelf entry on the test window. Adding value means both the dollar difference and the difference as a share of max risk have a 95% interval entirely above zero, on at least 30 test trades. The train intervals for that grid are not adjusted for the number of settings.
 
 ## Pricing
 
@@ -83,6 +85,18 @@ Sizing in the per-spread tables is 0.5% of a fixed $100,000, one spread per name
 | condor_etf_iv | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | condor_etf | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | condor_all_iv | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| base_osc | 41 | 0.53 | 48.8% [31.7%, 63.4%] | -$45 [-$78, -$12] | -12.3% [-21.0%, -3.5%] | $59 | -$144 | $2002 (2.0%) | 0.36 |
+| base_osc_d | 28 | 0.36 | 50.0% [32.1%, 67.9%] | -$41 [-$79, -$4] | -11.1% [-21.4%, -1.5%] | $58 | -$139 | $1363 (1.4%) | 0.36 |
+| base_osc_d2 | 9 | 0.12 | 44.4% [11.1%, 77.8%] | -$43 [-$106, $21] | -12.4% [-29.8%, 5.5%] | $63 | -$129 | $445 (0.4%) | 0.40 |
+| base_osc_day | 20 | 0.26 | 35.0% [15.0%, 55.0%] | -$76 [-$124, -$27] | -20.0% [-32.2%, -7.4%] | $55 | -$147 | $1740 (1.7%) | 0.37 |
+| d16_osc | 31 | 0.40 | 77.4% [61.3%, 90.3%] | $8 [-$8, $21] | 1.8% [-1.7%, 4.9%] | $29 | -$64 | $175 (0.2%) | 0.16 |
+| d16_osc_d | 24 | 0.31 | 83.3% [66.7%, 95.8%] | $17 [$6, $27] | 3.9% [1.3%, 6.0%] | $28 | -$40 | $58 (0.1%) | 0.16 |
+| d16_osc_d2 | 5 | 0.06 | 60.0% [20.0%, 100.0%] | -$5 [-$40, $29] | -1.2% [-9.2%, 6.6%] | $28 | -$55 | $109 (0.1%) | 0.16 |
+| d16_osc_day | 19 | 0.24 | 68.4% [47.4%, 89.5%] | -$3 [-$28, $18] | -0.7% [-6.4%, 4.0%] | $27 | -$68 | $273 (0.3%) | 0.16 |
+| d16_osc_x | 12 | 0.15 | 83.3% [58.3%, 100.0%] | $16 [-$4, $30] | 3.6% [-1.0%, 6.8%] | $29 | -$51 | $58 (0.1%) | 0.16 |
+| ext_osc | 60 | 0.77 | 18.3% [10.0%, 28.3%] | -$44 [-$57, -$32] | -10.0% [-12.8%, -7.3%] | $29 | -$61 | $2655 (2.7%) | 0.16 |
+| ext_osc_d | 42 | 0.54 | 16.7% [7.1%, 28.6%] | -$42 [-$57, -$29] | -9.5% [-12.9%, -6.5%] | $27 | -$56 | $1773 (1.8%) | 0.16 |
+| ext_osc_day | 15 | 0.19 | 20.0% [0.0%, 40.0%] | -$50 [-$73, -$26] | -11.3% [-16.4%, -5.9%] | $27 | -$69 | $751 (0.8%) | 0.16 |
 
 ### What each train row is
 
@@ -139,6 +153,18 @@ Sizing in the per-spread tables is 0.5% of a fixed $100,000, one spread per name
 - `condor_etf_iv` — Iron condor on ETFs when price is mid-range and within one ATR of the EMA50. 16 delta each side, IV percentile 50, managed exits, shorts beyond the 20-day range.
 - `condor_etf` — Same ETF iron condor with no IV filter.
 - `condor_all_iv` — Iron condor on the full list, IV percentile 50, managed exits.
+- `base_osc` — Live confirm book plus the hourly Stochastic RSI turn and a rising hourly MACD histogram. No daily MACD sign.
+- `base_osc_d` — Live confirm book, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line on the same side.
+- `base_osc_d2` — Live confirm book, hourly Stochastic RSI turn, two hourly histogram steps, and the daily MACD line.
+- `base_osc_day` — Live confirm book. The Stochastic RSI turn, the MACD histogram, and the MACD line are all read on the last completed daily bar.
+- `d16_osc` — 16-delta confirm book plus the hourly Stochastic RSI turn and a rising hourly MACD histogram.
+- `d16_osc_d` — 16-delta confirm book, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line.
+- `d16_osc_d2` — 16-delta confirm book, hourly Stochastic RSI turn, two hourly histogram steps, and the daily MACD line.
+- `d16_osc_day` — 16-delta confirm book with the Stochastic RSI turn, histogram, and MACD line all on the last completed daily bar.
+- `d16_osc_x` — 16-delta confirm book. Hourly %K must cross %D while leaving 20 or 80, the hourly histogram must agree, and the daily MACD line must agree.
+- `ext_osc` — 16-delta extension into the HVN shelf, plus the hourly Stochastic RSI turn and a rising hourly MACD histogram.
+- `ext_osc_d` — 16-delta extension into the shelf, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line.
+- `ext_osc_day` — 16-delta extension into the shelf. Stochastic RSI, histogram, and MACD line are read on the last completed daily bar.
 
 ## Selection
 
@@ -216,6 +242,61 @@ SPY buy-and-hold is the close on the first session of the window to the close on
 | baseline | test | 164 | 66 | 0 | 92 | 0 | 0 | 0 | 6 |
 | baseline | long | 347 | 144 | 0 | 197 | 0 | 0 | 0 | 6 |
 
+## MACD and Stochastic RSI
+
+Stochastic RSI is Wilder RSI(14), then a 14-period stochastic of that RSI, smoothed with a 3-period average (%K) and a 3-period average of %K (%D). A bull put needs %K to turn up from below 20. A bear call needs %K to turn down from above 80. MACD is 12/26/9. The histogram has to move with the turn: up for a bull put, down for a bear call. Daily trend context is the sign of the daily MACD line, positive for a bull put and negative for a bear call. A missing reading fails closed.
+
+The volume-profile shelf entry is unchanged. The oscillator is an extra gate on that same bar. Hourly readings use the closed timing bar. Daily readings use the last session whose 16:00 close is already known. The indicators are causal, so a later bar does not move an earlier reading.
+
+Locked, and not searched: the 14/14/3/3 Stochastic RSI, the 20 and 80 extremes, MACD 12/26/9, and the requirement that the turn and the histogram agree. Searched on the train window only: hourly versus daily frame, one histogram step versus two, daily MACD sign on or off, and a stricter %K cross of %D. The pick is the highest train expectancy per unit of risk among oscillator rows with at least 30 trades. Fills in this section are the same natural bid/ask as the rest of the study.
+
+### Train grid
+
+| Design | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | Expectancy / max risk (95% CI) | Avg win | Avg loss | Max drawdown | Avg |delta| |
+| --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- | ---: |
+| base_osc | 41 | 0.53 | 48.8% [31.7%, 63.4%] | -$45 [-$78, -$12] | -12.3% [-21.0%, -3.5%] | $59 | -$144 | $2002 (2.0%) | 0.36 |
+| base_osc_d | 28 | 0.36 | 50.0% [32.1%, 67.9%] | -$41 [-$79, -$4] | -11.1% [-21.4%, -1.5%] | $58 | -$139 | $1363 (1.4%) | 0.36 |
+| base_osc_d2 | 9 | 0.12 | 44.4% [11.1%, 77.8%] | -$43 [-$106, $21] | -12.4% [-29.8%, 5.5%] | $63 | -$129 | $445 (0.4%) | 0.40 |
+| base_osc_day | 20 | 0.26 | 35.0% [15.0%, 55.0%] | -$76 [-$124, -$27] | -20.0% [-32.2%, -7.4%] | $55 | -$147 | $1740 (1.7%) | 0.37 |
+| d16_osc | 31 | 0.40 | 77.4% [61.3%, 90.3%] | $8 [-$8, $21] | 1.8% [-1.7%, 4.9%] | $29 | -$64 | $175 (0.2%) | 0.16 |
+| d16_osc_d | 24 | 0.31 | 83.3% [66.7%, 95.8%] | $17 [$6, $27] | 3.9% [1.3%, 6.0%] | $28 | -$40 | $58 (0.1%) | 0.16 |
+| d16_osc_d2 | 5 | 0.06 | 60.0% [20.0%, 100.0%] | -$5 [-$40, $29] | -1.2% [-9.2%, 6.6%] | $28 | -$55 | $109 (0.1%) | 0.16 |
+| d16_osc_day | 19 | 0.24 | 68.4% [47.4%, 89.5%] | -$3 [-$28, $18] | -0.7% [-6.4%, 4.0%] | $27 | -$68 | $273 (0.3%) | 0.16 |
+| d16_osc_x | 12 | 0.15 | 83.3% [58.3%, 100.0%] | $16 [-$4, $30] | 3.6% [-1.0%, 6.8%] | $29 | -$51 | $58 (0.1%) | 0.16 |
+| ext_osc | 60 | 0.77 | 18.3% [10.0%, 28.3%] | -$44 [-$57, -$32] | -10.0% [-12.8%, -7.3%] | $29 | -$61 | $2655 (2.7%) | 0.16 |
+| ext_osc_d | 42 | 0.54 | 16.7% [7.1%, 28.6%] | -$42 [-$57, -$29] | -9.5% [-12.9%, -6.5%] | $27 | -$56 | $1773 (1.8%) | 0.16 |
+| ext_osc_day | 15 | 0.19 | 20.0% [0.0%, 40.0%] | -$50 [-$73, -$26] | -11.3% [-16.4%, -5.9%] | $27 | -$69 | $751 (0.8%) | 0.16 |
+
+Train pick: `d16_osc`, matched to `d16`. Train expectancy $8 [-$8, $21], 1.8% [-1.7%, 4.9%], 31 trades. 16-delta confirm book plus the hourly Stochastic RSI turn and a rising hourly MACD histogram.
+
+### Selected setting and its control
+
+Train is how the setting was chosen. Test is the out-of-sample look. Recent is Jul 6–Sep 25 2026. Long includes the train window.
+
+| Design | Trades | Trades/week | Win rate (95% CI) | Expectancy $ (95% CI) | Expectancy / max risk (95% CI) | Avg win | Avg loss | Max drawdown | Avg |delta| |
+| --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- | ---: |
+| d16_osc train | 31 | 0.40 | 77.4% [61.3%, 90.3%] | $8 [-$8, $21] | 1.8% [-1.7%, 4.9%] | $29 | -$64 | $175 (0.2%) | 0.16 |
+| d16 train | 142 | 1.82 | 66.2% [57.7%, 73.9%] | -$13 [-$25, -$3] | -3.0% [-5.5%, -0.6%] | $28 | -$95 | $2632 (2.6%) | 0.16 |
+| d16_osc test | 23 | 0.36 | 73.9% [56.5%, 91.3%] | -$0 [-$25, $20] | -0.1% [-5.5%, 4.5%] | $29 | -$83 | $246 (0.2%) | 0.16 |
+| d16 test | 101 | 1.56 | 67.3% [57.4%, 76.2%] | -$12 [-$25, $0] | -2.7% [-5.6%, 0.1%] | $28 | -$95 | $1708 (1.7%) | 0.16 |
+| d16_osc recent | 5 | 0.43 | 60.0% [20.0%, 100.0%] | -$24 [-$104, $31] | -5.4% [-23.3%, 7.1%] | $31 | -$108 | $167 (0.2%) | 0.17 |
+| d16 recent | 16 | 1.37 | 75.0% [50.0%, 93.8%] | -$9 [-$46, $24] | -2.0% [-10.3%, 5.4%] | $30 | -$124 | $449 (0.4%) | 0.16 |
+| d16_osc long | 54 | 0.38 | 75.9% [64.8%, 87.0%] | $4 [-$9, $16] | 1.0% [-1.9%, 3.7%] | $29 | -$73 | $246 (0.2%) | 0.16 |
+| d16 long | 243 | 1.70 | 66.7% [60.5%, 72.4%] | -$13 [-$21, -$5] | -2.9% [-4.8%, -1.1%] | $28 | -$95 | $3665 (3.7%) | 0.16 |
+
+Difference is the oscillator mean minus the control mean. The two trade lists are resampled independently, 5,000 draws, seed 20260925. An interval entirely above zero is the claim that the filter adds value beyond sampling noise.
+
+| Window | Oscillator trades | Control trades | Expectancy $ difference (95% CI) | Expectancy / max risk difference (95% CI) |
+| --- | ---: | ---: | --- | --- |
+| train | 31 | 142 | $21 [$2, $39] | 4.8% [0.5%, 8.7%] |
+| test | 23 | 101 | $11 [-$16, $35] | 2.6% [-3.6%, 8.0%] |
+| recent | 5 | 16 | -$16 [-$96, $52] | -3.5% [-21.5%, 11.8%] |
+| long | 54 | 243 | $17 [$2, $32] | 3.9% [0.5%, 7.2%] |
+
+Train picked `d16_osc`. The test sample is 23 trades, under 30, so the out-of-sample interval is not a claim. MACD and Stochastic RSI do not clear sampling noise.
+
+The other oscillator settings' test numbers sit in the appendix with the rest of the search. They were not used to choose the setting.
+
 ## Appendix: test window for every searchable design
 
 These numbers were not used to pick the winner. A row whose test interval sits above zero, and that was not the train selection, is not a candidate to ship.
@@ -275,6 +356,18 @@ These numbers were not used to pick the winner. A row whose test interval sits a
 | condor_etf_iv | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | condor_etf | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | condor_all_iv | 0 | 0.00 | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| base_osc | 37 | 0.57 | 54.1% [37.8%, 70.3%] | -$35 [-$72, $0] | -9.7% [-19.5%, -0.1%] | $59 | -$146 | $1408 (1.4%) | 0.39 |
+| base_osc_d | 30 | 0.46 | 56.7% [40.0%, 73.3%] | -$21 [-$59, $12] | -6.0% [-16.1%, 2.9%] | $58 | -$125 | $991 (1.0%) | 0.39 |
+| base_osc_d2 | 8 | 0.12 | 62.5% [25.0%, 100.0%] | -$36 [-$121, $43] | -10.0% [-32.9%, 11.2%] | $52 | -$181 | $486 (0.5%) | 0.38 |
+| base_osc_day | 21 | 0.33 | 33.3% [14.3%, 57.1%] | -$83 [-$126, -$35] | -22.0% [-33.4%, -9.3%] | $60 | -$154 | $1741 (1.7%) | 0.35 |
+| d16_osc | 23 | 0.36 | 73.9% [56.5%, 91.3%] | -$0 [-$25, $20] | -0.1% [-5.5%, 4.5%] | $29 | -$83 | $246 (0.2%) | 0.16 |
+| d16_osc_d | 21 | 0.33 | 76.2% [57.1%, 90.5%] | $1 [-$24, $21] | 0.3% [-5.5%, 4.8%] | $29 | -$87 | $182 (0.2%) | 0.16 |
+| d16_osc_d2 | 7 | 0.11 | 71.4% [42.9%, 100.0%] | -$19 [-$77, $28] | -4.2% [-17.2%, 6.4%] | $28 | -$137 | $218 (0.2%) | 0.16 |
+| d16_osc_day | 12 | 0.19 | 75.0% [50.0%, 100.0%] | -$4 [-$38, $27] | -1.0% [-8.7%, 6.2%] | $28 | -$101 | $228 (0.2%) | 0.16 |
+| d16_osc_x | 13 | 0.20 | 76.9% [53.8%, 100.0%] | $10 [-$9, $27] | 2.1% [-2.1%, 6.1%] | $28 | -$51 | $127 (0.1%) | 0.16 |
+| ext_osc | 54 | 0.84 | 25.9% [14.8%, 37.0%] | -$38 [-$51, -$26] | -8.8% [-11.7%, -5.9%] | $28 | -$62 | $2067 (2.1%) | 0.16 |
+| ext_osc_d | 38 | 0.59 | 28.9% [15.8%, 44.7%] | -$35 [-$51, -$20] | -8.2% [-11.8%, -4.6%] | $28 | -$61 | $1368 (1.4%) | 0.16 |
+| ext_osc_day | 7 | 0.11 | 0.0% [0.0%, 0.0%] | -$60 [-$75, -$50] | -13.6% [-16.9%, -11.2%] | n/a | -$60 | $423 (0.4%) | 0.17 |
 
 ## Decision
 
@@ -282,7 +375,9 @@ No design cleared the train window.
 
 No change to `config/default.yaml`. Leave `exits.credit_stop: false` as PR #10 set it, and do not run the sleeve. `config/paper-live.yaml` is not in this repo. If a copy is still placing orders, stop it. The hard locks stay in the code either way: options-native exits, atomic 2-leg opens and closes, paper only, and the risk caps the operator asked to keep (0.5% per spread, 10% open, and a 5-spread book on the machine that trades — the tracked default still says 20 concurrent, which is the dry-run list size, not a reason to keep trading).
 
-Plain English: selling the near-the-money credit the 20% width rule demands, into a breakout retest, did not become a winner by moving the short to a listed delta, by waiting for a high vol-proxy rank, by closing at 21 DTE, by stopping on the shelf, or by switching to condors and ETFs. Nothing in the precommitted search cleared an untouched test window. Keep the bot paused.
+Train picked `d16_osc`. The test sample is 23 trades, under 30, so the out-of-sample interval is not a claim. MACD and Stochastic RSI do not clear sampling noise.
+
+Plain English: selling the near-the-money credit the 20% width rule demands, into a breakout retest, did not become a winner by moving the short to a listed delta, by waiting for a high vol-proxy rank, by closing at 21 DTE, by stopping on the shelf, by switching to condors and ETFs, or by requiring a Stochastic RSI turn and a MACD histogram at the shelf. Nothing in the precommitted search cleared an untouched test window. Keep the bot paused.
 
 ## Reproduce
 

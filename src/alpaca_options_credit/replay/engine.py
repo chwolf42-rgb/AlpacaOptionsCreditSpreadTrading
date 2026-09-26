@@ -30,6 +30,7 @@ from alpaca_options_credit.replay.credit import (
     spread_mid,
     year_fraction,
 )
+from alpaca_options_credit.replay.oscillators import OscFlags, OscSeries, flags_at
 from alpaca_options_credit.replay.filters import (
     EMA_PERIOD,
     RS_LOOKBACK,
@@ -88,6 +89,7 @@ class EntryFeatures:
     vix_pct: Optional[float] = None
     spy_rv20: Optional[float] = None
     earnings_soon: bool = False
+    osc: OscFlags = field(default_factory=OscFlags)
 
 
 @dataclass
@@ -192,6 +194,8 @@ def replay_symbol(
     trades: list[ReplayTrade] = []
     cache: dict = {}
     price_cache: dict = {}
+    hourly_osc = OscSeries.from_closes([bar.close for bar in timing])
+    daily_osc = OscSeries.from_closes([bar.close for bar in daily])
 
     def limits_for(name: str) -> ReplayLimits:
         if limits_by_variant and name in limits_by_variant:
@@ -249,7 +253,13 @@ def replay_symbol(
             if not ready or view.side is None or view.invalidation is None:
                 continue
             slot.diag.ready += 1
-            features_base = _features_for_side(shared, view.side, symbol=symbol, snap=snap)
+            features_base = _features_for_side(
+                shared,
+                view.side,
+                symbol=symbol,
+                snap=snap,
+                osc=flags_at(hourly_osc, daily_osc, i, d_ptr - 1, view.side),
+            )
             slot_limits = limits_for(slot.name)
             if slot_limits.earnings_blackout_days > 0 and _earnings_soon(
                 earnings_by_symbol, symbol, entry_day, slot_limits.earnings_blackout_days
@@ -417,7 +427,14 @@ def _spy_return(completed: Sequence[Bar], spy_by_date: dict, lookback: int) -> O
     return p1 / p0 - 1.0
 
 
-def _features_for_side(shared: _Shared, side: Side, *, symbol: str = "", snap=None) -> EntryFeatures:
+def _features_for_side(
+    shared: _Shared,
+    side: Side,
+    *,
+    symbol: str = "",
+    snap=None,
+    osc: Optional[OscFlags] = None,
+) -> EntryFeatures:
     return EntryFeatures(
         side=side,
         session_ok=shared.session_ok,
@@ -434,6 +451,7 @@ def _features_for_side(shared: _Shared, side: Side, *, symbol: str = "", snap=No
         vix=None if snap is None else snap.vix,
         vix_pct=None if snap is None else snap.vix_pct,
         spy_rv20=None if snap is None else snap.spy_rv20,
+        osc=osc or OscFlags(),
     )
 
 

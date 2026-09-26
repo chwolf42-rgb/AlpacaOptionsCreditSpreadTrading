@@ -31,6 +31,7 @@ from alpaca_options_credit.replay.alt_entry import AltSpec, replay_alt_universe
 from alpaca_options_credit.replay.credit import ReplayLimits
 from alpaca_options_credit.replay.data import load_bars
 from alpaca_options_credit.replay.engine import replay_universe
+from alpaca_options_credit.replay.oscillators import OscGate, gate_allows
 from alpaca_options_credit.replay.regime import build_regime, max_drawdown, spy_buy_hold
 from alpaca_options_credit.replay.stats import (
     BookStats,
@@ -55,6 +56,10 @@ Y2026_START = date(2026, 1, 2)
 MIN_TRAIN = 50
 MIN_TEST = 30
 MIN_FOLD = 15
+# Oscillator settings are rarer than the unfiltered book. The train pick
+# needs this many trades. It still has to clear MIN_TRAIN and a positive
+# interval before the global rule can adopt it.
+MIN_OSC = 30
 N_BOOT = 5000
 BOOT_SEED = 20260925
 
@@ -104,6 +109,8 @@ class Design:
     vix_pct_min: Optional[float] = None
     vix_rich: bool = False
     searchable: bool = True
+    osc: Optional[OscGate] = None
+    control: Optional[str] = None
 
 
 def _limits(**kwargs) -> ReplayLimits:
@@ -372,7 +379,141 @@ def designs() -> list[Design]:
             ),
         ]
     )
+    rows.extend(_oscillator_designs())
     return rows
+
+
+def _oscillator_designs() -> list[Design]:
+    """Train-only grid. MACD is 12/26/9 and the Stochastic RSI extremes stay 20/80.
+
+    The searched settings are the bar the oscillator is read on, whether the
+    histogram must rise for one bar or two, whether the daily MACD line has
+    to agree, and whether %K must also cross %D. Each row is the same shelf
+    entry as its control, plus that gate.
+    """
+    live = _limits(
+        min_credit_pct=0.20,
+        target_abs_delta=None,
+        delta_tol=None,
+        earnings_blackout_days=0,
+    )
+    hour = OscGate(frame="1h", hist_bars=1, daily_sign=False)
+    hour_daily = OscGate(frame="1h", hist_bars=1, daily_sign=True)
+    hour_two = OscGate(frame="1h", hist_bars=2, daily_sign=True)
+    day = OscGate(frame="daily", hist_bars=1, daily_sign=True)
+    cross = OscGate(frame="1h", hist_bars=1, daily_sign=True, kd_cross=True)
+    specs = (
+        (
+            "base_osc",
+            "baseline",
+            live,
+            "confirm",
+            hour,
+            "Live confirm book plus the hourly Stochastic RSI turn and a rising hourly MACD histogram. No daily MACD sign.",
+        ),
+        (
+            "base_osc_d",
+            "baseline",
+            live,
+            "confirm",
+            hour_daily,
+            "Live confirm book, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line on the same side.",
+        ),
+        (
+            "base_osc_d2",
+            "baseline",
+            live,
+            "confirm",
+            hour_two,
+            "Live confirm book, hourly Stochastic RSI turn, two hourly histogram steps, and the daily MACD line.",
+        ),
+        (
+            "base_osc_day",
+            "baseline",
+            live,
+            "confirm",
+            day,
+            "Live confirm book. The Stochastic RSI turn, the MACD histogram, and the MACD line are all read on the last completed daily bar.",
+        ),
+        (
+            "d16_osc",
+            "d16",
+            _limits(),
+            "confirm",
+            hour,
+            "16-delta confirm book plus the hourly Stochastic RSI turn and a rising hourly MACD histogram.",
+        ),
+        (
+            "d16_osc_d",
+            "d16",
+            _limits(),
+            "confirm",
+            hour_daily,
+            "16-delta confirm book, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line.",
+        ),
+        (
+            "d16_osc_d2",
+            "d16",
+            _limits(),
+            "confirm",
+            hour_two,
+            "16-delta confirm book, hourly Stochastic RSI turn, two hourly histogram steps, and the daily MACD line.",
+        ),
+        (
+            "d16_osc_day",
+            "d16",
+            _limits(),
+            "confirm",
+            day,
+            "16-delta confirm book with the Stochastic RSI turn, histogram, and MACD line all on the last completed daily bar.",
+        ),
+        (
+            "d16_osc_x",
+            "d16",
+            _limits(),
+            "confirm",
+            cross,
+            "16-delta confirm book. Hourly %K must cross %D while leaving 20 or 80, the hourly histogram must agree, and the daily MACD line must agree.",
+        ),
+        (
+            "ext_osc",
+            "ext_d16",
+            _limits(),
+            "extension",
+            hour,
+            "16-delta extension into the HVN shelf, plus the hourly Stochastic RSI turn and a rising hourly MACD histogram.",
+        ),
+        (
+            "ext_osc_d",
+            "ext_d16",
+            _limits(),
+            "extension",
+            hour_daily,
+            "16-delta extension into the shelf, hourly Stochastic RSI turn, hourly MACD histogram, and the daily MACD line.",
+        ),
+        (
+            "ext_osc_day",
+            "ext_d16",
+            _limits(),
+            "extension",
+            day,
+            "16-delta extension into the shelf. Stochastic RSI, histogram, and MACD line are read on the last completed daily bar.",
+        ),
+    )
+    out = []
+    for name, control, limits, entry, gate, blurb in specs:
+        out.append(
+            Design(
+                name,
+                blurb,
+                "oscillator",
+                entry,
+                limits,
+                osc=gate,
+                control=control,
+            )
+        )
+    return out
 
 
 def allow_confirm(design: Design):
@@ -393,6 +534,8 @@ def allow_confirm(design: Design):
             features.vix is None or features.spy_rv20 is None or features.vix / 100.0 <= features.spy_rv20
         ):
             return False
+        if design.osc is not None and not gate_allows(design.osc, features.osc):
+            return False
         return True
 
     return _allow
@@ -410,6 +553,7 @@ def to_alt(design: Design) -> AltSpec:
         iv_over_rv=design.iv_over_rv,
         vix_pct_min=design.vix_pct_min,
         vix_rich=design.vix_rich,
+        osc=design.osc,
     )
 
 
@@ -477,6 +621,213 @@ def select_name(rows: Sequence[tuple[str, BookStats]], min_n: int = MIN_TRAIN) -
             best_point = stats.expectancy_r.point
             best_name = name
     return best_name
+
+
+def select_osc_name(rows: Sequence[tuple[str, BookStats]], min_n: int = MIN_OSC) -> Optional[str]:
+    """Train pick for the oscillator grid. The interval does not have to clear zero.
+
+    The setting with the highest expectancy per unit of risk wins. A tie goes
+    to the larger sample, then to the name, so the pick does not depend on
+    row order. Fewer than ``min_n`` trades is not a setting.
+    """
+    best_name: Optional[str] = None
+    best_point: Optional[float] = None
+    best_n = -1
+    for name, stats in rows:
+        if stats.n < min_n or stats.expectancy_r is None:
+            continue
+        point = stats.expectancy_r.point
+        if (
+            best_point is None
+            or point > best_point
+            or (point == best_point and stats.n > best_n)
+            or (point == best_point and stats.n == best_n and best_name is not None and name < best_name)
+        ):
+            best_point = point
+            best_n = stats.n
+            best_name = name
+    return best_name
+
+
+def mean_diff_interval(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    n_boot: int = N_BOOT,
+    seed: int = BOOT_SEED,
+) -> Optional[Interval]:
+    """Bootstrap of mean(left) − mean(right). The two samples are resampled independently."""
+    if not left or not right:
+        return None
+    a = np.asarray(left, dtype=float)
+    b = np.asarray(right, dtype=float)
+    point = float(a.mean() - b.mean())
+    if a.size == 1 and b.size == 1:
+        return Interval(point, point, point)
+    rng = np.random.default_rng(seed)
+    ia = rng.integers(0, a.size, size=(n_boot, a.size))
+    ib = rng.integers(0, b.size, size=(n_boot, b.size))
+    diffs = np.sort(a[ia].mean(axis=1) - b[ib].mean(axis=1))
+    low = float(diffs[int(0.025 * n_boot)])
+    high = float(diffs[min(n_boot - 1, int(0.975 * n_boot))])
+    return Interval(point, low, high)
+
+
+def oscillator_verdict(
+    name: Optional[str],
+    test_n: int,
+    diff_usd: Optional[Interval],
+    diff_r: Optional[Interval],
+    test_stats: Optional[BookStats],
+) -> str:
+    """Whether the train-chosen oscillator adds value beyond noise on the test window.
+
+    Written before the replay. Adding value means the test difference versus
+    the matched control, in dollars and as a share of max risk, has a 95%
+    interval entirely above zero, on at least 30 test trades. A positive
+    difference that leaves the book itself losing is not a reason to unpause.
+    """
+    if name is None:
+        return (
+            "No oscillator setting produced 30 train trades. The signal is too rare "
+            "to pick. It does not add a usable edge."
+        )
+    if test_n < MIN_TEST or diff_usd is None or diff_r is None:
+        return (
+            f"Train picked `{name}`. The test sample is {test_n} trades, under {MIN_TEST}, "
+            "so the out-of-sample interval is not a claim. MACD and Stochastic RSI do not "
+            "clear sampling noise."
+        )
+    usd_up = diff_usd.low > 0
+    r_up = diff_r.low > 0
+    usd_down = diff_usd.high < 0
+    r_down = diff_r.high < 0
+    if usd_down and r_down:
+        return (
+            f"`{name}` was the train setting. On the untouched test window it is worse than "
+            "its matched shelf entry, beyond sampling noise, in dollars and as a share of max risk. "
+            "MACD and Stochastic RSI do not add value."
+        )
+    if not (usd_up and r_up):
+        return (
+            f"`{name}` was the train setting. On the untouched test window the difference versus "
+            "its matched shelf entry has a 95% interval that includes zero, or the two units disagree. "
+            "MACD and Stochastic RSI do not add value beyond sampling noise."
+        )
+    book_positive = (
+        test_stats is not None
+        and test_stats.expectancy is not None
+        and test_stats.expectancy_r is not None
+        and test_stats.expectancy.low > 0
+        and test_stats.expectancy_r.low > 0
+    )
+    if book_positive:
+        return (
+            f"`{name}` improves its matched shelf entry beyond sampling noise, and the filtered "
+            "book itself has a positive test expectancy beyond noise."
+        )
+    return (
+        f"`{name}` improves its matched shelf entry beyond sampling noise, but the filtered book "
+        "is still not a positive-expectancy sleeve beyond noise. Do not unpause on this filter."
+    )
+
+
+def _oscillator_section(osc_rows, grouped, train, test, recent, long) -> tuple[list[str], str]:
+    """Train grid, the one train-chosen setting, and its out-of-sample difference."""
+    del grouped  # trades already live on the window dicts
+    lines = [
+        "Stochastic RSI is Wilder RSI(14), then a 14-period stochastic of that RSI, "
+        "smoothed with a 3-period average (%K) and a 3-period average of %K (%D). "
+        "A bull put needs %K to turn up from below 20. A bear call needs %K to turn down from above 80. "
+        "MACD is 12/26/9. The histogram has to move with the turn: up for a bull put, down for a bear call. "
+        "Daily trend context is the sign of the daily MACD line, positive for a bull put and negative for a bear call. "
+        "A missing reading fails closed.",
+        "",
+        "The volume-profile shelf entry is unchanged. The oscillator is an extra gate on that same bar. "
+        "Hourly readings use the closed timing bar. Daily readings use the last session whose 16:00 close "
+        "is already known. The indicators are causal, so a later bar does not move an earlier reading.",
+        "",
+        "Locked, and not searched: the 14/14/3/3 Stochastic RSI, the 20 and 80 extremes, MACD 12/26/9, "
+        "and the requirement that the turn and the histogram agree. Searched on the train window only: "
+        "hourly versus daily frame, one histogram step versus two, daily MACD sign on or off, and a stricter "
+        "%K cross of %D. The pick is the highest train expectancy per unit of risk among oscillator rows "
+        f"with at least {MIN_OSC} trades. Fills in this section are the same natural bid/ask as the rest of the study.",
+        "",
+        "### Train grid",
+        "",
+        TABLE_HEADER,
+    ]
+    for row in osc_rows:
+        stats, chosen = train[row.name]
+        lines.append(stats_line(row.name, stats, chosen))
+    picked = select_osc_name([(row.name, train[row.name][0]) for row in osc_rows])
+    by_name = {row.name: row for row in osc_rows}
+    if picked is None or by_name[picked].control is None:
+        verdict = oscillator_verdict(None, 0, None, None, None)
+        lines.extend(["", verdict])
+        return lines, verdict
+    control = by_name[picked].control
+    tw = train[picked][0]
+    lines.extend(
+        [
+            "",
+            f"Train pick: `{picked}`, matched to `{control}`. "
+            f"Train expectancy {_fmt(tw.expectancy, 'usd')}, {_fmt(tw.expectancy_r, 'r')}, {tw.n} trades. "
+            f"{by_name[picked].blurb}",
+            "",
+            "### Selected setting and its control",
+            "",
+            "Train is how the setting was chosen. Test is the out-of-sample look. "
+            "Recent is Jul 6–Sep 25 2026. Long includes the train window.",
+            "",
+            TABLE_HEADER,
+        ]
+    )
+    buckets = (
+        ("train", train),
+        ("test", test),
+        ("recent", recent),
+        ("long", long),
+    )
+    for label, bucket in buckets:
+        for name in (picked, control):
+            stats, chosen = bucket[name]
+            lines.append(stats_line(f"{name} {label}", stats, chosen))
+    lines.extend(
+        [
+            "",
+            "Difference is the oscillator mean minus the control mean. The two trade lists are resampled "
+            "independently, 5,000 draws, seed 20260925. An interval entirely above zero is the claim that "
+            "the filter adds value beyond sampling noise.",
+            "",
+            "| Window | Oscillator trades | Control trades | Expectancy $ difference (95% CI) | Expectancy / max risk difference (95% CI) |",
+            "| --- | ---: | ---: | --- | --- |",
+        ]
+    )
+    test_usd = None
+    test_r = None
+    for label, bucket in buckets:
+        osc_trades = bucket[picked][1]
+        control_trades = bucket[control][1]
+        usd = mean_diff_interval([t.pnl for t in osc_trades], [t.pnl for t in control_trades])
+        rmul = mean_diff_interval([t.r_multiple for t in osc_trades], [t.r_multiple for t in control_trades])
+        if label == "test":
+            test_usd = usd
+            test_r = rmul
+        lines.append(
+            f"| {label} | {len(osc_trades)} | {len(control_trades)} | {_fmt(usd, 'usd')} | {_fmt(rmul, 'r')} |"
+        )
+    verdict = oscillator_verdict(picked, test[picked][0].n, test_usd, test_r, test[picked][0])
+    lines.extend(
+        [
+            "",
+            verdict,
+            "",
+            "The other oscillator settings' test numbers sit in the appendix with the rest of the search. "
+            "They were not used to choose the setting.",
+        ]
+    )
+    return lines, verdict
 
 
 def _usd(value: float) -> str:
@@ -702,7 +1053,8 @@ def render(ctx: dict) -> str:
             "beyond sampling noise. "
             f"{reason} "
             "The live book is still the PR #10 sleeve with the price stop off, and that sleeve loses money. "
-            "Do not turn it back on to 'see' a row from the appendix: those test numbers were not the selection."
+            "Appendix rows that look less bad on the test window were not the selection. "
+            f"{ctx['osc_verdict']}"
         )
     parts = [
         "# Strategy redesign",
@@ -725,6 +1077,13 @@ def render(ctx: dict) -> str:
         f"There are {ctx['n_search']} searchable designs. The train intervals are not adjusted for that search. "
         "The test interval is one look at the precommitted winner. A different design that looks good only on the "
         "test window is listed in the appendix and is not implemented.",
+        "",
+        "MACD and Stochastic RSI are in that same search, so a row that clears the bar can still be the winner. "
+        "Separately, the oscillator settings are ranked on the train window by expectancy per unit of risk among "
+        f"rows with at least {MIN_OSC} trades. That one setting is then compared with its matched shelf entry on "
+        "the test window. Adding value means both the dollar difference and the difference as a share of max risk "
+        "have a 95% interval entirely above zero, on at least 30 test trades. The train intervals for that grid "
+        "are not adjusted for the number of settings.",
         "",
         "## Pricing",
         "",
@@ -788,6 +1147,7 @@ def render(ctx: dict) -> str:
     parts.append(_section("SPY buy and hold", ctx["spy_lines"]))
     parts.append(_section("Fill sensitivity", [TABLE_HEADER, *ctx["fill_lines"]]))
     parts.append(_section("Exit mix for the baseline and the train selection", ctx["exit_lines"]))
+    parts.append(_section("MACD and Stochastic RSI", ctx["osc_lines"]))
     parts.append(_section("Appendix: test window for every searchable design", [
         "These numbers were not used to pick the winner. A row whose test interval sits above zero, "
         "and that was not the train selection, is not a candidate to ship.",
@@ -1057,11 +1417,16 @@ def build_report(bars, cache: Path, cfg: dict) -> str:
             "on the machine that trades — the tracked default still says 20 concurrent, which is the dry-run list size, "
             "not a reason to keep trading)."
         )
+    osc_rows = [row for row in search if row.family == "oscillator"]
+    osc_lines, osc_verdict = _oscillator_section(osc_rows, grouped, train, test, recent, long)
+    decision.append("")
+    decision.append(osc_verdict)
     decision.append("")
     decision.append(
         f"Plain English: selling the near-the-money credit the 20% width rule demands, into a breakout retest, "
         "did not become a winner by moving the short to a listed delta, by waiting for a high vol-proxy rank, "
-        "by closing at 21 DTE, by stopping on the shelf, or by switching to condors and ETFs. "
+        "by closing at 21 DTE, by stopping on the shelf, by switching to condors and ETFs, or by requiring "
+        "a Stochastic RSI turn and a MACD histogram at the shelf. "
         + (
             f"`{winner}` cleared the train and the untouched test, so that is the book to paper-trade."
             if adopted and winner
@@ -1087,6 +1452,8 @@ def build_report(bars, cache: Path, cfg: dict) -> str:
         "fill_lines": fill_lines,
         "exit_lines": exit_lines,
         "decision_lines": decision,
+        "osc_lines": osc_lines,
+        "osc_verdict": osc_verdict,
     }
     text = render(ctx)
     # Keep the machine-readable winner next to the doc so a later step can implement it.

@@ -11,7 +11,21 @@ from alpaca_options_credit.replay.credit import (
     resolved_width,
     simulate_exit,
 )
-from alpaca_options_credit.replay.redesign import passes, select_name
+from alpaca_options_credit.replay.oscillators import (
+    OscFlags,
+    OscGate,
+    OscSeries,
+    flags_at,
+    gate_allows,
+    macd_series,
+    stoch_rsi_kd,
+)
+from alpaca_options_credit.replay.redesign import (
+    oscillator_verdict,
+    passes,
+    select_name,
+    select_osc_name,
+)
 from alpaca_options_credit.replay.regime import extension_touch, range_anchors
 from alpaca_options_credit.replay.stats import BookStats, Interval
 
@@ -249,3 +263,91 @@ def test_selection_requires_the_interval_above_zero():
     # The higher expectancy-per-risk wins when both clear the bar.
     better = _book("better", 80, 30, 0.08, 10, 0.02)
     assert select_name([("good", good), ("better", better)]) == "better"
+
+
+def test_stoch_turn_and_macd_sign_on_a_trend():
+    # A drift that never changes speed leaves RSI flat, so it must not look oversold.
+    drift = [100 - i * 0.6 for i in range(80)]
+    drift_k, _ = stoch_rsi_kd(drift)
+    assert all(value is None or value == 50.0 for value in drift_k)
+    drift_series = OscSeries.from_closes(drift)
+    assert not any(
+        flags_at(drift_series, drift_series, i, i, Side.BULLISH).h_turn for i in range(len(drift))
+    )
+
+    # A rise, a sharp drop, then a bounce. The bull turn is the first rise off the low.
+    closes = []
+    price = 100.0
+    for _ in range(40):
+        price += 0.15
+        closes.append(price)
+    for _ in range(35):
+        price -= 1.8
+        closes.append(price)
+    trough = len(closes) - 1
+    for _ in range(20):
+        price += 0.35
+        closes.append(price)
+    series = OscSeries.from_closes(closes)
+    bull = [i for i in range(len(closes)) if flags_at(series, series, i, i, Side.BULLISH).h_turn]
+    assert bull and min(bull) > trough
+
+    # Mirror: a drop, a sharp rally, then a fade.
+    bear_closes = []
+    price = 100.0
+    for _ in range(40):
+        price -= 0.15
+        bear_closes.append(price)
+    for _ in range(35):
+        price += 1.8
+        bear_closes.append(price)
+    peak = len(bear_closes) - 1
+    for _ in range(20):
+        price -= 0.35
+        bear_closes.append(price)
+    bear_series = OscSeries.from_closes(bear_closes)
+    bear = [i for i in range(len(bear_closes)) if flags_at(bear_series, bear_series, i, i, Side.BEARISH).h_turn]
+    assert bear and min(bear) > peak
+
+    up = [100 + i for i in range(80)]
+    down = [100 - i for i in range(80)]
+    up_line, _, _ = macd_series(up)
+    down_line, _, _ = macd_series(down)
+    assert up_line[-1] is not None and up_line[-1] > 0
+    assert down_line[-1] is not None and down_line[-1] < 0
+    # A future close must not move the reading at an earlier bar.
+    longer = OscSeries.from_closes(closes + [closes[-1] + 5, closes[-1] + 6])
+    assert series.k[bull[0]] == longer.k[bull[0]]
+    assert series.hist[bull[0]] == longer.hist[bull[0]]
+
+
+def test_oscillator_gate_fails_closed_and_the_mirror_is_required():
+    quiet = OscFlags()
+    gate = OscGate(frame="1h", hist_bars=1, daily_sign=True)
+    assert not gate_allows(gate, quiet)
+    bull = OscFlags(h_turn=True, h_hist1=True, daily_sign=True)
+    assert gate_allows(gate, bull)
+    assert not gate_allows(gate, OscFlags(h_turn=True, h_hist1=True, daily_sign=False))
+    # Two histogram steps are a different setting from one step.
+    two = OscGate(frame="1h", hist_bars=2, daily_sign=False)
+    assert not gate_allows(two, OscFlags(h_turn=True, h_hist1=True))
+    assert gate_allows(two, OscFlags(h_turn=True, h_hist2=True))
+    # Bearish is not implied by a bullish turn. The flags are already side-specific.
+    assert not gate_allows(OscGate(frame="daily"), OscFlags(h_turn=True, h_hist1=True))
+    assert gate_allows(OscGate(frame="daily"), OscFlags(d_turn=True, d_hist1=True))
+
+
+def test_oscillator_setting_is_picked_on_train_and_judged_on_the_difference():
+    weak = _book("weak", 40, -5, -0.02, -10, -0.04)
+    better = _book("better", 40, -1, -0.005, -4, -0.01)
+    thin = _book("thin", 10, 20, 0.05, 5, 0.01)
+    assert select_osc_name([("weak", weak), ("better", better), ("thin", thin)]) == "better"
+    assert select_osc_name([("thin", thin)]) is None
+    noise = Interval(2.0, -1.0, 5.0)
+    helped = Interval(8.0, 1.0, 15.0)
+    assert "do not add value beyond sampling noise" in oscillator_verdict("better", 40, noise, helped, better)
+    assert "do not add value beyond sampling noise" in oscillator_verdict("better", 40, helped, noise, better)
+    assert "Do not unpause" in oscillator_verdict("better", 40, helped, helped, better)
+    positive = _book("pos", 40, 12, 0.04, 4, 0.01)
+    assert "positive test expectancy" in oscillator_verdict("pos", 40, helped, helped, positive)
+    assert "under 30" in oscillator_verdict("better", 12, helped, helped, better)

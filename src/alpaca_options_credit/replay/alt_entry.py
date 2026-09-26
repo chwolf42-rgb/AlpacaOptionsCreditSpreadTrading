@@ -34,6 +34,7 @@ from alpaca_options_credit.replay.engine import (
     bar_end,
     daily_session_close,
 )
+from alpaca_options_credit.replay.oscillators import OscFlags, OscGate, OscSeries, flags_at, gate_allows
 from alpaca_options_credit.replay.regime import RegimeSnap, extension_touch, range_anchors
 from alpaca_options_credit.strategy.volume_profile import hvn_shelves
 from alpaca_options_credit.replay.stats import ReplayTrade
@@ -54,6 +55,7 @@ class AltSpec:
     iv_over_rv: bool = False
     vix_pct_min: Optional[float] = None
     vix_rich: bool = False
+    osc: Optional[OscGate] = None
 
 
 @dataclass
@@ -64,7 +66,14 @@ class _Slot:
     diag: VariantDiag = field(default_factory=VariantDiag)
 
 
-def _filters_ok(spec: AltSpec, symbol: str, side: Optional[Side], snap: Optional[RegimeSnap], etfs: set[str]) -> bool:
+def _filters_ok(
+    spec: AltSpec,
+    symbol: str,
+    side: Optional[Side],
+    snap: Optional[RegimeSnap],
+    etfs: set[str],
+    osc_flags: Optional[OscFlags] = None,
+) -> bool:
     if spec.etf_only and symbol not in etfs:
         return False
     if spec.stock_only and symbol in etfs:
@@ -89,6 +98,8 @@ def _filters_ok(spec: AltSpec, symbol: str, side: Optional[Side], snap: Optional
     if spec.vix_pct_min is not None and (snap.vix_pct is None or snap.vix_pct < spec.vix_pct_min):
         return False
     if spec.vix_rich and (snap.vix is None or snap.spy_rv20 is None or snap.vix / 100.0 <= snap.spy_rv20):
+        return False
+    if spec.osc is not None and (side is None or osc_flags is None or not gate_allows(spec.osc, osc_flags)):
         return False
     return True
 
@@ -117,6 +128,8 @@ def replay_alt_symbol(
 
     slots = [_Slot(spec) for spec in specs]
     trades: list[ReplayTrade] = []
+    hourly_osc = OscSeries.from_closes([bar.close for bar in timing])
+    daily_osc = OscSeries.from_closes([bar.close for bar in daily])
     price_cache: dict = {}
     shelf_cache: dict = {}
     d_ptr = 0
@@ -194,7 +207,8 @@ def replay_alt_symbol(
                 if episode_id in slot.consumed:
                     continue
                 slot.diag.ready += 1
-                if not _filters_ok(spec, symbol, touch.side, snap, etfs):
+                osc_flags = flags_at(hourly_osc, daily_osc, i, d_ptr - 1, touch.side)
+                if not _filters_ok(spec, symbol, touch.side, snap, etfs, osc_flags):
                     slot.diag.filter_reject += 1
                     continue
                 if _earnings_block(spec, earnings, symbol, today):
