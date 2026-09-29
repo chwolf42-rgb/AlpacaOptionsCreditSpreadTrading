@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -26,6 +27,15 @@ from alpaca_options_credit.close_prices import SOURCE_FILL, SOURCE_QUOTE, CloseO
 from alpaca_options_credit.config import validate_exit_policy, var_dir
 from alpaca_options_credit.heartbeat import Heartbeat, HeartbeatWriter
 from alpaca_options_credit.journal import Journal
+from alpaca_options_credit.market_data_limit import (
+    PRIORITY_ARMED,
+    PRIORITY_EXIT,
+    PRIORITY_WATCH,
+    PAGES_PER_SYMBOL,
+    budget_per_min,
+    data_priority,
+    get_limiter,
+)
 from alpaca_options_credit.models import (
     Arm,
     ArmStatus,
@@ -96,6 +106,10 @@ class Engine:
         self.calendar = calendar if calendar is not None else load_calendar(cal_path)
         validate_exit_policy(self.cfg)
         self._overnight_flagged_date = None
+        self._tick_data_pages = 0
+        self._scan_queue: deque[str] = deque()
+        self._scan_pass_active = False
+        self._pass_members: set[str] = set()
 
     def _rth(self, now: datetime) -> bool:
         rth = self.cfg.get("rth") or {}
@@ -125,6 +139,14 @@ class Engine:
         rth = self._rth(now)
         proposals: list[SpreadProposal] = []
         exits: list[str] = []
+        self._tick_data_pages = 0
+        if getattr(self.data, "limits_market_data", False):
+            get_limiter().set_wait_hook(
+                lambda: self.beat(
+                    "rth_scan" if rth else "idle_off_hours",
+                    "market-data pace",
+                )
+            )
 
         # Always persist/reconcile journaled spreads first — exits before entries.
         open_spreads = self.journal.open_spreads()
@@ -138,10 +160,11 @@ class Engine:
         # Off-hours: still latch structure-break / already-due exits; do not submit
         # (options do not trade AH). First RTH poll submits before any new entry.
         if open_spreads or submit_closes:
-            exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
-            open_spreads = self.journal.open_spreads()
-            exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
-            open_spreads = self.journal.open_spreads()
+            with data_priority(PRIORITY_EXIT):
+                exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
+                open_spreads = self.journal.open_spreads()
+                exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
+                open_spreads = self.journal.open_spreads()
 
         scan_ok = rth or not rth_cfg.get("scan_only_rth", True)
         unprotected = [s for s in open_spreads if s.status is SpreadStatus.EXITING]
@@ -173,15 +196,7 @@ class Engine:
 
         arms: list[Arm] = []
         if scan_ok:
-            for symbol in (self.cfg.get("universe") or {}).get("symbols") or []:
-                arm, prop = self._scan_symbol(symbol, now, open_spreads)
-                if arm:
-                    arms.append(arm)
-                if prop:
-                    proposals.append(prop)
-                    if not prop.skip:
-                        self._maybe_open(prop, open_spreads, now)
-                        open_spreads = self.journal.open_spreads()
+            arms, proposals = self._scan_universe(now, open_spreads, rth=rth)
 
         return TickResult(
             status="rth_scan" if rth else "idle_off_hours",
@@ -193,18 +208,149 @@ class Engine:
     def _tf_cfg(self) -> dict[str, Any]:
         return self.cfg.get("timeframe") or {}
 
+    def _limits_market_data(self) -> bool:
+        return bool(getattr(self.data, "limits_market_data", False))
+
+    def _note_pages(self, n: int) -> None:
+        """Count a fresh data-API page. No-op for fixture data (no HTTP cap)."""
+        if n > 0 and self._limits_market_data():
+            self._tick_data_pages += n
+
     def _structure_bars(self, symbol: str) -> list[Bar]:
         # Locked hybrid: daily owns bias / VP / S/R / invalidation.
         # Legacy timeframe.bar (1H-only) is ignored if structure_bar is absent.
         tf = str(self._tf_cfg().get("structure_bar") or "1Day")
         md = self.cfg.get("market_data") or {}
         limit = int(md.get("daily_bar_lookback") or md.get("bar_lookback") or 60)
+        self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
 
     def _timing_bars(self, symbol: str) -> list[Bar]:
         tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
         limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
+        self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
+
+    def _spread_mark(self, short_occ: str, long_occ: str) -> Optional[float]:
+        self._note_pages(1)
+        return self.data.spread_mark(short_occ, long_occ)
+
+    def _ordered_symbols(self, symbols: list[str]) -> list[str]:
+        """Armed setups first, then the rest of the universe."""
+        armed = [s for s in symbols if self.journal.get_open_arm(s)]
+        armed_set = set(armed)
+        rest = [s for s in symbols if s not in armed_set]
+        return armed + rest
+
+    def _reprioritize(self, pending: list[str], symbols: list[str]) -> list[str]:
+        """Armed names still waiting jump ahead of the watchlist. Already scanned names stay done."""
+        allowed = set(symbols)
+        kept: list[str] = []
+        seen: set[str] = set()
+        for symbol in pending:
+            if symbol in allowed and symbol not in seen:
+                kept.append(symbol)
+                seen.add(symbol)
+        for symbol in symbols:
+            if symbol not in seen and symbol not in self._pass_members:
+                kept.append(symbol)
+                seen.add(symbol)
+                self._pass_members.add(symbol)
+        self._pass_members &= allowed | seen
+        return self._ordered_symbols(kept)
+
+    def _scan_universe(
+        self,
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        *,
+        rth: bool,
+    ) -> tuple[list[Arm], list[SpreadProposal]]:
+        """Scan fresh bars. When the data budget is tight, finish the pass over later loops.
+
+        Exit checks have already run. Nothing is cached: a deferred name is
+        fetched on a later loop, and a finished pass starts over from live data.
+        """
+        symbols = list((self.cfg.get("universe") or {}).get("symbols") or [])
+        arms: list[Arm] = []
+        proposals: list[SpreadProposal] = []
+        if not self._limits_market_data():
+            for symbol in self._ordered_symbols(symbols):
+                self._consume_scan(symbol, now, open_spreads, arms, proposals)
+            return arms, proposals
+
+        budget = budget_per_min()
+        if not self._scan_pass_active:
+            self._scan_queue = deque(self._ordered_symbols(symbols))
+            self._pass_members = set(symbols)
+            self._scan_pass_active = True
+            self._log_pass_budget(symbols, budget)
+        else:
+            self._scan_queue = deque(self._reprioritize(list(self._scan_queue), symbols))
+
+        while self._scan_queue and self._tick_data_pages < budget:
+            symbol = self._scan_queue.popleft()
+            self.beat(
+                "rth_scan" if rth else "idle_off_hours",
+                f"scan {symbol} pages={self._tick_data_pages}/{budget}",
+            )
+            self._consume_scan(symbol, now, open_spreads, arms, proposals)
+
+        deferred = len(self._scan_queue)
+        if deferred:
+            armed_left = sum(1 for s in self._scan_queue if self.journal.get_open_arm(s))
+            log.info(
+                "market-data scan %d/%d pages this cycle; deferred %d symbol(s) "
+                "(%d armed, %d watch) for a fresh fetch next cycle — no cached bars",
+                self._tick_data_pages,
+                budget,
+                deferred,
+                armed_left,
+                deferred - armed_left,
+            )
+        else:
+            self._scan_pass_active = False
+            log.info(
+                "market-data scan pass complete: %d/%d pages this cycle",
+                self._tick_data_pages,
+                budget,
+            )
+        return arms, proposals
+
+    def _log_pass_budget(self, symbols: list[str], budget: int) -> None:
+        # Exit checks already ran this tick. Count those pages even if a spread
+        # closed during the check, so the line matches what was just fetched.
+        exit_pages = self._tick_data_pages
+        pages = len(symbols) * PAGES_PER_SYMBOL + exit_pages
+        if pages > budget:
+            log.info(
+                "full scan needs about %d data pages (%d symbols x 2 bars + "
+                "%d exit-check pages) and does not fit in %d/min; "
+                "pacing fresh fetches — exits, then armed setups, then the watchlist",
+                pages,
+                len(symbols),
+                exit_pages,
+                budget,
+            )
+
+    def _consume_scan(
+        self,
+        symbol: str,
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        arms: list[Arm],
+        proposals: list[SpreadProposal],
+    ) -> None:
+        level = PRIORITY_ARMED if self.journal.get_open_arm(symbol) else PRIORITY_WATCH
+        with data_priority(level):
+            arm, prop = self._scan_symbol(symbol, now, open_spreads)
+        if arm:
+            arms.append(arm)
+        if prop:
+            proposals.append(prop)
+            if not prop.skip:
+                self._maybe_open(prop, open_spreads, now)
+                open_spreads[:] = self.journal.open_spreads()
 
     def _hybrid_kwargs(self) -> dict[str, Any]:
         tf = self._tf_cfg()
@@ -336,6 +482,7 @@ class Engine:
         sp = self.cfg.get("spreads") or {}
         width = float(sp.get("width", 5.0))
         right = "put" if arm.side is Side.BULLISH else "call"
+        self._note_pages(1)
         chain = self.data.chain(
             symbol,
             right,
@@ -700,7 +847,7 @@ class Engine:
                 reasons.append(f"{spread.underlying}:naked_leg:latched_off_hours")
                 continue
 
-            mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
+            mark = self._spread_mark(spread.short_occ, spread.long_occ)
             paired = min(short_units, long_units)
             accepted = True
             if paired > 0:
@@ -928,7 +1075,7 @@ class Engine:
         exits_cfg = self.cfg.get("exits") or {}
         working_ids = self._working_close_ids() if submit else set()
         for spread in open_spreads:
-            mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
+            mark = self._spread_mark(spread.short_occ, spread.long_occ)
             reason, thesis_intact = self._evaluate_exit_reason(
                 spread, mark, allow_mark=submit
             )

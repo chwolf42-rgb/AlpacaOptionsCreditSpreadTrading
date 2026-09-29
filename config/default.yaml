@@ -138,6 +138,9 @@ calendar:
 
 market_data:
   # Stock bars: iex is the free paper feed; sip needs a paid data plan.
+  # Page budget is NOT here. OPTIONS_DATA_BUDGET_PER_MIN (default 60) is a
+  # hard rolling cap on data.alpaca.markets, shared with the equity and
+  # crypto bots' one 200 req/min pool (options share = 60).
   stock_feed: iex
   # Option snapshots: indicative works without OPRA; opra needs a subscription.
   options_feed: indicative

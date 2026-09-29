@@ -20,6 +20,7 @@ from alpaca_options_credit.broker.payloads import (
 from alpaca_options_credit.errors import AtomicSpreadError
 from alpaca_options_credit.credentials import Credentials, assert_expected_account
 from alpaca_options_credit.errors import PaperOnlyError
+from alpaca_options_credit.market_data_limit import install_market_data_client
 from alpaca_options_credit.close_prices import (
     BAR_MAX_AGE,
     QUOTE_MAX_AGE,
@@ -227,6 +228,10 @@ class AlpacaBroker:
 
 
 class AlpacaMarketData:
+    """Stock bars, option snapshots, and option quotes. Every data-host page is capped."""
+
+    limits_market_data = True
+
     def __init__(self, creds: Credentials, cfg: dict[str, Any]):
         from alpaca.data.historical.option import OptionHistoricalDataClient
         from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -236,6 +241,12 @@ class AlpacaMarketData:
         self.cfg = cfg
         self._stock = StockHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
         self._opt_data = OptionHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
+        # One process-wide limiter, shared by both data clients. Paginated
+        # pages and SDK retries all go through the session, so each HTTP
+        # response counts once. The trading client is a separate host and
+        # stays unwrapped.
+        install_market_data_client(self._stock)
+        install_market_data_client(self._opt_data)
         self._trading = TradingClient(
             creds.api_key_id,
             creds.api_secret_key,
