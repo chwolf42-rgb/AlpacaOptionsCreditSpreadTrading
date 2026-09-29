@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from alpaca_options_credit.bar_quality import STALE_BARS, newest_closed_bars, stale_bars_detail
+from alpaca_options_credit.bar_quality import (
+    STALE_BARS,
+    newest_closed_bars,
+    next_bar_close,
+    stale_bars_detail,
+)
 from alpaca_options_credit.broker.alpaca import AlpacaMarketData, _bars_start
 from alpaca_options_credit.broker.fixture_data import bullish_pullback_bars
 from alpaca_options_credit.models import Bar
@@ -38,9 +43,9 @@ class OldestFirstStockClient:
 
     def get_stock_bars(self, req):
         self.requests.append(req)
-        symbol = req.symbol_or_symbols
-        if isinstance(symbol, list):
-            symbol = symbol[0]
+        symbols = req.symbol_or_symbols
+        if isinstance(symbols, str):
+            symbols = [symbols]
         start = _as_utc(req.start)
         end = _as_utc(req.end)
         window = [b for b in self.series if start <= _as_utc(b.timestamp) <= end]
@@ -48,7 +53,7 @@ class OldestFirstStockClient:
         limit = getattr(req, "limit", None)
         if limit:
             window = window[: int(limit)]
-        return SimpleNamespace(data={symbol: window})
+        return SimpleNamespace(data={symbol: list(window) for symbol in symbols})
 
 
 def _market(client: OldestFirstStockClient) -> AlpacaMarketData:
@@ -170,6 +175,142 @@ def test_stale_detail_fails_closed_on_old_and_empty():
     ]
     assert stale_bars_detail(fresh, "1Hour", now) is None
     assert STALE_BARS == "stale_bars"
+
+
+def test_next_bar_close_matches_session_and_clock_hour():
+    # Monday 11:00 ET (EDT) → today's 16:00 ET.
+    monday_open = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)
+    assert next_bar_close("1Day", monday_open) == datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    # Exactly 16:00 ET is already closed, so the next close is Tuesday.
+    at_close = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    assert next_bar_close("1Day", at_close) == datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    # Friday 16:00 ET → Monday.
+    friday_close = datetime(2026, 9, 18, 20, 0, tzinfo=UTC)
+    assert next_bar_close("1Day", friday_close) == datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    # Winter: Wednesday 10:00 EST → 16:00 EST = 21:00 UTC.
+    winter = datetime(2026, 3, 4, 15, 0, tzinfo=UTC)
+    assert next_bar_close("1Day", winter) == datetime(2026, 3, 4, 21, 0, tzinfo=UTC)
+    hourly = datetime(2026, 9, 16, 15, 30, tzinfo=UTC)
+    assert next_bar_close("1Hour", hourly) == datetime(2026, 9, 16, 16, 0, tzinfo=UTC)
+    on_hour = datetime(2026, 9, 16, 16, 0, tzinfo=UTC)
+    assert next_bar_close("1Hour", on_hour) == datetime(2026, 9, 16, 17, 0, tzinfo=UTC)
+
+
+def test_multi_symbol_daily_bars_are_one_request(monkeypatch):
+    end = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)
+    monkeypatch.setattr("alpaca_options_credit.broker.alpaca._bars_end", lambda: end)
+    start = _bars_start("1Day", 60, end)
+    series = [_RawBar(ts, 100.0 + i) for i, ts in enumerate(_weekdays(start, end))]
+    client = OldestFirstStockClient(series)
+    batch = _market(client).bars_for_symbols(["AMAT", "SPY", "QQQ"], "1Day", 60, now=end)
+
+    assert len(client.requests) == 1
+    requested = client.requests[0].symbol_or_symbols
+    assert set(requested) == {"AMAT", "SPY", "QQQ"}
+    assert client.requests[0].limit is None
+    assert batch.pages == 1
+    assert set(batch.by_symbol) == {"AMAT", "SPY", "QQQ"}
+    assert batch.by_symbol["AMAT"][-1].ts.date().isoformat() == "2026-09-18"
+    assert batch.by_symbol["SPY"][-1].ts == batch.by_symbol["AMAT"][-1].ts
+
+
+def test_closed_daily_bars_reused_until_the_next_session_close():
+    end = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)  # Monday 11:00 ET
+    start = _bars_start("1Day", 60, end)
+    series = [_RawBar(ts, 100.0 + i) for i, ts in enumerate(_weekdays(start, end + timedelta(days=1)))]
+    client = OldestFirstStockClient(series)
+    md = _market(client)
+    first = md.bars_for_symbols(["AMAT", "SPY"], "1Day", 60, now=end)
+    assert len(client.requests) == 1
+    assert first.by_symbol["AMAT"][-1].ts.date().isoformat() == "2026-09-18"
+
+    later = end + timedelta(hours=4)  # 19:00 UTC, still before 20:00 UTC close
+    second = md.bars_for_symbols(["AMAT", "SPY"], "1Day", 60, now=later)
+    assert len(client.requests) == 1
+    assert second.pages == 0
+    assert second.by_symbol["AMAT"] == first.by_symbol["AMAT"]
+
+    after_close = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    third = md.bars_for_symbols(["AMAT", "SPY"], "1Day", 60, now=after_close)
+    assert len(client.requests) == 2
+    assert third.pages == 1
+    assert third.by_symbol["AMAT"][-1].ts.date().isoformat() == "2026-09-21"
+    assert third.by_symbol["SPY"][-1].ts > second.by_symbol["SPY"][-1].ts
+
+
+def test_closed_hourly_bars_reused_until_the_next_hour():
+    end = datetime(2026, 9, 16, 15, 30, tzinfo=UTC)
+    start = _bars_start("1Hour", 120, end)
+    series: list[_RawBar] = []
+    cursor = start.replace(minute=0, second=0, microsecond=0)
+    i = 0
+    while cursor <= end + timedelta(hours=2):
+        series.append(_RawBar(cursor, 50.0 + (i % 7)))
+        cursor += timedelta(hours=1)
+        i += 1
+    client = OldestFirstStockClient(series)
+    md = _market(client)
+    first = md.bars("AMAT", "1Hour", 120, now=end)
+    assert len(client.requests) == 1
+    assert first[-1].ts == datetime(2026, 9, 16, 14, 0, tzinfo=UTC)
+
+    second = md.bars("AMAT", "1Hour", 120, now=end + timedelta(minutes=20))
+    assert len(client.requests) == 1
+    assert second == first
+
+    on_close = datetime(2026, 9, 16, 16, 0, tzinfo=UTC)
+    third = md.bars("AMAT", "1Hour", 120, now=on_close)
+    assert len(client.requests) == 2
+    assert third[-1].ts == datetime(2026, 9, 16, 15, 0, tzinfo=UTC)
+
+
+def test_empty_or_failed_bars_are_not_cached():
+    end = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)
+    client = OldestFirstStockClient([])
+    md = _market(client)
+    assert md.bars("AMAT", "1Day", 60, now=end) == []
+    assert md.bars("AMAT", "1Day", 60, now=end) == []
+    assert len(client.requests) == 2
+
+    class Boom:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_bars(self, req):
+            self.calls += 1
+            raise RuntimeError("feed down")
+
+    boom = Boom()
+    broken = _market(boom)  # type: ignore[arg-type]
+    try:
+        broken.bars("AMAT", "1Day", 60, now=end)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the feed error")
+    try:
+        broken.bars("AMAT", "1Day", 60, now=end)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected a refetch, not a cached failure")
+    assert boom.calls == 2
+
+
+def test_page_count_uses_total_bars_across_symbols():
+    end = datetime(2026, 9, 16, 15, 0, tzinfo=UTC)
+    series = [_RawBar(end - timedelta(hours=i), 10.0) for i in range(6000)]
+    client = OldestFirstStockClient(series)
+    batch = _market(client).bars_for_symbols(["AAA", "BBB"], "1Hour", 10_000, now=end)
+    assert len(client.requests) == 1
+    assert batch.pages == 2
+
+    symbols = [f"S{i}" for i in range(101)]
+    wide = OldestFirstStockClient(series[:30])
+    chunked = _market(wide).bars_for_symbols(symbols, "1Hour", 120, now=end)
+    assert len(wide.requests) == 2
+    assert chunked.pages == 2
+    assert set(chunked.by_symbol) == set(symbols)
 
 
 def test_fixture_bars_are_fresh_for_observe():

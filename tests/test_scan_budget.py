@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,6 +126,50 @@ def test_tight_budget_serves_exits_then_armed_before_watchlist(tmp_path, caplog)
         # The QQQ daily bar above is the fresh exit check, not a cached scan.
         assert not any(call[1] == "SPY" for call in data.calls)
         assert not any(call[0] == "bars" and call[1] == "QQQ" and call[2] == "1Hour" for call in data.calls)
+    finally:
+        reset_limiter()
+
+
+class CachingBatchData(RecordingData):
+    """One multi-symbol fetch per timeframe, then pages=0 until the test says so."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fetched: set[str] = set()
+
+    def bars_for_symbols(self, symbols, timeframe, limit, now=None):
+        key = str(timeframe)
+        self.calls.append(("batch", key, tuple(symbols)))
+        if key in self._fetched:
+            return SimpleNamespace(by_symbol={s: [] for s in symbols}, pages=0)
+        self._fetched.add(key)
+        return SimpleNamespace(by_symbol={s: [] for s in symbols}, pages=1)
+
+
+def test_batched_scan_walks_the_universe_in_one_loop(tmp_path, caplog):
+    data = CachingBatchData()
+    try:
+        engine = _engine(tmp_path, data, budget=60)
+        with caplog.at_level("INFO"):
+            engine.tick()
+        # Exit mark before the daily batch. Hourly is the scan, after exits.
+        assert data.calls[0][0] == "mark"
+        batches = [call for call in data.calls if call[0] == "batch"]
+        assert [call[1] for call in batches] == ["1Day", "1Hour"]
+        assert set(batches[0][2]) == {"IWM", "QQQ", "SPY"}
+        assert set(batches[1][2]) == {"IWM", "QQQ", "SPY"}
+        assert not any(call[0] == "bars" for call in data.calls)
+        assert "pass complete" in caplog.text
+        assert "deferred" not in caplog.text
+        # Mark + one daily page + one hourly page. Empty bars skip the chain.
+        assert engine._tick_data_pages == 3
+
+        data.calls.clear()
+        engine.tick()
+        assert data.calls[0][0] == "mark"
+        assert [call[1] for call in data.calls if call[0] == "batch"] == ["1Day", "1Hour"]
+        # Closed bars reused: the only fresh data page is the exit snapshot.
+        assert engine._tick_data_pages == 1
     finally:
         reset_limiter()
 

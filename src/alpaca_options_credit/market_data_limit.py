@@ -36,14 +36,22 @@ PRIORITY_EXIT = 0
 PRIORITY_ARMED = 1
 PRIORITY_WATCH = 2
 
-# One full symbol scan is a daily bar page plus an hourly bar page.
-# alpaca-py asks for up to 10_000 bars per page; both of this bot's windows
-# are far smaller, so each get_stock_bars call is one HTTP page.
+# alpaca-py pages stock bars at 10_000 rows. The cap counts every bar in the
+# response, not bars per symbol, so one multi-symbol request is one page
+# until the combined rows cross this.
+BAR_PAGE_SIZE = 10_000
+# Unbatched clients (no bars_for_symbols) still pay one daily page and one
+# hourly page per name. The live client batches the universe instead.
 PAGES_PER_SYMBOL = 2
-# Exit check: option snapshot for the two legs, plus one daily bar page
-# for the structure-break read. Fetched again later if the name is scanned;
-# the second read is fresh, not a cache.
-PAGES_PER_OPEN_SPREAD = 2
+# Open-spread check that cannot be a closed bar: one fresh option snapshot.
+# The structure daily bar rides in the batched stock request.
+PAGES_PER_OPEN_SPREAD = 1
+# Rows a cold fetch downloads. Daily window is ~180 calendar days (~126
+# sessions): 57 * 126 = 7_182, one page. Hourly window is 23 days. About
+# 160 bars per name (RTH hours) is still one page; a bar every clock hour
+# is 23 * 24 = 552 and four pages. Callers pass that worst case explicitly.
+DEFAULT_DAILY_BARS_EACH = 126
+DEFAULT_HOURLY_BARS_EACH = 160
 
 _priority: ContextVar[int] = ContextVar("options_data_priority", default=PRIORITY_WATCH)
 
@@ -51,19 +59,49 @@ _install_lock = threading.Lock()
 _limiter: Optional["MarketDataLimiter"] = None
 
 
-def estimate_rth_scan_pages(n_symbols: int, n_open_spreads: int, n_chains: int = 0) -> int:
+def pages_for_bar_rows(n_rows: int) -> int:
+    """HTTP pages for one stock-bars response. Zero rows still cost the call."""
+    rows = int(n_rows)
+    if rows <= 0:
+        return 1
+    return (rows + BAR_PAGE_SIZE - 1) // BAR_PAGE_SIZE
+
+
+def estimate_rth_scan_pages(
+    n_symbols: int,
+    n_open_spreads: int,
+    n_chains: int = 0,
+    *,
+    daily_bars_each: int = DEFAULT_DAILY_BARS_EACH,
+    hourly_bars_each: int = DEFAULT_HOURLY_BARS_EACH,
+    reuse_closed_bars: bool = False,
+) -> int:
     """Data-API pages for one full pass over the universe.
 
-    ``n_chains`` is entry-ready option-snapshot requests (one per 100
-    contracts). Contract listing pages go to the trading API and are not
-    included. Armed names cost the same two bar pages as the rest of the
-    watchlist until a chain is actually pulled.
+    Cold pass: one multi-symbol daily request plus one multi-symbol hourly
+    request, then one fresh option snapshot per open spread. ``n_chains`` is
+    entry-ready option-snapshot requests (one per 100 contracts). Contract
+    listing pages go to the trading API and are not included.
+
+    ``reuse_closed_bars`` is a later loop in the same hour and session:
+    closed stock bars are already the latest close, so only snapshots and
+    chains are fetched.
     """
-    return (
-        int(n_symbols) * PAGES_PER_SYMBOL
-        + int(n_open_spreads) * PAGES_PER_OPEN_SPREAD
-        + int(n_chains)
-    )
+    symbols = int(n_symbols)
+    if reuse_closed_bars or symbols <= 0:
+        bar_pages = 0
+    else:
+        bar_pages = pages_for_bar_rows(symbols * int(daily_bars_each)) + pages_for_bar_rows(
+            symbols * int(hourly_bars_each)
+        )
+    return bar_pages + int(n_open_spreads) * PAGES_PER_OPEN_SPREAD + int(n_chains)
+
+
+def grant_count() -> Optional[int]:
+    """Pages the process limiter has granted, or None if it is not installed."""
+    if _limiter is None:
+        return None
+    return len(_limiter.acquired_at())
 
 
 def parse_budget(raw: Optional[str]) -> int:

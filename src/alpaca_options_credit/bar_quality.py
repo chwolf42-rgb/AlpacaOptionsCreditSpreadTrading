@@ -51,6 +51,33 @@ def is_bar_closed(ts: datetime, timeframe: str, now: datetime) -> bool:
     return _as_utc(now) >= bar_period_end(ts, timeframe)
 
 
+def next_bar_close(timeframe: str, now: datetime) -> datetime:
+    """UTC instant of the next close strictly after ``now``.
+
+    Hourly bars in this bot are clock-hour UTC: a bar timestamped 14:00
+    closes at 15:00, matching ``is_bar_closed``. Daily bars close at 16:00
+    America/New_York, including across weekends. A series fetched at ``now``
+    is still the latest closed bars until this instant.
+    """
+    now_utc = _as_utc(now)
+    tf = str(timeframe)
+    if tf in HOURLY_TIMEFRAMES:
+        hour = now_utc.replace(minute=0, second=0, microsecond=0)
+        return hour + timedelta(hours=1)
+    if tf in MIN30_TIMEFRAMES:
+        minute = 0 if now_utc.minute < 30 else 30
+        slot = now_utc.replace(minute=minute, second=0, microsecond=0)
+        return slot + timedelta(minutes=30)
+    local = now_utc.astimezone(ET)
+    close_today = datetime.combine(local.date(), RTH_CLOSE, tzinfo=ET)
+    if local.weekday() < 5 and local < close_today:
+        return close_today.astimezone(timezone.utc)
+    day = local.date() + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return datetime.combine(day, RTH_CLOSE, tzinfo=ET).astimezone(timezone.utc)
+
+
 def newest_closed_bars(
     bars: list[Bar],
     timeframe: str,

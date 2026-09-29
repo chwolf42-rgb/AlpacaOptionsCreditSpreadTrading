@@ -16,6 +16,7 @@ from alpaca_options_credit.market_data_limit import (
     backoff_seconds,
     estimate_rth_scan_pages,
     get_limiter,
+    pages_for_bar_rows,
     install_market_data_session,
     replace_limiter,
     reset_limiter,
@@ -229,15 +230,25 @@ def test_session_429_backs_off_before_returning():
         reset_limiter()
 
 
-def test_full_universe_scan_does_not_fit_at_60_per_min():
+def test_full_universe_scan_fits_at_60_per_min():
     cfg = load_config()
     symbols = list(cfg["universe"]["symbols"])
     assert len(symbols) == 57
+    # One multi-symbol daily page + one multi-symbol hourly page.
+    assert pages_for_bar_rows(57 * 126) == 1
+    assert pages_for_bar_rows(10_000) == 1
+    assert pages_for_bar_rows(10_001) == 2
     pages = estimate_rth_scan_pages(len(symbols), 0)
-    assert pages == 114
-    assert pages > 60
-    # Five open spreads: one snapshot + one daily bar each, on top of the scan.
-    assert estimate_rth_scan_pages(57, 5) == 124
+    assert pages == 2
+    assert pages <= 60
+    # Five open spreads: one fresh snapshot each. Structure bars are in the batch.
+    assert estimate_rth_scan_pages(57, 5) == 7
+    # Every clock hour across the 23-day window is still one loop.
+    assert pages_for_bar_rows(57 * 552) == 4
+    assert estimate_rth_scan_pages(57, 5, hourly_bars_each=552) == 10
+    assert estimate_rth_scan_pages(57, 5, hourly_bars_each=552) <= 60
+    # Later loop in the same hour: closed bars reused, snapshots only.
+    assert estimate_rth_scan_pages(57, 5, reuse_closed_bars=True) == 5
 
 
 def test_data_clients_are_wrapped_and_trading_client_is_not(monkeypatch):

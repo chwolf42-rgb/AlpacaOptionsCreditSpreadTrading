@@ -14,6 +14,7 @@ from typing import Any, Optional
 from alpaca_options_credit.bar_quality import (
     STALE_BARS,
     last_completed_daily_bar,
+    next_bar_close,
     stale_bars_detail,
 )
 from alpaca_options_credit.broker.payloads import (
@@ -34,6 +35,7 @@ from alpaca_options_credit.market_data_limit import (
     PAGES_PER_SYMBOL,
     budget_per_min,
     data_priority,
+    estimate_rth_scan_pages,
     get_limiter,
 )
 from alpaca_options_credit.models import (
@@ -110,6 +112,8 @@ class Engine:
         self._scan_queue: deque[str] = deque()
         self._scan_pass_active = False
         self._pass_members: set[str] = set()
+        self._bar_memo: dict[str, dict[str, list[Bar]]] = {}
+        self._bar_memo_until: dict[str, datetime] = {}
 
     def _rth(self, now: datetime) -> bool:
         rth = self.cfg.get("rth") or {}
@@ -140,6 +144,8 @@ class Engine:
         proposals: list[SpreadProposal] = []
         exits: list[str] = []
         self._tick_data_pages = 0
+        self._bar_memo = {}
+        self._bar_memo_until = {}
         if getattr(self.data, "limits_market_data", False):
             get_limiter().set_wait_hook(
                 lambda: self.beat(
@@ -216,18 +222,60 @@ class Engine:
         if n > 0 and self._limits_market_data():
             self._tick_data_pages += n
 
-    def _structure_bars(self, symbol: str) -> list[Bar]:
+    def _structure_spec(self) -> tuple[str, int]:
         # Locked hybrid: daily owns bias / VP / S/R / invalidation.
         # Legacy timeframe.bar (1H-only) is ignored if structure_bar is absent.
         tf = str(self._tf_cfg().get("structure_bar") or "1Day")
         md = self.cfg.get("market_data") or {}
         limit = int(md.get("daily_bar_lookback") or md.get("bar_lookback") or 60)
+        return tf, limit
+
+    def _timing_spec(self) -> tuple[str, int]:
+        tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
+        limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
+        return tf, limit
+
+    def _can_batch_bars(self) -> bool:
+        return self._limits_market_data() and callable(getattr(self.data, "bars_for_symbols", None))
+
+    def _batch_symbols(self, symbol: str) -> list[str]:
+        symbols = list((self.cfg.get("universe") or {}).get("symbols") or [])
+        if symbol and symbol not in symbols:
+            symbols = [symbol, *symbols]
+        return symbols
+
+    def _prime_timeframe(self, symbols: list[str], timeframe: str, limit: int, now: datetime) -> None:
+        batch = self.data.bars_for_symbols(list(symbols), timeframe, int(limit), now=now)
+        self._note_pages(int(getattr(batch, "pages", 0) or 0))
+        by_symbol = getattr(batch, "by_symbol", None) or {}
+        key = str(timeframe)
+        self._bar_memo[key] = {name: list(by_symbol.get(name) or []) for name in symbols}
+        # Drop the memo at the next close so a bar that closes mid-pass is
+        # fetched before any later symbol reads it.
+        self._bar_memo_until[key] = next_bar_close(timeframe, now)
+
+    def _batched_bars(self, symbol: str, timeframe: str, limit: int) -> list[Bar]:
+        key = str(timeframe)
+        now = self.now_fn()
+        memo = self._bar_memo.get(key)
+        until = self._bar_memo_until.get(key)
+        if memo is not None and symbol in memo and until is not None and now < until:
+            return list(memo[symbol])
+        self._prime_timeframe(self._batch_symbols(symbol), timeframe, limit, now)
+        memo = self._bar_memo.get(key) or {}
+        return list(memo.get(symbol) or [])
+
+    def _structure_bars(self, symbol: str) -> list[Bar]:
+        tf, limit = self._structure_spec()
+        if self._can_batch_bars():
+            return self._batched_bars(symbol, tf, limit)
         self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
 
     def _timing_bars(self, symbol: str) -> list[Bar]:
-        tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
-        limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
+        tf, limit = self._timing_spec()
+        if self._can_batch_bars():
+            return self._batched_bars(symbol, tf, limit)
         self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
 
@@ -266,10 +314,12 @@ class Engine:
         *,
         rth: bool,
     ) -> tuple[list[Arm], list[SpreadProposal]]:
-        """Scan fresh bars. When the data budget is tight, finish the pass over later loops.
+        """Scan bars. Exit checks have already run.
 
-        Exit checks have already run. Nothing is cached: a deferred name is
-        fetched on a later loop, and a finished pass starts over from live data.
+        A client with ``bars_for_symbols`` fetches each timeframe once for the
+        whole universe and walks every name this loop. Closed bars are reused
+        by that client until the next close. Clients without it pace one page
+        per symbol and finish the pass on a later loop, still with fresh fetches.
         """
         symbols = list((self.cfg.get("universe") or {}).get("symbols") or [])
         arms: list[Arm] = []
@@ -278,6 +328,8 @@ class Engine:
             for symbol in self._ordered_symbols(symbols):
                 self._consume_scan(symbol, now, open_spreads, arms, proposals)
             return arms, proposals
+        if self._can_batch_bars():
+            return self._scan_batched(symbols, now, open_spreads, rth=rth)
 
         budget = budget_per_min()
         if not self._scan_pass_active:
@@ -310,6 +362,59 @@ class Engine:
             )
         else:
             self._scan_pass_active = False
+            log.info(
+                "market-data scan pass complete: %d/%d pages this cycle",
+                self._tick_data_pages,
+                budget,
+            )
+        return arms, proposals
+
+    def _scan_batched(
+        self,
+        symbols: list[str],
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        *,
+        rth: bool,
+    ) -> tuple[list[Arm], list[SpreadProposal]]:
+        """One loop for the universe. Stock bars are already one request per timeframe.
+
+        The first exit mark ran before this. Daily bars may already be primed
+        by that exit's structure read. Option snapshots and quotes are still
+        fetched inside the exit check and inside any entry-ready chain.
+        """
+        arms: list[Arm] = []
+        proposals: list[SpreadProposal] = []
+        budget = budget_per_min()
+        with data_priority(PRIORITY_ARMED):
+            if symbols:
+                self._structure_bars(symbols[0])
+                self._timing_bars(symbols[0])
+        cold = estimate_rth_scan_pages(len(symbols), 0)
+        log.info(
+            "market-data batched scan: %d/%d pages so far, cold bar pass is %d "
+            "page(s) for %d symbol(s)",
+            self._tick_data_pages,
+            budget,
+            cold,
+            len(symbols),
+        )
+        for symbol in self._ordered_symbols(symbols):
+            self.beat(
+                "rth_scan" if rth else "idle_off_hours",
+                f"scan {symbol} pages={self._tick_data_pages}/{budget}",
+            )
+            self._consume_scan(symbol, now, open_spreads, arms, proposals)
+        self._scan_pass_active = False
+        self._scan_queue.clear()
+        if self._tick_data_pages > budget:
+            log.info(
+                "market-data scan used %d/%d pages this cycle; the rolling cap "
+                "paces the overflow. Exits already ran",
+                self._tick_data_pages,
+                budget,
+            )
+        else:
             log.info(
                 "market-data scan pass complete: %d/%d pages this cycle",
                 self._tick_data_pages,
