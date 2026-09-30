@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -13,6 +14,7 @@ from typing import Any, Optional
 from alpaca_options_credit.bar_quality import (
     STALE_BARS,
     last_completed_daily_bar,
+    next_bar_close,
     stale_bars_detail,
 )
 from alpaca_options_credit.broker.payloads import (
@@ -26,6 +28,16 @@ from alpaca_options_credit.close_prices import SOURCE_FILL, SOURCE_QUOTE, CloseO
 from alpaca_options_credit.config import validate_exit_policy, var_dir
 from alpaca_options_credit.heartbeat import Heartbeat, HeartbeatWriter
 from alpaca_options_credit.journal import Journal
+from alpaca_options_credit.market_data_limit import (
+    PRIORITY_ARMED,
+    PRIORITY_EXIT,
+    PRIORITY_WATCH,
+    PAGES_PER_SYMBOL,
+    budget_per_min,
+    data_priority,
+    estimate_rth_scan_pages,
+    get_limiter,
+)
 from alpaca_options_credit.models import (
     Arm,
     ArmStatus,
@@ -96,6 +108,12 @@ class Engine:
         self.calendar = calendar if calendar is not None else load_calendar(cal_path)
         validate_exit_policy(self.cfg)
         self._overnight_flagged_date = None
+        self._tick_data_pages = 0
+        self._scan_queue: deque[str] = deque()
+        self._scan_pass_active = False
+        self._pass_members: set[str] = set()
+        self._bar_memo: dict[str, dict[str, list[Bar]]] = {}
+        self._bar_memo_until: dict[str, datetime] = {}
 
     def _rth(self, now: datetime) -> bool:
         rth = self.cfg.get("rth") or {}
@@ -125,6 +143,16 @@ class Engine:
         rth = self._rth(now)
         proposals: list[SpreadProposal] = []
         exits: list[str] = []
+        self._tick_data_pages = 0
+        self._bar_memo = {}
+        self._bar_memo_until = {}
+        if getattr(self.data, "limits_market_data", False):
+            get_limiter().set_wait_hook(
+                lambda: self.beat(
+                    "rth_scan" if rth else "idle_off_hours",
+                    "market-data pace",
+                )
+            )
 
         # Always persist/reconcile journaled spreads first — exits before entries.
         open_spreads = self.journal.open_spreads()
@@ -138,10 +166,11 @@ class Engine:
         # Off-hours: still latch structure-break / already-due exits; do not submit
         # (options do not trade AH). First RTH poll submits before any new entry.
         if open_spreads or submit_closes:
-            exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
-            open_spreads = self.journal.open_spreads()
-            exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
-            open_spreads = self.journal.open_spreads()
+            with data_priority(PRIORITY_EXIT):
+                exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
+                open_spreads = self.journal.open_spreads()
+                exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
+                open_spreads = self.journal.open_spreads()
 
         scan_ok = rth or not rth_cfg.get("scan_only_rth", True)
         unprotected = [s for s in open_spreads if s.status is SpreadStatus.EXITING]
@@ -173,15 +202,7 @@ class Engine:
 
         arms: list[Arm] = []
         if scan_ok:
-            for symbol in (self.cfg.get("universe") or {}).get("symbols") or []:
-                arm, prop = self._scan_symbol(symbol, now, open_spreads)
-                if arm:
-                    arms.append(arm)
-                if prop:
-                    proposals.append(prop)
-                    if not prop.skip:
-                        self._maybe_open(prop, open_spreads, now)
-                        open_spreads = self.journal.open_spreads()
+            arms, proposals = self._scan_universe(now, open_spreads, rth=rth)
 
         return TickResult(
             status="rth_scan" if rth else "idle_off_hours",
@@ -193,18 +214,248 @@ class Engine:
     def _tf_cfg(self) -> dict[str, Any]:
         return self.cfg.get("timeframe") or {}
 
-    def _structure_bars(self, symbol: str) -> list[Bar]:
+    def _limits_market_data(self) -> bool:
+        return bool(getattr(self.data, "limits_market_data", False))
+
+    def _note_pages(self, n: int) -> None:
+        """Count a fresh data-API page. No-op for fixture data (no HTTP cap)."""
+        if n > 0 and self._limits_market_data():
+            self._tick_data_pages += n
+
+    def _structure_spec(self) -> tuple[str, int]:
         # Locked hybrid: daily owns bias / VP / S/R / invalidation.
         # Legacy timeframe.bar (1H-only) is ignored if structure_bar is absent.
         tf = str(self._tf_cfg().get("structure_bar") or "1Day")
         md = self.cfg.get("market_data") or {}
         limit = int(md.get("daily_bar_lookback") or md.get("bar_lookback") or 60)
+        return tf, limit
+
+    def _timing_spec(self) -> tuple[str, int]:
+        tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
+        limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
+        return tf, limit
+
+    def _can_batch_bars(self) -> bool:
+        return self._limits_market_data() and callable(getattr(self.data, "bars_for_symbols", None))
+
+    def _batch_symbols(self, symbol: str) -> list[str]:
+        symbols = list((self.cfg.get("universe") or {}).get("symbols") or [])
+        if symbol and symbol not in symbols:
+            symbols = [symbol, *symbols]
+        return symbols
+
+    def _prime_timeframe(self, symbols: list[str], timeframe: str, limit: int, now: datetime) -> None:
+        batch = self.data.bars_for_symbols(list(symbols), timeframe, int(limit), now=now)
+        self._note_pages(int(getattr(batch, "pages", 0) or 0))
+        by_symbol = getattr(batch, "by_symbol", None) or {}
+        key = str(timeframe)
+        self._bar_memo[key] = {name: list(by_symbol.get(name) or []) for name in symbols}
+        # Drop the memo at the next close so a bar that closes mid-pass is
+        # fetched before any later symbol reads it.
+        self._bar_memo_until[key] = next_bar_close(timeframe, now)
+
+    def _batched_bars(self, symbol: str, timeframe: str, limit: int) -> list[Bar]:
+        key = str(timeframe)
+        now = self.now_fn()
+        memo = self._bar_memo.get(key)
+        until = self._bar_memo_until.get(key)
+        if memo is not None and symbol in memo and until is not None and now < until:
+            return list(memo[symbol])
+        self._prime_timeframe(self._batch_symbols(symbol), timeframe, limit, now)
+        memo = self._bar_memo.get(key) or {}
+        return list(memo.get(symbol) or [])
+
+    def _structure_bars(self, symbol: str) -> list[Bar]:
+        tf, limit = self._structure_spec()
+        if self._can_batch_bars():
+            return self._batched_bars(symbol, tf, limit)
+        self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
 
     def _timing_bars(self, symbol: str) -> list[Bar]:
-        tf = str(self._tf_cfg().get("timing_bar") or "1Hour")
-        limit = int((self.cfg.get("market_data") or {}).get("bar_lookback", 120))
+        tf, limit = self._timing_spec()
+        if self._can_batch_bars():
+            return self._batched_bars(symbol, tf, limit)
+        self._note_pages(1)
         return self.data.bars(symbol, tf, limit)
+
+    def _spread_mark(self, short_occ: str, long_occ: str) -> Optional[float]:
+        self._note_pages(1)
+        return self.data.spread_mark(short_occ, long_occ)
+
+    def _ordered_symbols(self, symbols: list[str]) -> list[str]:
+        """Armed setups first, then the rest of the universe."""
+        armed = [s for s in symbols if self.journal.get_open_arm(s)]
+        armed_set = set(armed)
+        rest = [s for s in symbols if s not in armed_set]
+        return armed + rest
+
+    def _reprioritize(self, pending: list[str], symbols: list[str]) -> list[str]:
+        """Armed names still waiting jump ahead of the watchlist. Already scanned names stay done."""
+        allowed = set(symbols)
+        kept: list[str] = []
+        seen: set[str] = set()
+        for symbol in pending:
+            if symbol in allowed and symbol not in seen:
+                kept.append(symbol)
+                seen.add(symbol)
+        for symbol in symbols:
+            if symbol not in seen and symbol not in self._pass_members:
+                kept.append(symbol)
+                seen.add(symbol)
+                self._pass_members.add(symbol)
+        self._pass_members &= allowed | seen
+        return self._ordered_symbols(kept)
+
+    def _scan_universe(
+        self,
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        *,
+        rth: bool,
+    ) -> tuple[list[Arm], list[SpreadProposal]]:
+        """Scan bars. Exit checks have already run.
+
+        A client with ``bars_for_symbols`` fetches each timeframe once for the
+        whole universe and walks every name this loop. Closed bars are reused
+        by that client until the next close. Clients without it pace one page
+        per symbol and finish the pass on a later loop, still with fresh fetches.
+        """
+        symbols = list((self.cfg.get("universe") or {}).get("symbols") or [])
+        arms: list[Arm] = []
+        proposals: list[SpreadProposal] = []
+        if not self._limits_market_data():
+            for symbol in self._ordered_symbols(symbols):
+                self._consume_scan(symbol, now, open_spreads, arms, proposals)
+            return arms, proposals
+        if self._can_batch_bars():
+            return self._scan_batched(symbols, now, open_spreads, rth=rth)
+
+        budget = budget_per_min()
+        if not self._scan_pass_active:
+            self._scan_queue = deque(self._ordered_symbols(symbols))
+            self._pass_members = set(symbols)
+            self._scan_pass_active = True
+            self._log_pass_budget(symbols, budget)
+        else:
+            self._scan_queue = deque(self._reprioritize(list(self._scan_queue), symbols))
+
+        while self._scan_queue and self._tick_data_pages < budget:
+            symbol = self._scan_queue.popleft()
+            self.beat(
+                "rth_scan" if rth else "idle_off_hours",
+                f"scan {symbol} pages={self._tick_data_pages}/{budget}",
+            )
+            self._consume_scan(symbol, now, open_spreads, arms, proposals)
+
+        deferred = len(self._scan_queue)
+        if deferred:
+            armed_left = sum(1 for s in self._scan_queue if self.journal.get_open_arm(s))
+            log.info(
+                "market-data scan %d/%d pages this cycle; deferred %d symbol(s) "
+                "(%d armed, %d watch) for a fresh fetch next cycle — no cached bars",
+                self._tick_data_pages,
+                budget,
+                deferred,
+                armed_left,
+                deferred - armed_left,
+            )
+        else:
+            self._scan_pass_active = False
+            log.info(
+                "market-data scan pass complete: %d/%d pages this cycle",
+                self._tick_data_pages,
+                budget,
+            )
+        return arms, proposals
+
+    def _scan_batched(
+        self,
+        symbols: list[str],
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        *,
+        rth: bool,
+    ) -> tuple[list[Arm], list[SpreadProposal]]:
+        """One loop for the universe. Stock bars are already one request per timeframe.
+
+        The first exit mark ran before this. Daily bars may already be primed
+        by that exit's structure read. Option snapshots and quotes are still
+        fetched inside the exit check and inside any entry-ready chain.
+        """
+        arms: list[Arm] = []
+        proposals: list[SpreadProposal] = []
+        budget = budget_per_min()
+        with data_priority(PRIORITY_ARMED):
+            if symbols:
+                self._structure_bars(symbols[0])
+                self._timing_bars(symbols[0])
+        cold = estimate_rth_scan_pages(len(symbols), 0)
+        log.info(
+            "market-data batched scan: %d/%d pages so far, cold bar pass is %d "
+            "page(s) for %d symbol(s)",
+            self._tick_data_pages,
+            budget,
+            cold,
+            len(symbols),
+        )
+        for symbol in self._ordered_symbols(symbols):
+            self.beat(
+                "rth_scan" if rth else "idle_off_hours",
+                f"scan {symbol} pages={self._tick_data_pages}/{budget}",
+            )
+            self._consume_scan(symbol, now, open_spreads, arms, proposals)
+        self._scan_pass_active = False
+        self._scan_queue.clear()
+        if self._tick_data_pages > budget:
+            log.info(
+                "market-data scan used %d/%d pages this cycle; the rolling cap "
+                "paces the overflow. Exits already ran",
+                self._tick_data_pages,
+                budget,
+            )
+        else:
+            log.info(
+                "market-data scan pass complete: %d/%d pages this cycle",
+                self._tick_data_pages,
+                budget,
+            )
+        return arms, proposals
+
+    def _log_pass_budget(self, symbols: list[str], budget: int) -> None:
+        # Exit checks already ran this tick. Count those pages even if a spread
+        # closed during the check, so the line matches what was just fetched.
+        exit_pages = self._tick_data_pages
+        pages = len(symbols) * PAGES_PER_SYMBOL + exit_pages
+        if pages > budget:
+            log.info(
+                "full scan needs about %d data pages (%d symbols x 2 bars + "
+                "%d exit-check pages) and does not fit in %d/min; "
+                "pacing fresh fetches — exits, then armed setups, then the watchlist",
+                pages,
+                len(symbols),
+                exit_pages,
+                budget,
+            )
+
+    def _consume_scan(
+        self,
+        symbol: str,
+        now: datetime,
+        open_spreads: list[OpenSpread],
+        arms: list[Arm],
+        proposals: list[SpreadProposal],
+    ) -> None:
+        level = PRIORITY_ARMED if self.journal.get_open_arm(symbol) else PRIORITY_WATCH
+        with data_priority(level):
+            arm, prop = self._scan_symbol(symbol, now, open_spreads)
+        if arm:
+            arms.append(arm)
+        if prop:
+            proposals.append(prop)
+            if not prop.skip:
+                self._maybe_open(prop, open_spreads, now)
+                open_spreads[:] = self.journal.open_spreads()
 
     def _hybrid_kwargs(self) -> dict[str, Any]:
         tf = self._tf_cfg()
@@ -336,6 +587,7 @@ class Engine:
         sp = self.cfg.get("spreads") or {}
         width = float(sp.get("width", 5.0))
         right = "put" if arm.side is Side.BULLISH else "call"
+        self._note_pages(1)
         chain = self.data.chain(
             symbol,
             right,
@@ -700,7 +952,7 @@ class Engine:
                 reasons.append(f"{spread.underlying}:naked_leg:latched_off_hours")
                 continue
 
-            mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
+            mark = self._spread_mark(spread.short_occ, spread.long_occ)
             paired = min(short_units, long_units)
             accepted = True
             if paired > 0:
@@ -928,7 +1180,7 @@ class Engine:
         exits_cfg = self.cfg.get("exits") or {}
         working_ids = self._working_close_ids() if submit else set()
         for spread in open_spreads:
-            mark = self.data.spread_mark(spread.short_occ, spread.long_occ)
+            mark = self._spread_mark(spread.short_occ, spread.long_occ)
             reason, thesis_intact = self._evaluate_exit_reason(
                 spread, mark, allow_mark=submit
             )

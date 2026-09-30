@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -10,7 +11,10 @@ from alpaca_options_credit.bar_quality import (
     DAILY_TIMEFRAMES,
     HOURLY_TIMEFRAMES,
     MIN30_TIMEFRAMES,
+    is_bar_closed,
     newest_closed_bars,
+    next_bar_close,
+    stale_bars_detail,
 )
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
@@ -20,6 +24,11 @@ from alpaca_options_credit.broker.payloads import (
 from alpaca_options_credit.errors import AtomicSpreadError
 from alpaca_options_credit.credentials import Credentials, assert_expected_account
 from alpaca_options_credit.errors import PaperOnlyError
+from alpaca_options_credit.market_data_limit import (
+    grant_count,
+    install_market_data_client,
+    pages_for_bar_rows,
+)
 from alpaca_options_credit.close_prices import (
     BAR_MAX_AGE,
     QUOTE_MAX_AGE,
@@ -74,6 +83,29 @@ def _bars_start(timeframe: str, limit: int, end: datetime) -> datetime:
     if tf in MIN30_TIMEFRAMES:
         return end - timedelta(days=max(14, (limit // 12) + 3))
     return end - timedelta(days=30)
+
+
+# One HTTP request for the whole 57-name universe. Chunk only past this so a
+# larger list stays batched instead of one page per name.
+_BARS_SYMBOLS_PER_REQUEST = 100
+
+
+@dataclass(frozen=True)
+class BarBatch:
+    """Closed bars for many symbols, and how many data pages the fetch cost.
+
+    ``pages`` is 0 when every symbol was already the latest closed bar.
+    """
+
+    by_symbol: dict[str, list[Bar]]
+    pages: int
+
+
+@dataclass
+class _ClosedBarCache:
+    bars: list[Bar]
+    limit: int
+    valid_until: datetime
 
 
 class AlpacaBroker:
@@ -227,6 +259,10 @@ class AlpacaBroker:
 
 
 class AlpacaMarketData:
+    """Stock bars, option snapshots, and option quotes. Every data-host page is capped."""
+
+    limits_market_data = True
+
     def __init__(self, creds: Credentials, cfg: dict[str, Any]):
         from alpaca.data.historical.option import OptionHistoricalDataClient
         from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -236,6 +272,12 @@ class AlpacaMarketData:
         self.cfg = cfg
         self._stock = StockHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
         self._opt_data = OptionHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
+        # One process-wide limiter, shared by both data clients. Paginated
+        # pages and SDK retries all go through the session, so each HTTP
+        # response counts once. The trading client is a separate host and
+        # stays unwrapped.
+        install_market_data_client(self._stock)
+        install_market_data_client(self._opt_data)
         self._trading = TradingClient(
             creds.api_key_id,
             creds.api_secret_key,
@@ -243,55 +285,141 @@ class AlpacaMarketData:
             url_override=creds.base_url,
         )
 
-    def bars(self, symbol: str, timeframe: str, limit: int) -> list[Bar]:
+    def bars(self, symbol: str, timeframe: str, limit: int, now: Optional[datetime] = None) -> list[Bar]:
+        batch = self.bars_for_symbols([symbol], timeframe, limit, now=now)
+        return list(batch.by_symbol.get(symbol) or [])
+
+    def bars_for_symbols(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        limit: int,
+        now: Optional[datetime] = None,
+    ) -> BarBatch:
+        """Newest closed bars for every symbol, in as few stock-bar pages as possible.
+
+        A closed daily bar is reused until the next session close. A closed
+        hourly bar is reused until the next clock-hour close. The series is
+        served only while it is still the latest close and still passes the
+        freshness check. A miss refetches the whole set in one multi-symbol
+        request. An empty or failed fetch is not stored.
+        """
+        as_of = _as_utc(now) if now is not None else _bars_end()
+        ordered = _dedupe_symbols(symbols)
+        if not ordered:
+            return BarBatch({}, 0)
+        cached: dict[str, list[Bar]] = {}
+        for symbol in ordered:
+            hit = self._cached_closed_bars(symbol, timeframe, limit, as_of)
+            if hit is None:
+                cached = {}
+                break
+            cached[symbol] = hit
+        if len(cached) == len(ordered):
+            log.debug(
+                "bars %s cache hit symbols=%d until next close",
+                timeframe,
+                len(ordered),
+            )
+            return BarBatch(cached, 0)
+        fetched, pages = self._fetch_closed_bars(ordered, timeframe, limit, as_of)
+        return BarBatch(fetched, pages)
+
+    def _closed_cache(self) -> dict[tuple[str, str], _ClosedBarCache]:
+        # Tests build this object with __new__ and never call __init__.
+        cache = getattr(self, "_closed_bars", None)
+        if cache is None:
+            cache = {}
+            self._closed_bars = cache
+        return cache
+
+    def _cached_closed_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        now: datetime,
+    ) -> Optional[list[Bar]]:
+        entry = self._closed_cache().get((symbol, str(timeframe)))
+        if entry is None or int(limit) > entry.limit:
+            return None
+        if now >= entry.valid_until:
+            return None
+        bars = entry.bars[-int(limit) :] if len(entry.bars) > int(limit) else list(entry.bars)
+        if not bars or not is_bar_closed(bars[-1].ts, timeframe, now):
+            return None
+        if stale_bars_detail(bars, timeframe, now) is not None:
+            return None
+        return bars
+
+    def _fetch_closed_bars(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        limit: int,
+        now: datetime,
+    ) -> tuple[dict[str, list[Bar]], int]:
         from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockBarsRequest
 
         feed_name = (self.cfg.get("market_data") or {}).get("stock_feed", "iex")
         feed = DataFeed.IEX if str(feed_name).lower() == "iex" else DataFeed.SIP
-        end = _bars_end()
-        start = _bars_start(timeframe, limit, end)
-        # Do not pass limit. Alpaca returns oldest-first and keeps only the
-        # oldest `limit` rows, so limit=60 over a multi-month daily window
-        # ends in the past (AMAT 2026-09-21: 60 bars ending 2026-06-21).
-        # The SDK pages the whole [start, end] window when limit is unset.
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=_timeframe(timeframe),
-            start=start,
-            end=end,
-            feed=feed,
-        )
-        result = self._stock.get_stock_bars(req)
-        raw = []
-        if hasattr(result, "data"):
-            raw = result.data.get(symbol) or []
-        elif hasattr(result, "get"):
-            raw = result.get(symbol) or []
-        bars: list[Bar] = []
-        for b in raw:
-            ts = getattr(b, "timestamp", None) or getattr(b, "t", end)
-            bars.append(
-                Bar(
-                    ts=ts,
-                    open=float(b.open),
-                    high=float(b.high),
-                    low=float(b.low),
-                    close=float(b.close),
-                    volume=float(getattr(b, "volume", 0) or 0),
+        start = _bars_start(timeframe, limit, now)
+        pages = 0
+        raw_by_symbol: dict[str, list[Any]] = {symbol: [] for symbol in symbols}
+        for offset in range(0, len(symbols), _BARS_SYMBOLS_PER_REQUEST):
+            chunk = symbols[offset : offset + _BARS_SYMBOLS_PER_REQUEST]
+            # Do not pass limit. Alpaca returns oldest-first and keeps only the
+            # oldest `limit` rows, so limit=60 over a multi-month daily window
+            # ends in the past (AMAT 2026-09-21: 60 bars ending 2026-06-21).
+            # The SDK pages the whole [start, end] window when limit is unset.
+            req = StockBarsRequest(
+                symbol_or_symbols=chunk if len(chunk) > 1 else chunk[0],
+                timeframe=_timeframe(timeframe),
+                start=start,
+                end=now,
+                feed=feed,
+            )
+            before = grant_count()
+            result = self._stock.get_stock_bars(req)
+            after = grant_count()
+            total_raw = 0
+            for symbol in chunk:
+                raw = _raw_bars_for_symbol(result, symbol)
+                raw_by_symbol[symbol] = raw
+                total_raw += len(raw)
+            granted = (after - before) if before is not None and after is not None else 0
+            pages += granted if granted > 0 else pages_for_bar_rows(total_raw)
+
+        valid_until = next_bar_close(timeframe, now)
+        cache = self._closed_cache()
+        out: dict[str, list[Bar]] = {}
+        for symbol, raw in raw_by_symbol.items():
+            selected = newest_closed_bars(_bars_from_raw(raw, now), timeframe, limit, now)
+            out[symbol] = selected
+            # Empty, stale, or still-forming tails are not stored. The next
+            # loop refetches the whole set so a recovered feed shows up.
+            if (
+                selected
+                and is_bar_closed(selected[-1].ts, timeframe, now)
+                and stale_bars_detail(selected, timeframe, now) is None
+            ):
+                cache[(symbol, str(timeframe))] = _ClosedBarCache(
+                    bars=list(selected),
+                    limit=int(limit),
+                    valid_until=valid_until,
                 )
-            )
-        selected = newest_closed_bars(bars, timeframe, limit, end)
-        if selected:
-            log.debug(
-                "bars %s %s fetched=%d kept=%d last=%s",
-                symbol,
-                timeframe,
-                len(bars),
-                len(selected),
-                selected[-1].ts,
-            )
-        return selected
+            if selected:
+                log.debug(
+                    "bars %s %s fetched=%d kept=%d last=%s pages=%d",
+                    symbol,
+                    timeframe,
+                    len(raw),
+                    len(selected),
+                    selected[-1].ts,
+                    pages,
+                )
+        return out, pages
 
     def chain(
         self,
@@ -477,6 +605,50 @@ class AlpacaMarketData:
                 ask = float(getattr(quote, "ask_price", 0) or getattr(quote, "ap", 0) or 0)
                 out[str(occ)] = (bid, ask)
         return out
+
+
+def _as_utc(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _dedupe_symbols(symbols: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        symbol = str(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            ordered.append(symbol)
+    return ordered
+
+
+def _raw_bars_for_symbol(result: Any, symbol: str) -> list[Any]:
+    if hasattr(result, "data"):
+        data = result.data
+        if hasattr(data, "get"):
+            return list(data.get(symbol) or [])
+    if hasattr(result, "get"):
+        return list(result.get(symbol) or [])
+    return []
+
+
+def _bars_from_raw(raw: list[Any], fallback_ts: datetime) -> list[Bar]:
+    bars: list[Bar] = []
+    for b in raw:
+        ts = getattr(b, "timestamp", None) or getattr(b, "t", fallback_ts)
+        bars.append(
+            Bar(
+                ts=ts,
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=float(getattr(b, "volume", 0) or 0),
+            )
+        )
+    return bars
 
 
 def _series_for_symbol(result: Any, symbol: str) -> list[Any]:
