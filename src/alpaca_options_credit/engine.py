@@ -24,7 +24,13 @@ from alpaca_options_credit.broker.payloads import (
     open_credit_spread_payload,
 )
 from alpaca_options_credit.calendar_stub import load_calendar, skip_new_entry
-from alpaca_options_credit.close_prices import SOURCE_FILL, SOURCE_QUOTE, CloseOrderView, as_debit
+from alpaca_options_credit.close_prices import (
+    SOURCE_FILL,
+    SOURCE_QUOTE,
+    CloseOrderView,
+    EntryOrderView,
+    as_debit,
+)
 from alpaca_options_credit.config import validate_exit_policy, var_dir
 from alpaca_options_credit.heartbeat import Heartbeat, HeartbeatWriter
 from alpaca_options_credit.journal import Journal
@@ -39,6 +45,7 @@ from alpaca_options_credit.market_data_limit import (
     get_limiter,
 )
 from alpaca_options_credit.models import (
+    HELD_SPREAD_STATUSES,
     Arm,
     ArmStatus,
     Bar,
@@ -48,12 +55,13 @@ from alpaca_options_credit.models import (
     SpreadProposal,
     SpreadStatus,
 )
-from alpaca_options_credit.risk import decide
+from alpaca_options_credit.risk import decide, max_loss_dollars
 from alpaca_options_credit.rth import RTH_CLOSE, RTH_OPEN, as_et, is_rth, parse_hhmm
 from alpaca_options_credit.strategy.spreads import (
     DAILY_CLOSE_THROUGH_INV,
     PRE_PROPOSAL_SKIP_REASONS,
     STOP_CREDIT_EXIT,
+    STRUCTURE_BREAK_EXIT,
     UNDERWATER_OPEN_BLOCKED,
     build_proposal,
     entry_skip_event_kind,
@@ -108,6 +116,7 @@ class Engine:
         self.calendar = calendar if calendar is not None else load_calendar(cal_path)
         validate_exit_policy(self.cfg)
         self._overnight_flagged_date = None
+        self._legacy_entries_reconciled = False
         self._tick_data_pages = 0
         self._scan_queue: deque[str] = deque()
         self._scan_pass_active = False
@@ -154,8 +163,13 @@ class Engine:
                 )
             )
 
-        # Always persist/reconcile journaled spreads first — exits before entries.
+        # Reconcile working entries before any exit. A day mleg that has not
+        # filled is not a position: do not close it, flatten it, or flag it
+        # overnight. Exits still run before new entries.
         open_spreads = self.journal.open_spreads()
+        if not self.dry_run:
+            self._reconcile_legacy_open_entries()
+            open_spreads = self.journal.open_spreads()
         if rth:
             self.beat("rth_scan", _open_spread_detail(open_spreads, prefix="rth_exits_first"))
         else:
@@ -165,11 +179,18 @@ class Engine:
         submit_closes = bool(rth or rth_cfg.get("manage_exits_off_hours"))
         # Off-hours: still latch structure-break / already-due exits; do not submit
         # (options do not trade AH). First RTH poll submits before any new entry.
+        # Pending entries are reconciled here too: a structure break cancels the
+        # working entry instead of submitting a close.
         if open_spreads or submit_closes:
             with data_priority(PRIORITY_EXIT):
-                exits.extend(self._reconcile_naked_legs(open_spreads, now, submit=submit_closes))
+                if not self.dry_run:
+                    self._reconcile_pending_entries(open_spreads, now)
+                    open_spreads = self.journal.open_spreads()
+                held = _held_spreads(open_spreads)
+                exits.extend(self._reconcile_naked_legs(held, now, submit=submit_closes))
                 open_spreads = self.journal.open_spreads()
-                exits.extend(self._manage_exits(open_spreads, now, submit=submit_closes))
+                held = _held_spreads(open_spreads)
+                exits.extend(self._manage_exits(held, now, submit=submit_closes))
                 open_spreads = self.journal.open_spreads()
 
         scan_ok = rth or not rth_cfg.get("scan_only_rth", True)
@@ -786,8 +807,34 @@ class Engine:
             order_id = None
             status = SpreadStatus.PROPOSED
         else:
-            order_id = self.broker.submit_open(proposal, payload)
-            status = SpreadStatus.OPEN
+            try:
+                order_id = self.broker.submit_open(proposal, payload)
+            except Exception as exc:
+                self.journal.log_event(
+                    "entry_submit_failed",
+                    proposal.underlying,
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+                log.error(
+                    "ENTRY SUBMIT FAILED %s: %s — spread not journaled",
+                    proposal.underlying,
+                    exc,
+                )
+                return
+            if not order_id:
+                self.journal.log_event(
+                    "entry_submit_failed",
+                    proposal.underlying,
+                    {"error": "empty order id"},
+                )
+                log.error(
+                    "ENTRY SUBMIT FAILED %s — empty broker id; spread not journaled",
+                    proposal.underlying,
+                )
+                return
+            # Day mleg may never fill. Stay pending until the broker reports
+            # a fill; the limit credit is not the fill price.
+            status = SpreadStatus.PENDING_ENTRY
 
         spread = OpenSpread(
             id=str(uuid.uuid4()),
@@ -804,8 +851,25 @@ class Engine:
             opened_at=now.isoformat(),
             broker_order_id=order_id,
             expiration=proposal.short.expiration.isoformat(),
+            entry_order_id=order_id if status is SpreadStatus.PENDING_ENTRY else None,
+            entry_limit_credit=(
+                proposal.credit if status is SpreadStatus.PENDING_ENTRY else None
+            ),
         )
         self.journal.upsert_spread(spread)
+        if status is SpreadStatus.PENDING_ENTRY:
+            self.journal.log_event(
+                "entry_submitted",
+                proposal.underlying,
+                {
+                    "spread_id": spread.id,
+                    "order_id": order_id,
+                    "limit_credit": proposal.credit,
+                    "qty": proposal.qty,
+                    "short_occ": proposal.short.occ,
+                    "long_occ": proposal.long.occ,
+                },
+            )
         arm = self.journal.get_open_arm(proposal.underlying)
         if arm:
             self.journal.mark_arm_triggered(arm.id, "spread_opened" if not self.dry_run else "observer_proposed")
@@ -815,13 +879,463 @@ class Engine:
         if getter is None:
             return {}
         try:
-            return {str(k): int(v) for k, v in (getter() or {}).items()}
+            raw = getter()
         except Exception as exc:
             log.error(
                 "option_positions failed (%s) — cannot confirm legs are paired",
                 type(exc).__name__,
             )
             return None
+        if raw is None:
+            log.error(
+                "option_positions unavailable — will not treat the book as flat"
+            )
+            return None
+        return {str(k): int(v) for k, v in raw.items()}
+
+    def _fetch_entry_order(self, order_id: str) -> Optional[EntryOrderView]:
+        getter = getattr(self.broker, "get_entry_order", None)
+        if getter is None or not order_id:
+            return None
+        try:
+            view = getter(order_id)
+        except Exception as exc:
+            log.error(
+                "entry order lookup failed %s (%s) — leaving the journal state unchanged",
+                order_id,
+                type(exc).__name__,
+            )
+            return None
+        return view
+
+    def _reconcile_legacy_open_entries(self) -> None:
+        """Repair OPEN rows journaled before the entry mleg filled.
+
+        A still-working order becomes PENDING_ENTRY. A terminal order with no
+        fill and no position in either leg becomes ENTRY_EXPIRED or CANCELLED.
+        A filled order, or any leg still on the book, stays OPEN. Unknown
+        broker state is retried on the next poll.
+        """
+        if self.dry_run or self._legacy_entries_reconciled:
+            return
+        candidates = [
+            s
+            for s in self.journal.open_spreads()
+            if s.status is SpreadStatus.OPEN and (s.entry_order_id or s.broker_order_id)
+        ]
+        if not candidates:
+            self._legacy_entries_reconciled = True
+            return
+        positions = self._option_positions()
+        unknown = False
+        for spread in candidates:
+            order_id = str(spread.entry_order_id or spread.broker_order_id or "")
+            view = self._fetch_entry_order(order_id)
+            if view is None:
+                unknown = True
+                self.journal.log_event(
+                    "legacy_entry_status_unknown",
+                    spread.underlying,
+                    {"spread_id": spread.id, "order_id": order_id},
+                )
+                log.error(
+                    "legacy open %s order %s unconfirmed — not marking it filled or dead",
+                    spread.underlying,
+                    order_id,
+                )
+                continue
+            if view.state == "open":
+                if not self.journal.mark_pending_entry(spread.id, order_id):
+                    unknown = True
+                    continue
+                if view.filled_qty > 0:
+                    self.journal.note_entry_progress(spread.id, view.filled_qty)
+                self.journal.log_event(
+                    "legacy_entry_still_working",
+                    spread.underlying,
+                    {
+                        "spread_id": spread.id,
+                        "order_id": order_id,
+                        "filled_qty": view.filled_qty,
+                        "order_qty": view.order_qty,
+                    },
+                )
+                log.warning(
+                    "legacy OPEN %s order %s is still working — treating as pending "
+                    "entry (not a held spread)",
+                    spread.underlying,
+                    order_id,
+                )
+                continue
+            if view.state == "filled" or view.filled_qty > 0:
+                self._repair_legacy_filled_open(spread, view, order_id)
+                continue
+            if positions is None:
+                unknown = True
+                self.journal.log_event(
+                    "legacy_entry_positions_unknown",
+                    spread.underlying,
+                    {
+                        "spread_id": spread.id,
+                        "order_id": order_id,
+                        "raw_status": view.raw_status,
+                    },
+                )
+                log.error(
+                    "legacy OPEN %s order %s is %s with no fill, but positions are "
+                    "unknown — not freeing the slot",
+                    spread.underlying,
+                    order_id,
+                    view.raw_status,
+                )
+                continue
+            short_q = int(positions.get(spread.short_occ, 0) or 0)
+            long_q = int(positions.get(spread.long_occ, 0) or 0)
+            if short_q != 0 or long_q != 0:
+                self.journal.log_event(
+                    "legacy_entry_positions_held",
+                    spread.underlying,
+                    {
+                        "spread_id": spread.id,
+                        "order_id": order_id,
+                        "short_qty": short_q,
+                        "long_qty": long_q,
+                        "raw_status": view.raw_status,
+                    },
+                )
+                log.warning(
+                    "legacy OPEN %s order %s is terminal-unfilled but a leg is still "
+                    "on the book (short=%s long=%s) — left OPEN",
+                    spread.underlying,
+                    order_id,
+                    short_q,
+                    long_q,
+                )
+                continue
+            self._retire_unfilled_entry(spread, view, order_id, legacy=True)
+        if not unknown:
+            self._legacy_entries_reconciled = True
+
+    def _repair_legacy_filled_open(
+        self, spread: OpenSpread, view: EntryOrderView, order_id: str
+    ) -> None:
+        """Keep a filled legacy OPEN, but store the actual fill when it differs.
+
+        Rows already in a close (``close_filled_qty`` > 0) are left alone.
+        """
+        if int(spread.close_filled_qty or 0) > 0:
+            log.info(
+                "legacy OPEN %s order %s already closing — left as journaled",
+                spread.underlying,
+                order_id,
+            )
+            return
+        qty = int(view.filled_qty or 0) or int(spread.qty)
+        priced = (
+            view.filled_avg_credit
+            if view.filled_avg_credit is not None and view.filled_avg_credit > 0
+            else None
+        )
+        credit = float(priced if priced is not None else spread.credit)
+        qty_differs = qty != int(spread.qty)
+        credit_differs = (
+            priced is not None and abs(credit - float(spread.credit)) > 1e-6
+        )
+        if not qty_differs and not credit_differs:
+            log.info(
+                "legacy OPEN %s order %s already filled qty=%s — left OPEN",
+                spread.underlying,
+                order_id,
+                qty,
+            )
+            return
+        multiplier = int((self.cfg.get("spreads") or {}).get("multiplier", 100))
+        max_loss = max_loss_dollars(spread.width, credit, multiplier) * qty
+        if not self.journal.apply_open_fill(
+            spread.id,
+            qty=qty,
+            credit=credit,
+            max_loss=max_loss,
+            filled_qty=qty,
+        ):
+            return
+        limit = (
+            spread.entry_limit_credit
+            if spread.entry_limit_credit is not None
+            else spread.credit
+        )
+        self.journal.log_event(
+            "legacy_entry_filled",
+            spread.underlying,
+            {
+                "spread_id": spread.id,
+                "order_id": order_id,
+                "filled_qty": qty,
+                "ordered_qty": spread.qty,
+                "limit_credit": limit,
+                "filled_credit": priced,
+                "credit": credit,
+                "max_loss": max_loss,
+            },
+        )
+        log.info(
+            "legacy OPEN %s reconciled to fill qty=%s credit=%.2f (was %.2f)",
+            spread.underlying,
+            qty,
+            credit,
+            float(spread.credit),
+        )
+
+    def _reconcile_pending_entries(
+        self, open_spreads: list[OpenSpread], now: datetime
+    ) -> None:
+        if self.dry_run:
+            return
+        for spread in open_spreads:
+            if spread.status is not SpreadStatus.PENDING_ENTRY:
+                continue
+            self._reconcile_one_pending_entry(spread, now)
+
+    def _reconcile_one_pending_entry(self, spread: OpenSpread, now: datetime) -> None:
+        order_id = str(spread.entry_order_id or spread.broker_order_id or "")
+        if not order_id:
+            self.journal.log_event(
+                "entry_order_missing",
+                spread.underlying,
+                {"spread_id": spread.id},
+            )
+            log.error(
+                "pending entry %s has no order id — not promoting and not expiring",
+                spread.underlying,
+            )
+            return
+        view = self._fetch_entry_order(order_id)
+        if view is None:
+            self.journal.log_event(
+                "entry_status_unknown",
+                spread.underlying,
+                {"spread_id": spread.id, "order_id": order_id},
+            )
+            log.error(
+                "pending entry %s order %s unconfirmed — not promoting and not expiring",
+                spread.underlying,
+                order_id,
+            )
+            return
+        if view.state == "open":
+            self._track_working_entry(spread, view, order_id, now)
+            return
+        self._apply_terminal_entry(spread, view, order_id)
+
+    def _track_working_entry(
+        self,
+        spread: OpenSpread,
+        view: EntryOrderView,
+        order_id: str,
+        now: datetime,
+    ) -> None:
+        if view.filled_qty > int(spread.entry_filled_qty or 0):
+            self.journal.note_entry_progress(spread.id, view.filled_qty)
+            self.journal.log_event(
+                "entry_partial_working",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "order_id": order_id,
+                    "filled_qty": view.filled_qty,
+                    "order_qty": view.order_qty or spread.qty,
+                    "filled_credit": view.filled_avg_credit,
+                },
+            )
+            log.info(
+                "pending entry %s partial fill %s/%s — still working, not closing",
+                spread.underlying,
+                view.filled_qty,
+                view.order_qty or spread.qty,
+            )
+        # pending_cancel is still working. Do not submit a close for it.
+        if view.raw_status == "pending_cancel":
+            return
+        if not self._pending_structure_broken(spread):
+            return
+        self._cancel_working_entry(spread, order_id, now)
+
+    def _pending_structure_broken(self, spread: OpenSpread) -> bool:
+        """Same daily structure-break as an exit. Marks are not an entry cancel."""
+        reason, _thesis = self._evaluate_exit_reason(spread, None, allow_mark=False)
+        return reason == STRUCTURE_BREAK_EXIT
+
+    def _cancel_working_entry(
+        self, spread: OpenSpread, order_id: str, now: datetime
+    ) -> None:
+        cancel = getattr(self.broker, "cancel_entry_order", None)
+        if cancel is None:
+            self.journal.log_event(
+                "entry_cancel_failed",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "order_id": order_id,
+                    "error": "broker has no cancel_entry_order",
+                },
+            )
+            log.error(
+                "structure break on pending %s but broker cannot cancel entry %s — "
+                "not submitting a close",
+                spread.underlying,
+                order_id,
+            )
+            return
+        try:
+            cancel(order_id)
+        except Exception as exc:
+            self.journal.log_event(
+                "entry_cancel_failed",
+                spread.underlying,
+                {
+                    "spread_id": spread.id,
+                    "order_id": order_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            log.error(
+                "cancel entry failed %s %s (%s) — not submitting a close",
+                spread.underlying,
+                order_id,
+                type(exc).__name__,
+            )
+            return
+        self.journal.log_event(
+            "entry_cancel_structure_break",
+            spread.underlying,
+            {
+                "spread_id": spread.id,
+                "order_id": order_id,
+                "as_of": now.isoformat(),
+            },
+        )
+        log.warning(
+            "cancelled working entry %s order %s — structure break, no close submitted",
+            spread.underlying,
+            order_id,
+        )
+        view = self._fetch_entry_order(order_id)
+        if view is None or view.state == "open":
+            if view is not None and view.filled_qty > int(spread.entry_filled_qty or 0):
+                self.journal.note_entry_progress(spread.id, view.filled_qty)
+            return
+        fresh = self.journal.get_spread(spread.id) or spread
+        self._apply_terminal_entry(fresh, view, order_id)
+
+    def _apply_terminal_entry(
+        self, spread: OpenSpread, view: EntryOrderView, order_id: str
+    ) -> None:
+        # A terminal partial is a real (smaller) spread. The mleg is atomic,
+        # so filled_qty is paired units, not a naked leg.
+        if view.state == "filled" or view.filled_qty > 0:
+            self._promote_filled_entry(spread, view, order_id)
+            return
+        self._retire_unfilled_entry(spread, view, order_id, legacy=False)
+
+    def _retire_unfilled_entry(
+        self,
+        spread: OpenSpread,
+        view: EntryOrderView,
+        order_id: str,
+        *,
+        legacy: bool,
+    ) -> None:
+        status = _terminal_entry_status(view.raw_status)
+        reason = _terminal_entry_reason(status)
+        wrote = self.journal.mark_entry_terminal(
+            spread.id, status, reason=reason, allow_open=legacy
+        )
+        if not wrote:
+            return
+        payload = {
+            "spread_id": spread.id,
+            "order_id": order_id,
+            "raw_status": view.raw_status,
+            "filled_qty": view.filled_qty,
+            "legacy": legacy,
+        }
+        if legacy:
+            self.journal.log_event("legacy_entry_unfilled", spread.underlying, payload)
+        self.journal.log_event(reason, spread.underlying, payload)
+        log.info(
+            "entry %s %s order %s status=%s — slot freed",
+            reason,
+            spread.underlying,
+            order_id,
+            view.raw_status,
+        )
+
+    def _promote_filled_entry(
+        self, spread: OpenSpread, view: EntryOrderView, order_id: str
+    ) -> None:
+        qty = int(view.filled_qty or 0)
+        if qty <= 0:
+            qty = int(view.order_qty or spread.qty or 0)
+        if qty <= 0:
+            log.error("filled entry %s has no qty — not promoting", spread.underlying)
+            return
+        limit = (
+            spread.entry_limit_credit
+            if spread.entry_limit_credit is not None
+            else spread.credit
+        )
+        priced = (
+            view.filled_avg_credit
+            if view.filled_avg_credit is not None and view.filled_avg_credit > 0
+            else None
+        )
+        credit = float(priced if priced is not None else limit)
+        multiplier = int((self.cfg.get("spreads") or {}).get("multiplier", 100))
+        max_loss = max_loss_dollars(spread.width, credit, multiplier) * qty
+        wrote = self.journal.promote_pending_entry(
+            spread.id,
+            qty=qty,
+            credit=credit,
+            max_loss=max_loss,
+            filled_qty=qty,
+        )
+        if not wrote:
+            return
+        kind = (
+            "entry_partial"
+            if view.state == "partial" or qty < int(spread.qty)
+            else "entry_filled"
+        )
+        payload = {
+            "spread_id": spread.id,
+            "order_id": order_id,
+            "filled_qty": qty,
+            "ordered_qty": spread.qty,
+            "limit_credit": limit,
+            "filled_credit": priced,
+            "credit": credit,
+            "max_loss": max_loss,
+            "unpriced": priced is None,
+            "filled_at": view.filled_at,
+        }
+        self.journal.log_event(kind, spread.underlying, payload)
+        if priced is None:
+            self.journal.log_event("entry_fill_unpriced", spread.underlying, payload)
+            log.warning(
+                "entry %s filled qty=%s but the broker sent no credit — "
+                "OPEN keeps the limit credit %.2f",
+                spread.underlying,
+                qty,
+                credit,
+            )
+            return
+        log.info(
+            "entry filled %s qty=%s credit=%.2f (limit %.2f) — now OPEN",
+            spread.underlying,
+            qty,
+            credit,
+            float(limit),
+        )
 
     def _flatten_residual_leg(
         self,
@@ -916,6 +1430,8 @@ class Engine:
             return []
         reasons: list[str] = []
         for spread in open_spreads:
+            if spread.status is SpreadStatus.PENDING_ENTRY:
+                continue
             short_q = int(positions.get(spread.short_occ, 0) or 0)
             long_q = int(positions.get(spread.long_occ, 0) or 0)
             short_units = abs(short_q)
@@ -995,7 +1511,14 @@ class Engine:
         return reasons
 
     def _flag_overnight_opens(self, open_spreads: list[OpenSpread], now: datetime) -> None:
-        """Heartbeat + once-per-ET-date journal flag. No AH mleg submits."""
+        """Heartbeat + once-per-ET-date journal flag. No AH mleg submits.
+
+        A working entry is not a position held overnight. Day orders expire;
+        they are not flagged and they are not closed here.
+        """
+        open_spreads = [
+            s for s in open_spreads if s.status is not SpreadStatus.PENDING_ENTRY
+        ]
         detail = _open_spread_detail(open_spreads, prefix="overnight_open")
         self.beat("idle_off_hours", detail)
         if not open_spreads:
@@ -1180,6 +1703,8 @@ class Engine:
         exits_cfg = self.cfg.get("exits") or {}
         working_ids = self._working_close_ids() if submit else set()
         for spread in open_spreads:
+            if spread.status is SpreadStatus.PENDING_ENTRY:
+                continue
             mark = self._spread_mark(spread.short_occ, spread.long_occ)
             reason, thesis_intact = self._evaluate_exit_reason(
                 spread, mark, allow_mark=submit
@@ -1404,6 +1929,25 @@ class Engine:
                 else float(loop_cfg.get("sleep_seconds_off_hours", 60))
             )
             time.sleep(sleep)
+
+
+_ENTRY_EXPIRED_ORDER_STATUSES = frozenset({"expired", "done_for_day"})
+
+
+def _terminal_entry_status(raw_status: str) -> SpreadStatus:
+    if str(raw_status or "") in _ENTRY_EXPIRED_ORDER_STATUSES:
+        return SpreadStatus.ENTRY_EXPIRED
+    return SpreadStatus.CANCELLED
+
+
+def _terminal_entry_reason(status: SpreadStatus) -> str:
+    if status is SpreadStatus.ENTRY_EXPIRED:
+        return "entry_expired"
+    return "entry_cancelled"
+
+
+def _held_spreads(spreads: list[OpenSpread]) -> list[OpenSpread]:
+    return [s for s in spreads if s.status in HELD_SPREAD_STATUSES]
 
 
 def _max_credit_pct(sp: dict[str, Any]) -> float:

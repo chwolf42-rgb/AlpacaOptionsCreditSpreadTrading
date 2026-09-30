@@ -24,14 +24,27 @@ class ArmStatus(str, Enum):
 
 
 class SpreadStatus(str, Enum):
-    PROPOSED = "proposed"
-    OPEN = "open"
+    PROPOSED = "proposed"  # observer; no broker order
+    PENDING_ENTRY = "pending_entry"  # live mleg accepted, not filled
+    OPEN = "open"  # entry filled; both legs are held
     EXITING = "exiting"  # exit latched; close not yet accepted
     CLOSED = "closed"
+    ENTRY_EXPIRED = "entry_expired"  # day order ended with no fill
+    CANCELLED = "cancelled"  # entry canceled or rejected with no fill
 
 
-# Still on the book: proposed (observer), live, or close-pending.
+# Reserves risk (concurrent, portfolio, one underlying). Terminal entry
+# states are absent so an unfilled day order frees the slot.
 LIVE_SPREAD_STATUSES = (
+    SpreadStatus.PROPOSED,
+    SpreadStatus.PENDING_ENTRY,
+    SpreadStatus.OPEN,
+    SpreadStatus.EXITING,
+)
+
+# Actually held, or an observer proposal. A working entry is not held:
+# do not mark-to-close it, flatten it, or flag it overnight.
+HELD_SPREAD_STATUSES = (
     SpreadStatus.PROPOSED,
     SpreadStatus.OPEN,
     SpreadStatus.EXITING,
@@ -128,3 +141,7 @@ class OpenSpread:
     close_fill_notional: Optional[float] = None
     # Journal updated_at. Legacy closes stored the close clock only here.
     updated_at: str = ""
+    # Live entry mleg. ``credit`` stays the limit until the fill is known.
+    entry_order_id: Optional[str] = None
+    entry_filled_qty: int = 0
+    entry_limit_credit: Optional[float] = None

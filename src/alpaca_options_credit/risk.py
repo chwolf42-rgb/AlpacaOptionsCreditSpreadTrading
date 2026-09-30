@@ -50,6 +50,9 @@ def decide(
     one_per_underlying: bool = True,
     multiplier: int = 100,
 ) -> RiskDecision:
+    # Pending entries reserve the slot at the full order's max loss (limit
+    # credit is the worst fill we would accept) so a working day order
+    # cannot be double-submitted.
     live = [s for s in open_spreads if s.status in LIVE_SPREAD_STATUSES]
     if one_per_underlying and any(s.underlying == proposal.underlying for s in live):
         return RiskDecision(False, 0, "one_spread_per_underlying", 0.0)

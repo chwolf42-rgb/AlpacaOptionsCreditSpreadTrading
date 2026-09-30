@@ -56,6 +56,19 @@ class CloseOrderView:
     filled_at: Optional[str]
 
 
+@dataclass(frozen=True)
+class EntryOrderView:
+    """Broker view of one mleg entry. ``filled_avg_credit`` is per spread, > 0."""
+
+    order_id: str
+    state: str  # open | filled | partial | dead
+    raw_status: str
+    filled_qty: int
+    order_qty: int
+    filled_avg_credit: Optional[float]
+    filled_at: Optional[str]
+
+
 def as_debit(value: Any) -> Optional[float]:
     """Finite premium. None when the feed did not produce a price."""
     if value is None or value is False or value == "":
@@ -263,6 +276,71 @@ def _attr(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
     return getattr(obj, name, None)
+
+
+def entry_credit_from_price(raw: Any) -> Optional[float]:
+    """Net mleg premium as a positive credit.
+
+    Alpaca's signed limit is negative for a credit. Some order payloads
+    report that same net as a positive magnitude. Zero is not a fill price.
+    """
+    price = as_debit(raw)
+    if price is None or price == 0:
+        return None
+    return abs(price)
+
+
+def net_credit_from_open_legs(legs: Sequence[Any]) -> Optional[float]:
+    """Sell-to-open price − buy-to-open price when the parent net is absent."""
+    buy: Optional[float] = None
+    sell: Optional[float] = None
+    for leg in legs:
+        px = as_debit(_attr(leg, "filled_avg_price"))
+        if px is None:
+            continue
+        intent_text = _enum_text(_attr(leg, "position_intent"))
+        side_text = _enum_text(_attr(leg, "side"))
+        price = abs(px)
+        if "sell" in intent_text or side_text == "sell":
+            sell = price
+        elif "buy" in intent_text or side_text == "buy":
+            buy = price
+    if buy is None or sell is None:
+        return None
+    credit = sell - buy
+    if credit <= 0:
+        return None
+    return credit
+
+
+def entry_order_view_from_broker_order(order: Any) -> EntryOrderView:
+    """Read an Alpaca (or test double) entry into an :class:`EntryOrderView`.
+
+    ``state`` matches :func:`classify_close_order`: a still-working partial
+    stays ``open``. ``filled_avg_credit`` is the parent net when present,
+    otherwise the two open-leg prices. An mleg fill is one spread qty, not
+    a single naked leg.
+    """
+    status = _status_text(_attr(order, "status"))
+    filled_qty = _qty(_attr(order, "filled_qty"))
+    order_qty = _qty(_attr(order, "qty"))
+    if status in _FILLED_ORDER_STATES and filled_qty <= 0 and order_qty > 0:
+        filled_qty = order_qty
+    state = classify_close_order(status, filled_qty, order_qty)
+    credit = entry_credit_from_price(_attr(order, "filled_avg_price"))
+    if credit is None:
+        legs = _attr(order, "legs") or []
+        credit = net_credit_from_open_legs(legs)
+    filled_at = _iso(_attr(order, "filled_at")) or _iso(_attr(order, "updated_at"))
+    return EntryOrderView(
+        order_id=str(_attr(order, "id") or ""),
+        state=state,
+        raw_status=status,
+        filled_qty=filled_qty,
+        order_qty=order_qty,
+        filled_avg_credit=credit,
+        filled_at=filled_at,
+    )
 
 
 def close_order_view_from_broker_order(order: Any) -> CloseOrderView:

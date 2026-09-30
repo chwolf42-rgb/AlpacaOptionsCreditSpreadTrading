@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS spreads (
     status TEXT NOT NULL,
     opened_at TEXT NOT NULL,
     broker_order_id TEXT,
+    entry_order_id TEXT,
+    entry_filled_qty INTEGER NOT NULL DEFAULT 0,
+    entry_limit_credit REAL,
     exit_reason TEXT NOT NULL DEFAULT '',
     thesis_intact INTEGER NOT NULL DEFAULT 1,
     expiration TEXT NOT NULL DEFAULT '',
@@ -195,13 +198,24 @@ class Journal:
                 INSERT INTO spreads (id, underlying, kind, short_occ, long_occ, width, credit,
                                      qty, max_loss, invalidation, status, opened_at,
                                      broker_order_id, exit_reason, thesis_intact, expiration,
-                                     close_attempts, exit_order_id, last_close_error, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     close_attempts, exit_order_id, last_close_error,
+                                     entry_order_id, entry_filled_qty, entry_limit_credit,
+                                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     exit_reason=excluded.exit_reason,
                     thesis_intact=excluded.thesis_intact,
-                    broker_order_id=excluded.broker_order_id,
+                    broker_order_id=COALESCE(excluded.broker_order_id, spreads.broker_order_id),
+                    entry_order_id=COALESCE(excluded.entry_order_id, spreads.entry_order_id),
+                    entry_filled_qty=CASE
+                        WHEN excluded.entry_filled_qty > spreads.entry_filled_qty
+                        THEN excluded.entry_filled_qty
+                        ELSE spreads.entry_filled_qty
+                    END,
+                    entry_limit_credit=COALESCE(
+                        excluded.entry_limit_credit, spreads.entry_limit_credit
+                    ),
                     close_attempts=excluded.close_attempts,
                     exit_order_id=excluded.exit_order_id,
                     last_close_error=excluded.last_close_error,
@@ -227,6 +241,9 @@ class Journal:
                     int(spread.close_attempts),
                     spread.exit_order_id,
                     spread.last_close_error,
+                    spread.entry_order_id,
+                    int(spread.entry_filled_qty or 0),
+                    spread.entry_limit_credit,
                     _now(),
                 ),
             )
@@ -266,6 +283,150 @@ class Journal:
                 (symbol, *statuses),
             ).fetchone()
         return _spread_from_row(row) if row else None
+
+    def mark_pending_entry(self, spread_id: str, order_id: str) -> bool:
+        """Demote a legacy OPEN row whose entry mleg is still working."""
+        with self._conn() as con:
+            cur = con.execute(
+                """
+                UPDATE spreads
+                SET status=?,
+                    entry_order_id=COALESCE(NULLIF(entry_order_id, ''), ?),
+                    broker_order_id=COALESCE(NULLIF(broker_order_id, ''), ?),
+                    entry_limit_credit=COALESCE(entry_limit_credit, credit),
+                    updated_at=?
+                WHERE id=? AND status=?
+                """,
+                (
+                    SpreadStatus.PENDING_ENTRY.value,
+                    order_id,
+                    order_id,
+                    _now(),
+                    spread_id,
+                    SpreadStatus.OPEN.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def note_entry_progress(self, spread_id: str, filled_qty: int) -> None:
+        """Record spread units filled on a still-working entry. Never decreases."""
+        with self._conn() as con:
+            con.execute(
+                """
+                UPDATE spreads
+                SET entry_filled_qty=?, updated_at=?
+                WHERE id=? AND status=? AND entry_filled_qty < ?
+                """,
+                (
+                    int(filled_qty),
+                    _now(),
+                    spread_id,
+                    SpreadStatus.PENDING_ENTRY.value,
+                    int(filled_qty),
+                ),
+            )
+
+    def promote_pending_entry(
+        self,
+        spread_id: str,
+        *,
+        qty: int,
+        credit: float,
+        max_loss: float,
+        filled_qty: int,
+    ) -> bool:
+        """OPEN a pending entry at the actual fill. Limit credit is left intact."""
+        with self._conn() as con:
+            cur = con.execute(
+                """
+                UPDATE spreads
+                SET status=?,
+                    qty=?,
+                    credit=?,
+                    max_loss=?,
+                    entry_filled_qty=?,
+                    updated_at=?
+                WHERE id=? AND status=?
+                """,
+                (
+                    SpreadStatus.OPEN.value,
+                    int(qty),
+                    float(credit),
+                    float(max_loss),
+                    int(filled_qty),
+                    _now(),
+                    spread_id,
+                    SpreadStatus.PENDING_ENTRY.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def apply_open_fill(
+        self,
+        spread_id: str,
+        *,
+        qty: int,
+        credit: float,
+        max_loss: float,
+        filled_qty: int,
+    ) -> bool:
+        """Point an already-OPEN row at the broker fill. Does not touch a close in progress.
+
+        ``entry_limit_credit`` keeps the pre-fill credit when it was not stored yet.
+        """
+        with self._conn() as con:
+            cur = con.execute(
+                """
+                UPDATE spreads
+                SET qty=?,
+                    credit=?,
+                    max_loss=?,
+                    entry_filled_qty=?,
+                    entry_limit_credit=COALESCE(entry_limit_credit, credit),
+                    updated_at=?
+                WHERE id=? AND status=? AND close_filled_qty=0
+                """,
+                (
+                    int(qty),
+                    float(credit),
+                    float(max_loss),
+                    int(filled_qty),
+                    _now(),
+                    spread_id,
+                    SpreadStatus.OPEN.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def mark_entry_terminal(
+        self,
+        spread_id: str,
+        status: SpreadStatus,
+        *,
+        reason: str,
+        allow_open: bool = False,
+    ) -> bool:
+        """Free the slot. Not a close — no ``closed_at`` and no close debit.
+
+        ``allow_open`` is only for a legacy OPEN row whose entry order is
+        already terminal and unfilled. A real filled OPEN is not passed here.
+        """
+        if status not in (SpreadStatus.ENTRY_EXPIRED, SpreadStatus.CANCELLED):
+            raise ValueError(f"not a terminal entry status: {status}")
+        allowed = [SpreadStatus.PENDING_ENTRY.value]
+        if allow_open:
+            allowed.append(SpreadStatus.OPEN.value)
+        placeholders = ",".join("?" * len(allowed))
+        with self._conn() as con:
+            cur = con.execute(
+                f"""
+                UPDATE spreads
+                SET status=?, exit_reason=?, updated_at=?
+                WHERE id=? AND status IN ({placeholders})
+                """,
+                (status.value, reason, _now(), spread_id, *allowed),
+            )
+            return cur.rowcount == 1
 
     def latch_exit(
         self,
@@ -817,6 +978,9 @@ def _spread_from_row(row: sqlite3.Row) -> OpenSpread:
         close_filled_qty=int(_row_get(row, "close_filled_qty", 0) or 0),
         close_fill_notional=_optional_float(_row_get(row, "close_fill_notional", None)),
         updated_at=str(_row_get(row, "updated_at", "") or ""),
+        entry_order_id=_row_get(row, "entry_order_id", None) or None,
+        entry_filled_qty=int(_row_get(row, "entry_filled_qty", 0) or 0),
+        entry_limit_credit=_optional_float(_row_get(row, "entry_limit_credit", None)),
     )
 
 
@@ -858,6 +1022,32 @@ def _migrate_spreads(con: sqlite3.Connection) -> None:
         )
     if "close_order_notional_seen" not in cols:
         con.execute("ALTER TABLE spreads ADD COLUMN close_order_notional_seen REAL")
+    if "entry_order_id" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN entry_order_id TEXT")
+    if "entry_filled_qty" not in cols:
+        con.execute(
+            "ALTER TABLE spreads ADD COLUMN entry_filled_qty INTEGER NOT NULL DEFAULT 0"
+        )
+    if "entry_limit_credit" not in cols:
+        con.execute("ALTER TABLE spreads ADD COLUMN entry_limit_credit REAL")
+    # Existing live rows stored the entry id in broker_order_id. Copy it once
+    # so startup reconciliation can see the order without a second schema.
+    con.execute(
+        """
+        UPDATE spreads
+        SET entry_order_id = broker_order_id
+        WHERE (entry_order_id IS NULL OR entry_order_id = '')
+          AND broker_order_id IS NOT NULL
+          AND broker_order_id != ''
+        """
+    )
+    con.execute(
+        """
+        UPDATE spreads
+        SET entry_limit_credit = credit
+        WHERE entry_limit_credit IS NULL
+        """
+    )
 
 
 @dataclass(frozen=True)
