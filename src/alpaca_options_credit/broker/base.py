@@ -27,8 +27,18 @@ class Broker(Protocol):
     def open_order_ids(self) -> list[str]:
         ...
 
-    def option_positions(self) -> dict[str, int]:
-        """OCC symbol → signed qty (short negative). Empty if unknown."""
+    def option_positions(self) -> Optional[dict[str, int]]:
+        """OCC symbol → signed qty (short negative).
+
+        None when the query failed. An empty dict means the book was read
+        and has no option positions.
+        """
+
+    def get_entry_order(self, order_id: str) -> Any:
+        """Working, filled, or dead view of one entry mleg. None if unknown."""
+
+    def cancel_entry_order(self, order_id: str) -> None:
+        """Cancel a working entry mleg. Never used on a working close."""
 
     def flatten_residual(self, occ: str, payload: dict[str, Any]) -> Optional[str]:
         """CRITICAL: flatten one leftover leg. Not a spread exit."""

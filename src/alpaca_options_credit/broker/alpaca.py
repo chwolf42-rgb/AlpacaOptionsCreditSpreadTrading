@@ -33,8 +33,10 @@ from alpaca_options_credit.close_prices import (
     BAR_MAX_AGE,
     QUOTE_MAX_AGE,
     CloseOrderView,
+    EntryOrderView,
     bar_closes_from_prints,
     close_order_view_from_broker_order,
+    entry_order_view_from_broker_order,
     leg_price_at,
     quote_mids_from_prints,
     spread_debit,
@@ -156,13 +158,13 @@ class AlpacaBroker:
             raise AtomicSpreadError("flatten_residual requires emergency_flatten payload")
         return self._submit_simple(payload)
 
-    def option_positions(self) -> dict[str, int]:
-        """OCC → signed qty. Missing/failed query returns {} (engine alerts)."""
+    def option_positions(self) -> Optional[dict[str, int]]:
+        """OCC → signed qty. A failed query returns None so the book is not treated as flat."""
         try:
             positions = self._trading.get_all_positions()
         except Exception as exc:  # pragma: no cover - live path
             log.error("option position query failed: %s", type(exc).__name__)
-            return {}
+            return None
         out: dict[str, int] = {}
         for pos in positions or []:
             asset_class = str(getattr(pos, "asset_class", "") or "").lower()
@@ -194,6 +196,21 @@ class AlpacaBroker:
         if order is None:
             return None
         return close_order_view_from_broker_order(order)
+
+    def get_entry_order(self, order_id: str) -> Optional[EntryOrderView]:
+        """Filled qty and average credit for one mleg entry. None if the lookup fails."""
+        try:
+            order = self._trading.get_order_by_id(order_id)
+        except Exception as exc:  # pragma: no cover - live path
+            log.error("entry order lookup failed: %s", type(exc).__name__)
+            return None
+        if order is None:
+            return None
+        return entry_order_view_from_broker_order(order)
+
+    def cancel_entry_order(self, order_id: str) -> None:
+        """Cancel a working entry mleg. Working closes are never cancelled."""
+        self._trading.cancel_order_by_id(order_id)
 
     def open_order_ids(self) -> list[str]:
         from alpaca.trading.enums import QueryOrderStatus

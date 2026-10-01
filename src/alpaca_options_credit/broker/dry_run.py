@@ -63,6 +63,14 @@ class DryRunBroker:
             f"(cancel-before-replace naked window; order_id={order_id})"
         )
 
+    def get_entry_order(self, order_id: str):
+        """Observer never works an entry. Live fills are reconciled on AlpacaBroker."""
+        return None
+
+    def cancel_entry_order(self, order_id: str) -> None:
+        """No working entry in the observer. This is not the exit-cancel path."""
+        return None
+
     def option_positions(self) -> dict[str, int]:
         return dict(self.positions)
 
