@@ -441,11 +441,10 @@ def test_ambiguous_mleg_is_found_by_client_order_id_on_the_next_poll(failure, mo
     assert order_id == "ord-99"
     assert trading.submits == 1
     assert [kind for kind, _ in trading.events].count("submit") == 1
+    # The rebuilt payload is not posted. The lookup is the id from the first attempt,
+    # including when the close debit moved.
     assert trading.events[-1] == ("lookup", first_id)
-    if move_limit:
-        assert second["client_order_id"] != first_id
-    else:
-        assert second["client_order_id"] == first_id
+    assert "client_order_id" not in second
 
 
 def test_restarted_broker_looks_up_the_ambiguous_submit_before_posting(tmp_path: Path):
@@ -470,7 +469,7 @@ def test_restarted_broker_looks_up_the_ambiguous_submit_before_posting(tmp_path:
     first = _broker(first_trading)
     first._submit_state_path = state
     payload = _mleg_payload()
-    with pytest.raises(_HttpStatus):
+    with pytest.raises(SubmitUnconfirmed):
         first._submit_mleg(payload)
     assert first_trading.submits == 1
     assert state.is_file()

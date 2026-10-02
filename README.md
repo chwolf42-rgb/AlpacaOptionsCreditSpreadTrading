@@ -203,13 +203,13 @@ Coverage includes credential isolation, strike-near-invalidation, credit/width g
 
 See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`), and the **locked options-native exit policy** (`exits.path`, `forbid_equity_oco_bracket`, `never_cancel_working_close`) live there.
 
-Poll-loop HTTP bounds (Alpaca trading and market-data REST):
+Poll-loop HTTP bounds (Alpaca trading and market-data REST). These are the tracked defaults in `config/default.yaml`. `config/paper-live.yaml` is not in this repo; copy the same keys there if that file should override them. Do not change a live file's other values just to add these.
 
-| Key | Default |
-| --- | --- |
-| `http.timeout_seconds` | 15 (connect and read) |
-| `http.read_attempts` | 3 (GET/HEAD only; order submits are not retried) |
-| `http.read_backoff_seconds` | 0.5, 1.0 |
-| `http.read_budget_seconds` | 50, kept under `heartbeat.stale_after_seconds_rth` (90) |
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `http.timeout_seconds` | 15 | Connect timeout and read timeout, in seconds, on every poll-loop Alpaca REST call. A hung `session.request` otherwise blocks the heartbeat until the OS gives up. |
+| `http.read_attempts` | 3 | How many times an idempotent GET or HEAD may be tried, including the first try. Order submits (POST) are not retried. |
+| `http.read_backoff_seconds` | 0.5, 1.0 | Sleep between read retries, in seconds. One value is used per gap, in order. |
+| `http.read_budget_seconds` | 50 | Cap on one read including retries and backoff. Kept under `heartbeat.stale_after_seconds_rth` (90) so a slow GET cannot stale the heartbeat. Submits do not use this budget. |
 
-A timed-out multi-leg submit is looked up by `client_order_id` and not posted again. When the heartbeat is stale, the supervisor logs `blocked_in=<op> for <s>s` from the in-flight call recorded on that beat.
+Each order attempt gets its own `client_order_id` (a short random nonce plus a digest of the body). Alpaca never accepts an id again, even after the order expires or fills. The id actually posted is written to `var/options/mleg_submit_attempts.json` before the POST. A 429, 5xx, or timeout looks that id up on the next poll, including after a restart: a live or filled order is returned and not posted again; a 404 or a terminal non-fill (expired, canceled, rejected) allows one new attempt with a new nonce. A later identical order is a fresh attempt, not the previous fill. When the heartbeat is stale, the supervisor logs `blocked_in=<op> for <s>s` from the in-flight call recorded on that beat.

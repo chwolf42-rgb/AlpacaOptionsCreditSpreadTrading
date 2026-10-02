@@ -21,7 +21,7 @@ from alpaca_options_credit.bar_quality import (
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
     close_credit_spread_payload,
-    ensure_client_order_id,
+    mint_client_order_id,
     open_credit_spread_payload,
     order_attempt_key,
 )
@@ -125,14 +125,9 @@ class AlpacaBroker:
 
         self.creds = creds
         self._http = policy_from_config(cfg)
-        # client_order_ids whose POST did not return a definitive result.
-        # A later submit looks these up before it posts again.
-        self._unconfirmed_submits: set[str] = set()
-        # client_order_id -> broker order id, once we know the POST landed.
-        self._landed_submits: dict[str, str] = {}
-        # order_attempt_key -> client_order_id actually sent. The limit can
-        # change on the next poll; the key does not, so the earlier id is
-        # still found. Persisted so a restarted child does the same lookup.
+        # order_attempt_key -> client_order_id saved before that attempt's POST.
+        # Only the unresolved attempt is kept. A resolved one is dropped so a
+        # later identical order gets a new nonce instead of an old fill.
         self._attempted_ids: dict[str, str] = {}
         self._submit_state_path = _submit_state_path(cfg)
         self._submit_state_loaded = False
@@ -238,7 +233,6 @@ class AlpacaBroker:
 
     def _submit_mleg(self, payload: dict[str, Any]) -> Optional[str]:
         """One atomic 2-leg POST. A timeout is reconciled, never posted again."""
-        client_order_id = ensure_client_order_id(payload)
 
         def _send() -> Any:
             from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
@@ -267,15 +261,14 @@ class AlpacaBroker:
                 time_in_force=tif,
                 limit_price=float(payload["limit_price"]),
                 legs=legs,
-                client_order_id=client_order_id,
+                client_order_id=str(payload["client_order_id"]),
             )
             return self._trading.submit_order(req)
 
-        return self._post_once(payload, client_order_id, _send)
+        return self._post_once(payload, _send)
 
     def _submit_simple(self, payload: dict[str, Any]) -> Optional[str]:
         """One residual-leg POST. Same timeout rule: reconcile, do not resubmit."""
-        client_order_id = ensure_client_order_id(payload)
 
         def _send() -> Any:
             from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
@@ -294,17 +287,13 @@ class AlpacaBroker:
                 time_in_force=tif,
                 limit_price=float(payload["limit_price"]),
                 position_intent=intent_map[payload["position_intent"]],
-                client_order_id=client_order_id,
+                client_order_id=str(payload["client_order_id"]),
             )
             return self._trading.submit_order(req)
 
-        return self._post_once(payload, client_order_id, _send)
+        return self._post_once(payload, _send)
 
     def _ensure_submit_memory(self) -> None:
-        if not hasattr(self, "_unconfirmed_submits"):
-            self._unconfirmed_submits = set()
-        if not hasattr(self, "_landed_submits"):
-            self._landed_submits = {}
         if not hasattr(self, "_attempted_ids"):
             self._attempted_ids = {}
         if not hasattr(self, "_submit_state_path"):
@@ -314,86 +303,45 @@ class AlpacaBroker:
             self._load_submit_state()
 
     def _remember_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
-        """Keep the id that was actually POSTed, even if the limit later moves."""
-        self._unconfirmed_submits.add(client_order_id)
+        """Persist the id before POST so a crash can still look it up."""
         self._attempted_ids[order_attempt_key(payload)] = client_order_id
         self._persist_submit_state()
 
-    def _forget_attempt(
-        self,
-        payload: dict[str, Any],
-        client_order_id: str,
-        *,
-        persist: bool = True,
-    ) -> None:
+    def _forget_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
+        """Drop a resolved attempt so a later identical order starts fresh."""
         identity = order_attempt_key(payload)
         if self._attempted_ids.get(identity) == client_order_id:
             self._attempted_ids.pop(identity, None)
-        self._unconfirmed_submits.discard(client_order_id)
-        if persist:
-            self._persist_submit_state()
+        self._persist_submit_state()
 
-    def _ids_to_resolve_before_post(self, payload: dict[str, Any], client_order_id: str) -> list[str]:
-        """Earlier ids that must be looked up before this payload is posted."""
-        ids: list[str] = []
-        prior = self._attempted_ids.get(order_attempt_key(payload))
-        if prior:
-            ids.append(prior)
-        if client_order_id in self._unconfirmed_submits and client_order_id not in ids:
-            ids.append(client_order_id)
-        return ids
+    def _saved_attempt(self, payload: dict[str, Any]) -> Optional[str]:
+        return self._attempted_ids.get(order_attempt_key(payload))
 
-    def _post_once(
-        self,
-        payload: dict[str, Any],
-        client_order_id: str,
-        send: Any,
-    ) -> Optional[str]:
-        """Submit at most once. An ambiguous POST is never posted again blindly.
+    def _post_once(self, payload: dict[str, Any], send: Any) -> Optional[str]:
+        """One POST per new attempt. An open attempt is looked up first.
 
-        The next call looks up the earlier ``client_order_id`` before
-        ``submit_order``. A 404 on that lookup is the only path to one new
-        POST. HTTP 429, 5xx, and timeouts stay unresolved until that lookup
-        answers, including after a restart.
+        The id is written to disk before ``submit_order``. HTTP 429, 5xx, and
+        timeouts leave that id in place. The next poll, including a restarted
+        child, looks it up and does not post a second live order. A 404 or a
+        terminal non-fill (expired, canceled, rejected) retires it and allows
+        exactly one new attempt, with a new nonce. A clean accept is retired
+        too, so a later identical order is not handed the old fill.
         """
         self._ensure_submit_memory()
-        label = _order_label(payload)
-        with symbol_hint(label):
-            landed = self._landed_submits.get(client_order_id)
-            if landed:
-                return landed
-            # A hard reject must not drop the earlier attempt. The guard
-            # clears it in memory only when the lookup says it is gone, so
-            # this call can POST; if that POST does not land, restore it.
-            prior_attempts = dict(self._attempted_ids)
-            prior_unconfirmed = set(self._unconfirmed_submits)
-            for cid in self._ids_to_resolve_before_post(payload, client_order_id):
-                found = self._reconcile_client_order(cid)
-                if found is _UNKNOWN:
-                    raise SubmitUnconfirmed(
-                        f"order {cid} is still unconfirmed; not resubmitting"
-                    )
-                if found is _NOT_FOUND:
-                    # Confirmed absent (or terminal). A new POST below is the
-                    # first live order, not a second one. Leave the file in
-                    # place until that POST finishes so a crash here retries
-                    # the lookup instead of posting blind.
-                    self._forget_attempt(payload, cid, persist=False)
-                    continue
-                self._landed_submits[cid] = str(found)
-                self._forget_attempt(payload, cid)
-                log.warning(
-                    "reconciled client_order_id=%s as order %s; not resubmitting",
-                    cid,
-                    found,
-                )
-                return str(found)
+        with symbol_hint(_order_label(payload)):
+            saved = self._saved_attempt(payload)
+            if saved:
+                held = self._hold_or_release(payload, saved)
+                if held is not _RELEASE:
+                    return held
+            client_order_id = mint_client_order_id(payload)
+            self._remember_attempt(payload, client_order_id)
             try:
                 order = send()
             except Exception as exc:
                 if not _ambiguous_submit(exc):
-                    self._attempted_ids = prior_attempts
-                    self._unconfirmed_submits = prior_unconfirmed
+                    # Validation reject: the id was not accepted. Retire it.
+                    self._forget_attempt(payload, client_order_id)
                     raise
                 log.warning(
                     "order submit ambiguous (%s) client_order_id=%s; "
@@ -401,29 +349,54 @@ class AlpacaBroker:
                     type(exc).__name__,
                     client_order_id,
                 )
-                # Keep the id across the 404. The order can become visible
-                # on the next poll, and that poll must look it up first.
-                self._remember_attempt(payload, client_order_id)
                 found = self._reconcile_client_order(client_order_id)
-                if found is _UNKNOWN:
+                if found is _UNKNOWN or found is _NOT_FOUND or _hit_kind(found) == "terminal":
+                    # Keep the saved id. This call does not POST again.
+                    # The next poll looks it up; 404 or terminal starts one new attempt.
                     raise SubmitUnconfirmed(
-                        f"order {client_order_id} timed out and lookup failed; not resubmitting"
+                        f"order {client_order_id} is still unconfirmed; not resubmitting"
                     ) from exc
-                if found is _NOT_FOUND:
-                    raise
-                self._landed_submits[client_order_id] = str(found)
-                self._forget_attempt(payload, client_order_id)
+                if _hit_kind(found) == "filled":
+                    self._forget_attempt(payload, client_order_id)
                 log.warning(
                     "reconciled client_order_id=%s as order %s after ambiguous submit",
                     client_order_id,
-                    found,
+                    found.order_id,
                 )
-                return str(found)
+                return found.order_id
+            # The caller has the broker id. Drop the attempt so the next
+            # identical payload is a new order, not this one.
             self._forget_attempt(payload, client_order_id)
-            oid = _order_id(order)
-            if oid:
-                self._landed_submits[client_order_id] = oid
-            return oid
+            return _order_id(order)
+
+    def _hold_or_release(self, payload: dict[str, Any], client_order_id: str) -> Any:
+        """Lookup result for an open attempt.
+
+        Returns an order id to hand back, or ``_RELEASE`` when this call may
+        start one new attempt.
+        """
+        found = self._reconcile_client_order(client_order_id)
+        if found is _UNKNOWN:
+            raise SubmitUnconfirmed(
+                f"order {client_order_id} is still unconfirmed; not resubmitting"
+            )
+        if found is _NOT_FOUND or _hit_kind(found) == "terminal":
+            self._forget_attempt(payload, client_order_id)
+            return _RELEASE
+        if _hit_kind(found) == "filled":
+            self._forget_attempt(payload, client_order_id)
+            log.warning(
+                "reconciled client_order_id=%s as filled order %s",
+                client_order_id,
+                found.order_id,
+            )
+            return found.order_id
+        log.warning(
+            "reconciled client_order_id=%s as order %s; not resubmitting",
+            client_order_id,
+            found.order_id,
+        )
+        return found.order_id
 
     def _load_submit_state(self) -> None:
         path = getattr(self, "_submit_state_path", None)
@@ -441,7 +414,6 @@ class AlpacaBroker:
             if not key or not cid:
                 continue
             self._attempted_ids[str(key)] = str(cid)
-            self._unconfirmed_submits.add(str(cid))
 
     def _persist_submit_state(self) -> None:
         path = getattr(self, "_submit_state_path", None)
@@ -457,7 +429,7 @@ class AlpacaBroker:
         tmp.replace(dest)
 
     def _reconcile_client_order(self, client_order_id: str) -> Any:
-        """Broker order id, ``_NOT_FOUND``, or ``_UNKNOWN`` (do not POST)."""
+        """``_OrderHit``, ``_NOT_FOUND``, or ``_UNKNOWN`` (do not POST)."""
         try:
             order = self._trading.get_order_by_client_id(client_order_id)
         except Exception as exc:
@@ -470,18 +442,19 @@ class AlpacaBroker:
                 type(exc).__name__,
             )
             return _UNKNOWN
-        if order is None or not _order_blocks_resubmit(order):
-            if order is not None:
-                log.warning(
-                    "client_order_id=%s status=%s is not live",
-                    client_order_id,
-                    _order_status_name(order),
-                )
+        if order is None:
             return _NOT_FOUND
         oid = _order_id(order)
         if not oid:
             return _UNKNOWN
-        return oid
+        kind = _classify_order(order)
+        if kind == "terminal":
+            log.warning(
+                "client_order_id=%s status=%s is not live",
+                client_order_id,
+                _order_status_name(order),
+            )
+        return _OrderHit(kind, oid)
 
 
 class AlpacaMarketData:
@@ -906,9 +879,24 @@ def _submit_state_path(cfg: Optional[dict[str, Any]]) -> Optional[Path]:
     return var_dir(cfg) / "mleg_submit_attempts.json"
 
 
-# A terminal order is not a second live order. The next poll may submit
-# a replacement. Anything else (including an unknown status) blocks a POST.
-_DEAD_ORDER_STATUSES = frozenset(
+# Working orders block a second POST. A fill is this attempt's result.
+# Terminal non-fills may be replaced by exactly one new attempt.
+_LIVE_ORDER_STATUSES = frozenset(
+    {
+        "new",
+        "accepted",
+        "pending",
+        "pending_new",
+        "pending_cancel",
+        "pending_replace",
+        "partially_filled",
+        "accepted_for_bidding",
+        "calculated",
+        "held",
+        "stopped",
+    }
+)
+_TERMINAL_ORDER_STATUSES = frozenset(
     {
         "canceled",
         "cancelled",
@@ -932,11 +920,31 @@ def _order_status_name(order: Any) -> str:
     return text
 
 
-def _order_blocks_resubmit(order: Any) -> bool:
+def _classify_order(order: Any) -> str:
+    """``live``, ``filled``, or ``terminal``.
+
+    An unknown status is treated as live so we do not post a second order.
+    """
     status = _order_status_name(order)
-    if not status:
-        return True
-    return status not in _DEAD_ORDER_STATUSES
+    if status == "filled":
+        return "filled"
+    if status in _TERMINAL_ORDER_STATUSES:
+        return "terminal"
+    if status in _LIVE_ORDER_STATUSES or not status:
+        return "live"
+    return "live"
+
+
+class _OrderHit:
+    """A client_order_id lookup that found an order."""
+
+    def __init__(self, kind: str, order_id: str) -> None:
+        self.kind = kind
+        self.order_id = order_id
+
+
+def _hit_kind(found: Any) -> Optional[str]:
+    return getattr(found, "kind", None)
 
 
 class _Lookup:
@@ -951,6 +959,8 @@ class _Lookup:
 
 _NOT_FOUND = _Lookup("NOT_FOUND")
 _UNKNOWN = _Lookup("UNKNOWN")
+# The saved attempt is gone or terminal. The caller may POST one new id.
+_RELEASE = _Lookup("RELEASE")
 
 
 def _order_id(order: Any) -> Optional[str]:

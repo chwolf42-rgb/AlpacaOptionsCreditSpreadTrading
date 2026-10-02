@@ -169,11 +169,17 @@ heartbeat:
 # or after the data limiter grants a page stalls the heartbeat.
 # One read, retries included, must stay under heartbeat.stale_after_seconds_rth
 # (90). 3 * 15s + 0.5s + 1.0s = 46.5s, and read_budget_seconds caps it at 50.
+# config/paper-live.yaml is not in this repo. Copy this http: block there to
+# override; leave every other live value alone.
 http:
-  timeout_seconds: 15          # connect and read, each
-  read_attempts: 3             # idempotent GET/HEAD only
+  # Connect timeout and read timeout, each, in seconds, on every poll-loop call.
+  timeout_seconds: 15
+  # Idempotent GET/HEAD tries, including the first. POST submits are not retried.
+  read_attempts: 3
+  # Seconds to sleep between read retries, one value per gap, in order.
   read_backoff_seconds: [0.5, 1.0]
-  read_budget_seconds: 50      # submits are not retried and do not use this budget
+  # Cap on one read, retries and backoff included. Submits do not use this budget.
+  read_budget_seconds: 50
 
 rth:
   timezone: America/New_York

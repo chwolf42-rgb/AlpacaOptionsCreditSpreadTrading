@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from typing import Any, Literal
 
 from alpaca_options_credit.errors import AtomicSpreadError
@@ -106,33 +107,50 @@ def order_attempt_key(payload: dict[str, Any]) -> str:
     """Identity of one logical order across polls.
 
     The close debit and the open credit are limits, and the engine rebuilds
-    them from the latest mark. Two polls of the same spread must still share
-    one attempt key so the earlier ``client_order_id`` can be looked up before
-    another POST. The id sent to Alpaca still includes the limit.
+    them from the latest mark. An unresolved attempt is stored under this key
+    so the next poll can look up the ``client_order_id`` that was actually
+    posted. The id itself is not this key: Alpaca never allows an id to be
+    reused, so each new attempt gets its own nonce.
     """
     return hashlib.sha256(
         json.dumps(_order_material(payload, include_limit=False), sort_keys=True, default=str).encode()
     ).hexdigest()
 
 
-def ensure_client_order_id(payload: dict[str, Any]) -> str:
-    """Stable id for one order body so a timed-out POST can be looked up.
+# Alpaca's client_order_id limit. A short nonce plus a body digest stays well under it.
+_CLIENT_ORDER_ID_MAX = 128
 
-    Alpaca rejects a second POST with the same client_order_id. The id is
-    derived from the order itself (not a fresh uuid) so a restarted child
-    reconciles the same submit instead of minting a second one. Max 48 chars.
+
+def mint_client_order_id(payload: dict[str, Any]) -> str:
+    """A new client_order_id for one POST. Never reused.
+
+    Alpaca rejects any id it has seen before, including after the order
+    expires, is canceled, or fills. The nonce is random; the digest only
+    makes the id recognizable. The logical attempt is tracked separately.
     """
-    existing = payload.get("client_order_id")
-    if existing:
-        return str(existing)
     digest = hashlib.sha256(
         json.dumps(
             _order_material(payload, include_limit=True), sort_keys=True, default=str
         ).encode()
     ).hexdigest()[:32]
-    client_order_id = f"oc{digest}"
+    nonce = uuid.uuid4().hex[:12]
+    client_order_id = f"oc{nonce}{digest}"
+    if len(client_order_id) > _CLIENT_ORDER_ID_MAX:
+        client_order_id = client_order_id[:_CLIENT_ORDER_ID_MAX]
     payload["client_order_id"] = client_order_id
     return client_order_id
+
+
+def ensure_client_order_id(payload: dict[str, Any]) -> str:
+    """Return the payload's id, or mint one.
+
+    A caller that already stamped this attempt keeps that id. A payload with
+    no id gets a fresh nonce; it is not a pure hash of the legs and limit.
+    """
+    existing = payload.get("client_order_id")
+    if existing:
+        return str(existing)
+    return mint_client_order_id(payload)
 
 
 def mleg_order(
