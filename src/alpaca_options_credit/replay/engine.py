@@ -13,8 +13,8 @@ can be scored without the slot race deciding which name got filled.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, Optional, Sequence
 
 from alpaca_options_credit.models import Bar, Side
@@ -22,6 +22,7 @@ from alpaca_options_credit.replay.credit import (
     ExitFill,
     PricedSpread,
     ReplayLimits,
+    earnings_near,
     implied_vol,
     modeled_proposal,
     realized_vol,
@@ -29,6 +30,7 @@ from alpaca_options_credit.replay.credit import (
     spread_mid,
     year_fraction,
 )
+from alpaca_options_credit.replay.oscillators import OscFlags, OscSeries, flags_at
 from alpaca_options_credit.replay.filters import (
     EMA_PERIOD,
     RS_LOOKBACK,
@@ -78,6 +80,16 @@ class EntryFeatures:
     ema_daily_ok: bool
     ema_4h_ok: bool
     volume_ok: bool
+    symbol: str = ""
+    iv_pct: Optional[float] = None
+    rv20: Optional[float] = None
+    rv60: Optional[float] = None
+    iv: Optional[float] = None
+    vix: Optional[float] = None
+    vix_pct: Optional[float] = None
+    spy_rv20: Optional[float] = None
+    earnings_soon: bool = False
+    osc: OscFlags = field(default_factory=OscFlags)
 
 
 @dataclass
@@ -165,6 +177,8 @@ def replay_symbol(
     limits: ReplayLimits,
     structure: StructureParams,
     limits_by_variant: Optional[dict[str, ReplayLimits]] = None,
+    regime_by_symbol: Optional[dict] = None,
+    earnings_by_symbol: Optional[dict] = None,
 ) -> tuple[list[ReplayTrade], dict[str, VariantDiag]]:
     """Walk one name. Returns every filled spread (all dates) plus diagnostics.
 
@@ -180,6 +194,8 @@ def replay_symbol(
     trades: list[ReplayTrade] = []
     cache: dict = {}
     price_cache: dict = {}
+    hourly_osc = OscSeries.from_closes([bar.close for bar in timing])
+    daily_osc = OscSeries.from_closes([bar.close for bar in daily])
 
     def limits_for(name: str) -> ReplayLimits:
         if limits_by_variant and name in limits_by_variant:
@@ -221,6 +237,11 @@ def replay_symbol(
             end,
             spy_by_date,
         )
+        asof = as_et(completed[-1].ts).date()
+        entry_day = as_et(end).date()
+        snap = None
+        if regime_by_symbol is not None:
+            snap = (regime_by_symbol.get(symbol) or {}).get(asof)
 
         for slot in slots:
             if slot.busy_until is not None and bar.ts >= slot.busy_until:
@@ -232,13 +253,24 @@ def replay_symbol(
             if not ready or view.side is None or view.invalidation is None:
                 continue
             slot.diag.ready += 1
-            features_base = _features_for_side(shared, view.side)
+            features_base = _features_for_side(
+                shared,
+                view.side,
+                symbol=symbol,
+                snap=snap,
+                osc=flags_at(hourly_osc, daily_osc, i, d_ptr - 1, view.side),
+            )
+            slot_limits = limits_for(slot.name)
+            if slot_limits.earnings_blackout_days > 0 and _earnings_soon(
+                earnings_by_symbol, symbol, entry_day, slot_limits.earnings_blackout_days
+            ):
+                slot.diag.filter_reject += 1
+                continue
             # Strike-dependent HVN is filled after the credit model, because
             # the short is chosen by the same gate the live bot uses.
             if not _allow_before_strike(slot, features_base):
                 slot.diag.filter_reject += 1
                 continue
-            slot_limits = limits_for(slot.name)
             price_key = (
                 view.side,
                 round(float(view.invalidation), 4),
@@ -254,10 +286,8 @@ def replay_symbol(
             if priced is None or priced.proposal.skip:
                 slot.diag.credit_skip += 1
                 continue
-            features = EntryFeatures(
-                side=features_base.side,
-                session_ok=features_base.session_ok,
-                rs_ok=features_base.rs_ok,
+            features = replace(
+                features_base,
                 two_hvn_ok=two_hvn_allows(
                     completed[-structure.vp_lookback :],
                     priced.proposal.short.strike,
@@ -265,11 +295,16 @@ def replay_symbol(
                     bin_size=structure.vp_bin,
                     percentile=structure.vp_percentile,
                 ),
-                ema_daily_ok=features_base.ema_daily_ok,
-                ema_4h_ok=features_base.ema_4h_ok,
-                volume_ok=features_base.volume_ok,
             )
             if not slot.allow(features):
+                slot.diag.filter_reject += 1
+                continue
+            if slot_limits.earnings_blackout_days > 0 and _earnings_soon(
+                earnings_by_symbol,
+                symbol,
+                priced.expiration,
+                slot_limits.earnings_blackout_days,
+            ):
                 slot.diag.filter_reject += 1
                 continue
             if daily_close_through_invalidation(
@@ -311,6 +346,8 @@ def replay_universe(
     structure: StructureParams,
     spy_symbol: str = "SPY",
     limits_by_variant: Optional[dict[str, ReplayLimits]] = None,
+    regime_by_symbol: Optional[dict] = None,
+    earnings_by_symbol: Optional[dict] = None,
 ) -> tuple[dict[str, list[ReplayTrade]], dict[str, VariantDiag]]:
     spy_daily = bars_by_symbol.get(spy_symbol, {}).get("1d") or []
     grouped: dict[str, list[ReplayTrade]] = {name: [] for name in variants}
@@ -330,6 +367,8 @@ def replay_universe(
             limits=limits,
             structure=structure,
             limits_by_variant=limits_by_variant,
+            regime_by_symbol=regime_by_symbol,
+            earnings_by_symbol=earnings_by_symbol,
         )
         for trade in trades:
             grouped[trade.variant].append(trade)
@@ -388,7 +427,14 @@ def _spy_return(completed: Sequence[Bar], spy_by_date: dict, lookback: int) -> O
     return p1 / p0 - 1.0
 
 
-def _features_for_side(shared: _Shared, side: Side) -> EntryFeatures:
+def _features_for_side(
+    shared: _Shared,
+    side: Side,
+    *,
+    symbol: str = "",
+    snap=None,
+    osc: Optional[OscFlags] = None,
+) -> EntryFeatures:
     return EntryFeatures(
         side=side,
         session_ok=shared.session_ok,
@@ -397,6 +443,15 @@ def _features_for_side(shared: _Shared, side: Side) -> EntryFeatures:
         ema_daily_ok=trend_allows(side, shared.daily_close, shared.daily_ema),
         ema_4h_ok=trend_allows(side, shared.h4_close, shared.h4_ema),
         volume_ok=volume_allows(shared.bar_volume, shared.vol_avg),
+        symbol=symbol,
+        iv_pct=None if snap is None else snap.iv_pct,
+        rv20=None if snap is None else snap.rv20,
+        rv60=None if snap is None else snap.rv60,
+        iv=None if snap is None else snap.iv,
+        vix=None if snap is None else snap.vix,
+        vix_pct=None if snap is None else snap.vix_pct,
+        spy_rv20=None if snap is None else snap.spy_rv20,
+        osc=osc or OscFlags(),
     )
 
 
@@ -404,16 +459,13 @@ def _allow_before_strike(slot: _Variant, features: EntryFeatures) -> bool:
     """Reject on filters that do not need the short strike, without a chain."""
     if slot.name == "two_hvn_at_short":
         return True
-    probe = EntryFeatures(
-        side=features.side,
-        session_ok=features.session_ok,
-        rs_ok=features.rs_ok,
-        two_hvn_ok=True,
-        ema_daily_ok=features.ema_daily_ok,
-        ema_4h_ok=features.ema_4h_ok,
-        volume_ok=features.volume_ok,
-    )
-    return slot.allow(probe)
+    return slot.allow(replace(features, two_hvn_ok=True))
+
+
+def _earnings_soon(earnings_by_symbol, symbol: str, day: date, days: int) -> bool:
+    if not earnings_by_symbol or days <= 0:
+        return False
+    return earnings_near(earnings_by_symbol.get(symbol), day, days)
 
 
 def _advance_arm(slot, structure_bars, timing_bars, completed, cache, kwargs, structure: StructureParams) -> None:
@@ -492,7 +544,18 @@ def _entry_key(limits: ReplayLimits) -> tuple:
         round(limits.max_credit_pct, 6),
         round(limits.min_short_inv_gap, 6),
         limits.target_abs_delta,
+        limits.width_pct,
+        limits.delta_tol,
     )
+
+
+def _filled_credit(natural: float, mid: float, fill_mode: str) -> float:
+    """Credit actually booked. The gate still uses the natural credit."""
+    if fill_mode == "mid":
+        return mid
+    if fill_mode == "nickel":
+        return natural - 0.05
+    return natural
 
 
 def _price(symbol, view, spot, when, completed, limits: ReplayLimits) -> Optional[PricedSpread]:
@@ -523,15 +586,6 @@ def _open_trade(
     daily: Sequence[Bar],
 ) -> Optional[ReplayTrade]:
     proposal = priced.proposal
-    qty = size_contracts(
-        limits.equity,
-        limits.risk_pct,
-        proposal.width,
-        proposal.credit,
-        limits.multiplier,
-    )
-    if qty < 1:
-        return None
     # Full daily tape, revealed only at each session close. The entry-time
     # slice would hide a later structure break.
     daily_by_date = {as_et(bar.ts).date(): bar.close for bar in daily}
@@ -552,11 +606,27 @@ def _open_trade(
         priced.iv,
         right,
     )
+    credit = _filled_credit(proposal.credit, entry_mid, limits.fill_mode)
+    if credit <= 0:
+        return None
+    qty = size_contracts(
+        limits.equity,
+        limits.risk_pct,
+        proposal.width,
+        credit,
+        limits.multiplier,
+    )
+    if qty < 1:
+        return None
+    if view.side is Side.BULLISH:
+        shelf = None if view.zone_low is None else float(view.zone_low)
+    else:
+        shelf = None if view.zone_high is None else float(view.zone_high)
     fill: ExitFill = simulate_exit(
         side=view.side,
         short_k=proposal.short.strike,
         long_k=proposal.long.strike,
-        credit=proposal.credit,
+        credit=credit,
         iv=priced.iv,
         expiration=priced.expiration,
         invalidation=float(view.invalidation),
@@ -565,9 +635,10 @@ def _open_trade(
         bar_end_fn=lambda bar: bar_end(bar, minutes),
         daily_close_at=_daily_close_at,
         limits=limits,
+        shelf=shelf,
     )
-    pnl = (proposal.credit - fill.debit) * qty * limits.multiplier
-    max_loss = (proposal.width - proposal.credit) * qty * limits.multiplier
+    pnl = (credit - fill.debit) * qty * limits.multiplier
+    max_loss = (proposal.width - credit) * qty * limits.multiplier
     return ReplayTrade(
         symbol=symbol,
         side=view.side.value,
@@ -575,7 +646,7 @@ def _open_trade(
         entry_time=bar_end(timing[index], minutes),
         exit_time=fill.when,
         exit_reason=fill.reason,
-        credit=proposal.credit,
+        credit=credit,
         debit=fill.debit,
         width=proposal.width,
         qty=qty,

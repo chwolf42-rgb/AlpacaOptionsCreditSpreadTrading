@@ -99,6 +99,31 @@ class ReplayLimits:
     # When set, the short is the listed strike beyond the gap whose |delta|
     # is closest to this value. None keeps the nearest-strike rule.
     target_abs_delta: Optional[float] = None
+    # If set, reject the delta short when the closest listed strike beyond
+    # the anchor is closer to the money than target + this tolerance.
+    # A strike further out than the target is kept: the shelf won, and the
+    # short is still protected. None keeps the closest strike either way.
+    delta_tol: Optional[float] = None
+    # Close when calendar days to expiration are at or under this. None
+    # holds to the other exits. 21 is the managed-premium rule.
+    close_dte: Optional[int] = None
+    # invalidation: daily close through the structure level.
+    # short: daily close through the short strike.
+    # shelf: daily close through the shelf passed to simulate_exit.
+    # none: no underlying-close stop.
+    spot_stop: str = "invalidation"
+    # natural: short bid − long ask in, short ask − long bid out.
+    # mid: both sides at the model mid (no bid/ask).
+    # nickel: natural, then another $0.05 worse on the credit and on
+    # any debit that is not the formula take-profit fill. The take-profit
+    # fill also pays that extra nickel.
+    fill_mode: str = "natural"
+    # When set, the width is this fraction of spot, snapped to the listed
+    # strike step, at least one step. None uses ``width``.
+    width_pct: Optional[float] = None
+    # 0 disables. Skip a new open when earnings fall within this many
+    # calendar days of the entry or the expiration.
+    earnings_blackout_days: int = 0
     multiplier: int = 100
     equity: float = 100_000.0
     risk_pct: float = 0.005
@@ -246,6 +271,30 @@ def year_fraction(when: datetime, expiration: date) -> float:
     return secs / (365.25 * 24.0 * 3600.0)
 
 
+def resolved_width(symbol: str, spot: float, limits: ReplayLimits) -> float:
+    """Dollar width. ``width_pct`` snaps to the listed strike step."""
+    pct = limits.width_pct
+    if pct is None or pct <= 0:
+        return float(limits.width)
+    step = strike_increment(symbol, spot)
+    if step <= 0 or spot <= 0:
+        return float(limits.width)
+    steps = max(1, int(round((spot * float(pct)) / step)))
+    return round(steps * step, 2)
+
+
+def calendar_dte(when: datetime, expiration: date) -> int:
+    return (expiration - as_et(when).date()).days
+
+
+def earnings_near(dates: Optional[Sequence[date]], day: date, days: int) -> bool:
+    """True when any event falls within ``days`` calendar days of ``day``."""
+    if days <= 0 or not dates:
+        return False
+    window = {day + timedelta(days=offset) for offset in range(-days, days + 1)}
+    return any(item in window for item in dates)
+
+
 def strike_increment(symbol: str, spot: float) -> float:
     """Listed-strike step. ETFs stay on $1; stocks widen with price."""
     if symbol.upper() in ETF_ONE_POINT:
@@ -367,6 +416,7 @@ def modeled_proposal(
     if t_years <= 0:
         return None
     step = strike_increment(symbol, spot)
+    width = resolved_width(symbol, spot, limits)
     right = "put" if side is Side.BULLISH else "call"
     if limits.target_abs_delta is not None:
         chosen = _strike_for_delta(
@@ -381,11 +431,11 @@ def modeled_proposal(
         )
         strikes = []
         if chosen is not None:
-            long_k = chosen - limits.width if right == "put" else chosen + limits.width
+            long_k = chosen - width if right == "put" else chosen + width
             strikes = [chosen, round(long_k, 2)]
     else:
-        lo = invalidation - limits.width * 3
-        hi = invalidation + limits.width * 3
+        lo = invalidation - width * 3
+        hi = invalidation + width * 3
         strikes = strike_grid(max(step, lo), hi, step)
     quotes: list[ContractQuote] = []
     for strike in strikes:
@@ -406,7 +456,7 @@ def modeled_proposal(
         side=side,
         invalidation=invalidation,
         chain=quotes,
-        width=limits.width,
+        width=width,
         min_credit_pct=limits.min_credit_pct,
         today=today,
         dte_min=limits.dte_min,
@@ -463,6 +513,13 @@ def _strike_for_delta(
         if best_key is None or key < best_key:
             best_key = key
             best = strike
+    if best is None:
+        return None
+    if limits.delta_tol is not None:
+        got = abs(bs_delta(spot, best, t_years, iv, right))
+        # Too close to the money. Further out than the target is allowed.
+        if got > float(target) + float(limits.delta_tol) + 1e-9:
+            return None
     return best
 
 
@@ -480,6 +537,7 @@ def simulate_exit(
     bar_end_fn,
     daily_close_at,
     limits: ReplayLimits,
+    shelf: Optional[float] = None,
 ) -> ExitFill:
     """Walk bars after the fill. Stop is tested before take-profit on each bar.
 
@@ -509,6 +567,8 @@ def simulate_exit(
             invalidation=invalidation,
             daily_close=daily_close_at(when),
             limits=limits,
+            expiration=expiration,
+            shelf=shelf,
         )
         if fill is not None:
             return fill
@@ -527,7 +587,7 @@ def simulate_exit(
         debit = (
             intrinsic_spread(anchor.close, short_k, long_k, right)
             if t_years <= 0
-            else natural_debit(anchor.close, short_k, long_k, t_years, iv, right)
+            else _terminal_debit(anchor.close, short_k, long_k, t_years, iv, right, limits)
         )
         return ExitFill("open_mtm", debit, when)
 
@@ -535,9 +595,18 @@ def simulate_exit(
     debit = (
         intrinsic_spread(last_spot, short_k, long_k, right)
         if t_end <= 0
-        else natural_debit(last_spot, short_k, long_k, t_end, iv, right)
+        else _terminal_debit(last_spot, short_k, long_k, t_end, iv, right, limits)
     )
     return ExitFill("open_mtm", debit, last_when)
+
+
+def _terminal_debit(spot, short_k, long_k, t_years, iv, right, limits: ReplayLimits) -> float:
+    natural = natural_debit(spot, short_k, long_k, t_years, iv, right)
+    if limits.fill_mode == "mid":
+        return max(0.0, spread_mid(spot, short_k, long_k, t_years, iv, right))
+    if limits.fill_mode == "nickel":
+        return natural + 0.05
+    return natural
 
 
 def _exit_on_bar(
@@ -554,6 +623,8 @@ def _exit_on_bar(
     invalidation: float,
     daily_close: Optional[float],
     limits: ReplayLimits,
+    expiration: date,
+    shelf: Optional[float],
 ) -> Optional[ExitFill]:
     adverse = bar.low if side is Side.BULLISH else bar.high
     favorable = bar.high if side is Side.BULLISH else bar.low
@@ -567,6 +638,18 @@ def _exit_on_bar(
     check = limits.stop_check
     if check not in {"intrabar", "close", "none"}:
         raise ValueError(f"unknown stop_check {check!r}")
+    if limits.fill_mode not in {"natural", "mid", "nickel"}:
+        raise ValueError(f"unknown fill_mode {limits.fill_mode!r}")
+    if limits.spot_stop not in {"invalidation", "short", "shelf", "none"}:
+        raise ValueError(f"unknown spot_stop {limits.spot_stop!r}")
+
+    def _priced(natural_fill: float, mid_fill: float) -> float:
+        """Exit debit under the fill assumption. Natural is unchanged."""
+        if limits.fill_mode == "mid":
+            return max(0.0, mid_fill)
+        if limits.fill_mode == "nickel":
+            return natural_fill + 0.05
+        return natural_fill
 
     open_mid = mid_at(bar.open)
     adverse_mid = mid_at(adverse)
@@ -591,25 +674,77 @@ def _exit_on_bar(
     if check == "intrabar":
         # Gap through the stop on the open: fill at the open, not at the multiple.
         if stop_hit(credit, open_mid, limits.stop_mult):
-            return _stop(open_nat)
+            return _stop(_priced(open_nat, open_mid))
         if stop_hit(credit, adverse_mid, limits.stop_mult):
             slip = max(0.0, adverse_nat - adverse_mid)
             # Poll-level stop plus the spread, capped by the bar's worst debit.
             filled = min(adverse_nat, limits.stop_mult * credit + slip)
-            return _stop(filled)
+            return _stop(_priced(filled, min(adverse_mid, limits.stop_mult * credit)))
     elif check == "close" and stop_hit(credit, close_mid_, limits.stop_mult):
         slip = max(0.0, close_nat - close_mid_)
         filled = min(close_nat, limits.stop_mult * credit + slip)
-        return _stop(filled)
+        return _stop(_priced(filled, min(close_mid_, limits.stop_mult * credit)))
+
+    level, level_reason = _spot_stop_level(
+        limits.spot_stop, short_k, invalidation, shelf
+    )
+    # A close through the short or the shelf is a stop, so it beats take-profit
+    # on the same bar. The legacy invalidation break stays after take-profit,
+    # which is the PR #10 order.
+    if (
+        level_reason == "underlying_stop"
+        and level is not None
+        and daily_close is not None
+        and _structure_broken(side, level, daily_close)
+    ):
+        return ExitFill(
+            level_reason,
+            _priced(debit_at(daily_close), mid_at(daily_close)),
+            when,
+        )
 
     if take_profit_hit(credit, mid_at(favorable), limits.tp_frac):
         # Capturing tp_frac of the credit leaves a debit of the rest.
         # At the default 50% the debit is half the credit.
-        return ExitFill("take_profit", (1.0 - limits.tp_frac) * credit, when)
+        tp_debit = (1.0 - limits.tp_frac) * credit
+        if limits.fill_mode == "nickel":
+            tp_debit += 0.05
+        return ExitFill("take_profit", tp_debit, when)
 
-    if daily_close is not None and _structure_broken(side, invalidation, daily_close):
-        return ExitFill("structure_break", debit_at(daily_close), when)
+    if (
+        level_reason == "structure_break"
+        and level is not None
+        and daily_close is not None
+        and _structure_broken(side, level, daily_close)
+    ):
+        return ExitFill(
+            level_reason,
+            _priced(debit_at(daily_close), mid_at(daily_close)),
+            when,
+        )
+
+    if limits.close_dte is not None and calendar_dte(when, expiration) <= int(limits.close_dte):
+        return ExitFill(
+            "dte_exit",
+            _priced(close_nat, close_mid_),
+            when,
+        )
     return None
+
+
+def _spot_stop_level(
+    mode: str,
+    short_k: float,
+    invalidation: float,
+    shelf: Optional[float],
+) -> tuple[Optional[float], str]:
+    if mode == "none":
+        return None, ""
+    if mode == "short":
+        return short_k, "underlying_stop"
+    if mode == "shelf":
+        return (shelf if shelf is not None else invalidation), "underlying_stop"
+    return invalidation, "structure_break"
 
 
 def _structure_broken(side: Side, invalidation: float, close: float) -> bool:
@@ -618,3 +753,181 @@ def _structure_broken(side: Side, invalidation: float, close: float) -> bool:
     if side is Side.BEARISH:
         return close > invalidation
     return False
+
+
+def filled_debit(natural_fill: float, mid_fill: float, limits: ReplayLimits) -> float:
+    """Debit paid to close under ``limits.fill_mode``."""
+    if limits.fill_mode == "mid":
+        return max(0.0, mid_fill)
+    if limits.fill_mode == "nickel":
+        return natural_fill + 0.05
+    return natural_fill
+
+
+def simulate_condor_exit(
+    *,
+    put_short: float,
+    put_long: float,
+    call_short: float,
+    call_long: float,
+    credit: float,
+    iv: float,
+    expiration: date,
+    put_level: float,
+    call_level: float,
+    bars: Sequence[Bar],
+    start_index: int,
+    bar_end_fn,
+    daily_close_at,
+    limits: ReplayLimits,
+) -> ExitFill:
+    """Iron condor. The mark is the sum of the two verticals.
+
+    The sum is highest at the wings, so a stop looks at the worse extreme
+    and a take-profit looks at the best spot inside the bar, including the
+    midpoint of the two shorts when that price printed.
+    """
+    last_when: Optional[datetime] = None
+    last_spot: Optional[float] = None
+    for i in range(start_index + 1, len(bars)):
+        bar = bars[i]
+        when = bar_end_fn(bar)
+        last_when = when
+        last_spot = bar.close
+        t_years = year_fraction(when, expiration)
+        fill = _condor_on_bar(
+            bar=bar,
+            when=when,
+            put_short=put_short,
+            put_long=put_long,
+            call_short=call_short,
+            call_long=call_long,
+            credit=credit,
+            iv=iv,
+            t_years=t_years,
+            expiration=expiration,
+            put_level=put_level,
+            call_level=call_level,
+            daily_close=daily_close_at(when),
+            limits=limits,
+        )
+        if fill is not None:
+            return fill
+        if t_years <= 0:
+            return ExitFill(
+                "expiration",
+                _condor_intrinsic(bar.close, put_short, put_long, call_short, call_long),
+                when,
+            )
+    if last_when is None or last_spot is None:
+        anchor = bars[start_index]
+        when = bar_end_fn(anchor)
+        t_years = year_fraction(when, expiration)
+        debit = (
+            _condor_intrinsic(anchor.close, put_short, put_long, call_short, call_long)
+            if t_years <= 0
+            else _condor_terminal(
+                anchor.close, put_short, put_long, call_short, call_long, t_years, iv, limits
+            )
+        )
+        return ExitFill("open_mtm", debit, when)
+    t_end = year_fraction(last_when, expiration)
+    debit = (
+        _condor_intrinsic(last_spot, put_short, put_long, call_short, call_long)
+        if t_end <= 0
+        else _condor_terminal(
+            last_spot, put_short, put_long, call_short, call_long, t_end, iv, limits
+        )
+    )
+    return ExitFill("open_mtm", debit, last_when)
+
+
+def _condor_intrinsic(spot, put_short, put_long, call_short, call_long) -> float:
+    return intrinsic_spread(spot, put_short, put_long, "put") + intrinsic_spread(
+        spot, call_short, call_long, "call"
+    )
+
+
+def _condor_marks(spot, put_short, put_long, call_short, call_long, t_years, iv):
+    put_mid = spread_mid(spot, put_short, put_long, t_years, iv, "put")
+    call_mid = spread_mid(spot, call_short, call_long, t_years, iv, "call")
+    put_nat = natural_debit(spot, put_short, put_long, t_years, iv, "put")
+    call_nat = natural_debit(spot, call_short, call_long, t_years, iv, "call")
+    return put_mid + call_mid, put_nat + call_nat
+
+
+def _condor_terminal(spot, put_short, put_long, call_short, call_long, t_years, iv, limits) -> float:
+    mid, natural = _condor_marks(spot, put_short, put_long, call_short, call_long, t_years, iv)
+    return filled_debit(natural, mid, limits)
+
+
+def _condor_on_bar(
+    *,
+    bar: Bar,
+    when: datetime,
+    put_short: float,
+    put_long: float,
+    call_short: float,
+    call_long: float,
+    credit: float,
+    iv: float,
+    t_years: float,
+    expiration: date,
+    put_level: float,
+    call_level: float,
+    daily_close: Optional[float],
+    limits: ReplayLimits,
+) -> Optional[ExitFill]:
+    center = (put_short + call_short) / 2.0
+    spots = [bar.open, bar.high, bar.low, bar.close]
+    if bar.low <= center <= bar.high:
+        spots.append(center)
+
+    def marks(spot: float) -> tuple[float, float]:
+        return _condor_marks(spot, put_short, put_long, call_short, call_long, t_years, iv)
+
+    priced = [marks(spot) for spot in spots]
+    open_mid, open_nat = marks(bar.open)
+    worst_mid, worst_nat = max(priced, key=lambda item: item[0])
+    best_mid, _best_nat = min(priced, key=lambda item: item[0])
+    close_mid, close_nat = marks(bar.close)
+
+    check = limits.stop_check
+    if check == "intrabar":
+        if stop_hit(credit, open_mid, limits.stop_mult):
+            return ExitFill("stop_credit", filled_debit(open_nat, open_mid, limits), when)
+        if stop_hit(credit, worst_mid, limits.stop_mult):
+            slip = max(0.0, worst_nat - worst_mid)
+            filled = min(worst_nat, limits.stop_mult * credit + slip)
+            return ExitFill(
+                "stop_credit",
+                filled_debit(filled, min(worst_mid, limits.stop_mult * credit), limits),
+                when,
+            )
+    elif check == "close" and stop_hit(credit, close_mid, limits.stop_mult):
+        slip = max(0.0, close_nat - close_mid)
+        filled = min(close_nat, limits.stop_mult * credit + slip)
+        return ExitFill(
+            "stop_credit",
+            filled_debit(filled, min(close_mid, limits.stop_mult * credit), limits),
+            when,
+        )
+
+    if (
+        limits.spot_stop != "none"
+        and daily_close is not None
+        and (daily_close < put_level or daily_close > call_level)
+    ):
+        reason = "structure_break" if limits.spot_stop == "invalidation" else "underlying_stop"
+        spot_mid, spot_nat = marks(daily_close)
+        return ExitFill(reason, filled_debit(spot_nat, spot_mid, limits), when)
+
+    if take_profit_hit(credit, best_mid, limits.tp_frac):
+        tp_debit = (1.0 - limits.tp_frac) * credit
+        if limits.fill_mode == "nickel":
+            tp_debit += 0.05
+        return ExitFill("take_profit", tp_debit, when)
+
+    if limits.close_dte is not None and calendar_dte(when, expiration) <= int(limits.close_dte):
+        return ExitFill("dte_exit", filled_debit(close_nat, close_mid, limits), when)
+    return None
