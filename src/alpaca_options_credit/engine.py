@@ -33,6 +33,7 @@ from alpaca_options_credit.close_prices import (
 )
 from alpaca_options_credit.config import validate_exit_policy, var_dir
 from alpaca_options_credit.heartbeat import Heartbeat, HeartbeatWriter
+from alpaca_options_credit.http_bounds import current_inflight, is_transport_failure, set_inflight_hook
 from alpaca_options_credit.journal import Journal
 from alpaca_options_credit.market_data_limit import (
     PRIORITY_ARMED,
@@ -106,7 +107,9 @@ class Engine:
         self.data = data
         self.dry_run = dry_run or bool(cfg.get("bot", {}).get("dry_run", True))
         self.heartbeat = heartbeat
+        self._beat_status = "starting"
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        set_inflight_hook(self._on_inflight)
         self.loop = 0
         root = cfg.get("_repo_root")
         cal_rel = (cfg.get("calendar") or {}).get("file", "config/calendar.yaml")
@@ -132,9 +135,14 @@ class Engine:
             close_t=parse_hhmm(str(rth.get("close", "16:00")), RTH_CLOSE),
         )
 
+    def _on_inflight(self) -> None:
+        """Refresh the heartbeat at the edges of a blocking HTTP call."""
+        self.beat(self._beat_status or "starting")
+
     def beat(self, status: str, detail: str = "") -> None:
         if not self.heartbeat:
             return
+        snap = current_inflight()
         self.heartbeat.write(
             Heartbeat(
                 ts=self.now_fn().isoformat(),
@@ -143,6 +151,9 @@ class Engine:
                 loop=self.loop,
                 dry_run=self.dry_run,
                 detail=detail,
+                inflight_op=snap.op,
+                inflight_symbol=snap.symbol,
+                inflight_since=snap.since,
             )
         )
 
@@ -150,6 +161,7 @@ class Engine:
         self.loop += 1
         now = self.now_fn()
         rth = self._rth(now)
+        self._beat_status = "rth_scan" if rth else "idle_off_hours"
         proposals: list[SpreadProposal] = []
         exits: list[str] = []
         self._tick_data_pages = 0
@@ -1922,7 +1934,22 @@ class Engine:
     def run_forever(self) -> None:
         loop_cfg = self.cfg.get("loop") or {}
         while True:
-            result = self.tick()
+            try:
+                result = self.tick()
+            except Exception as exc:
+                # A timed-out read must not kill the child. The supervisor
+                # would otherwise see a dead process, and a hang with no
+                # timeout was the stale-heartbeat restart. Strategy errors
+                # still propagate.
+                if not is_transport_failure(exc):
+                    raise
+                log.error(
+                    "poll tick failed (%s) — heartbeat continues",
+                    type(exc).__name__,
+                )
+                status = self._beat_status or "rth_scan"
+                self.beat(status, f"tick_error:{type(exc).__name__}")
+                result = TickResult(status=status, proposals=[], exits=[], arms=[])
             sleep = (
                 float(loop_cfg.get("sleep_seconds_rth", 30))
                 if result.status == "rth_scan"
@@ -1944,6 +1971,24 @@ def _terminal_entry_reason(status: SpreadStatus) -> str:
     if status is SpreadStatus.ENTRY_EXPIRED:
         return "entry_expired"
     return "entry_cancelled"
+
+
+def write_startup_beat(writer: HeartbeatWriter, *, dry_run: bool) -> None:
+    """Heartbeat used until the engine exists and takes over the hook."""
+    snap = current_inflight()
+    writer.write(
+        Heartbeat(
+            ts=datetime.now(timezone.utc).isoformat(),
+            pid=os.getpid(),
+            status="starting",
+            loop=0,
+            dry_run=dry_run,
+            detail="startup",
+            inflight_op=snap.op,
+            inflight_symbol=snap.symbol,
+            inflight_since=snap.since,
+        )
+    )
 
 
 def _held_spreads(spreads: list[OpenSpread]) -> list[OpenSpread]:
@@ -2023,16 +2068,21 @@ def build_engine(
     from alpaca_options_credit.broker.alpaca import AlpacaBroker, AlpacaMarketData
 
     creds = load_credentials(env)
+    # Beat before the first REST call so a slow account/data fetch cannot
+    # look like a missing child. The HTTP wrapper refreshes this while the
+    # call is in flight (blocked_in=get_account / get_stock_bars / ...).
+    write_startup_beat(hb, dry_run=dry_run)
+    set_inflight_hook(lambda: write_startup_beat(hb, dry_run=dry_run))
     data = AlpacaMarketData(creds, cfg)
     if dry_run:
         broker = DryRunBroker(equity=equity)
         # Prefer live account equity when keys exist, still zero orders.
         try:
-            live = AlpacaBroker(creds)
+            live = AlpacaBroker(creds, cfg)
             broker = DryRunBroker(equity=live.account_equity() or equity, account_number=live.account_number())
         except Exception as exc:
             log.warning("live account fetch skipped in observer: %s", type(exc).__name__)
         return Engine(cfg, journal, broker, data, dry_run=True, heartbeat=hb)
 
-    broker = AlpacaBroker(creds)
+    broker = AlpacaBroker(creds, cfg)
     return Engine(cfg, journal, broker, data, dry_run=False, heartbeat=hb)

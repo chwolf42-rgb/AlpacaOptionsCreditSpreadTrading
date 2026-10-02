@@ -13,6 +13,8 @@ We build dicts here so tests do not need alpaca-py; AlpacaBroker maps dict → S
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Literal
 
 from alpaca_options_credit.errors import AtomicSpreadError
@@ -82,6 +84,35 @@ def assert_atomic_mleg(payload: dict[str, Any], *, intent: Literal["open", "clos
     if qty <= 0:
         raise AtomicSpreadError(f"mleg qty must be the live spread size, got {qty!r}")
     return payload
+
+
+def ensure_client_order_id(payload: dict[str, Any]) -> str:
+    """Stable id for one order body so a timed-out POST can be looked up.
+
+    Alpaca rejects a second POST with the same client_order_id. The id is
+    derived from the order itself (not a fresh uuid) so a restarted child
+    reconciles the same submit instead of minting a second one. Max 48 chars.
+    """
+    existing = payload.get("client_order_id")
+    if existing:
+        return str(existing)
+    material = {
+        "order_class": payload.get("order_class"),
+        "qty": payload.get("qty"),
+        "limit_price": payload.get("limit_price"),
+        "time_in_force": payload.get("time_in_force"),
+        "legs": payload.get("legs"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "position_intent": payload.get("position_intent"),
+        "emergency_flatten": payload.get("emergency_flatten"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, default=str).encode()
+    ).hexdigest()[:32]
+    client_order_id = f"oc{digest}"
+    payload["client_order_id"] = client_order_id
+    return client_order_id
 
 
 def mleg_order(

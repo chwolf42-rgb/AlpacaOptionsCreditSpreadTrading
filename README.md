@@ -202,3 +202,14 @@ Coverage includes credential isolation, strike-near-invalidation, credit/width g
 ## Config
 
 See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`), and the **locked options-native exit policy** (`exits.path`, `forbid_equity_oco_bracket`, `never_cancel_working_close`) live there.
+
+Poll-loop HTTP bounds (Alpaca trading and market-data REST):
+
+| Key | Default |
+| --- | --- |
+| `http.timeout_seconds` | 15 (connect and read) |
+| `http.read_attempts` | 3 (GET/HEAD only; order submits are not retried) |
+| `http.read_backoff_seconds` | 0.5, 1.0 |
+| `http.read_budget_seconds` | 50, kept under `heartbeat.stale_after_seconds_rth` (90) |
+
+A timed-out multi-leg submit is looked up by `client_order_id` and not posted again. When the heartbeat is stale, the supervisor logs `blocked_in=<op> for <s>s` from the in-flight call recorded on that beat.

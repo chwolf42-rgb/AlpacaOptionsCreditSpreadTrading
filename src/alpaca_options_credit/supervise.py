@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from alpaca_options_credit.config import var_dir
-from alpaca_options_credit.heartbeat import heartbeat_age_seconds, is_stale
+from alpaca_options_credit.heartbeat import heartbeat_age_seconds, is_stale, read_heartbeat
 from alpaca_options_credit.rth import is_rth
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,47 @@ def stale_timeout(cfg: dict[str, Any], now) -> float:
     if is_rth(now):
         return float(hb.get("stale_after_seconds_rth", 90))
     return float(hb.get("stale_after_seconds_off_hours", 600))
+
+
+def stale_block_detail(heartbeat_path: Path, now=None) -> str:
+    """``blocked_in=<op> for <s>s`` from the last heartbeat the child wrote.
+
+    The child records the in-flight HTTP call before the request blocks, so a
+    stale file still names that call. Missing fields become ``unknown``.
+    """
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    data = read_heartbeat(heartbeat_path) or {}
+    op = str(data.get("inflight_op") or "").strip() or "unknown"
+    symbol = str(data.get("inflight_symbol") or "").strip()
+    label = f"{op}:{symbol}" if symbol else op
+    seconds = int(round(max(0.0, _blocked_seconds(data, heartbeat_path, now))))
+    return f"blocked_in={label} for {seconds}s"
+
+
+def _blocked_seconds(data: dict, heartbeat_path: Path, now) -> float:
+    from datetime import datetime, timezone
+
+    since = str(data.get("inflight_since") or "").strip()
+    if since:
+        try:
+            ts = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (now - ts).total_seconds()
+        except ValueError:
+            pass
+    age = heartbeat_age_seconds(heartbeat_path, now=now)
+    return float(age or 0.0)
+
+
+def log_restart(why: str, pid: int, heartbeat_path: Path, now=None) -> None:
+    if why == "stale_heartbeat":
+        detail = stale_block_detail(heartbeat_path, now=now)
+        log.warning("supervisor restart (%s) pid=%s %s", why, pid, detail)
+        return
+    log.warning("supervisor restart (%s) pid=%s", why, pid)
 
 
 def should_restart_child(
@@ -91,7 +132,7 @@ def supervise_forever(cfg: dict[str, Any], child_args: list[str]) -> int:
             )
             if not restart:
                 continue
-            log.warning("supervisor restart (%s) pid=%s", why, proc.pid)
+            log_restart(why, proc.pid, hb_path)
             if alive:
                 proc.terminate()
                 try:

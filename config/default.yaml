@@ -164,6 +164,17 @@ heartbeat:
   supervise_poll_seconds: 5
   restart_backoff_seconds: [2, 5, 15, 30]
 
+# Poll-loop Alpaca REST (trading + stock/option data). alpaca-py does not
+# set a requests timeout; a hung GET after "market-data scan pass complete"
+# or after the data limiter grants a page stalls the heartbeat.
+# One read, retries included, must stay under heartbeat.stale_after_seconds_rth
+# (90). 3 * 15s + 0.5s + 1.0s = 46.5s, and read_budget_seconds caps it at 50.
+http:
+  timeout_seconds: 15          # connect and read, each
+  read_attempts: 3             # idempotent GET/HEAD only
+  read_backoff_seconds: [0.5, 1.0]
+  read_budget_seconds: 50      # submits are not retried and do not use this budget
+
 rth:
   timezone: America/New_York
   open: "09:30"

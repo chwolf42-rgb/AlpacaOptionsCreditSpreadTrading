@@ -22,6 +22,11 @@ class Heartbeat:
     loop: int = 0
     dry_run: bool = True
     detail: str = ""
+    # Set while a poll-loop HTTP call is in flight. The supervisor reads these
+    # when the beat goes stale so the restart line names the blocked call.
+    inflight_op: str = ""
+    inflight_symbol: str = ""
+    inflight_since: str = ""
 
 
 class HeartbeatWriter:
