@@ -86,6 +86,35 @@ def assert_atomic_mleg(payload: dict[str, Any], *, intent: Literal["open", "clos
     return payload
 
 
+def _order_material(payload: dict[str, Any], *, include_limit: bool) -> dict[str, Any]:
+    material = {
+        "order_class": payload.get("order_class"),
+        "qty": payload.get("qty"),
+        "time_in_force": payload.get("time_in_force"),
+        "legs": payload.get("legs"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "position_intent": payload.get("position_intent"),
+        "emergency_flatten": payload.get("emergency_flatten"),
+    }
+    if include_limit:
+        material["limit_price"] = payload.get("limit_price")
+    return material
+
+
+def order_attempt_key(payload: dict[str, Any]) -> str:
+    """Identity of one logical order across polls.
+
+    The close debit and the open credit are limits, and the engine rebuilds
+    them from the latest mark. Two polls of the same spread must still share
+    one attempt key so the earlier ``client_order_id`` can be looked up before
+    another POST. The id sent to Alpaca still includes the limit.
+    """
+    return hashlib.sha256(
+        json.dumps(_order_material(payload, include_limit=False), sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
 def ensure_client_order_id(payload: dict[str, Any]) -> str:
     """Stable id for one order body so a timed-out POST can be looked up.
 
@@ -96,19 +125,10 @@ def ensure_client_order_id(payload: dict[str, Any]) -> str:
     existing = payload.get("client_order_id")
     if existing:
         return str(existing)
-    material = {
-        "order_class": payload.get("order_class"),
-        "qty": payload.get("qty"),
-        "limit_price": payload.get("limit_price"),
-        "time_in_force": payload.get("time_in_force"),
-        "legs": payload.get("legs"),
-        "symbol": payload.get("symbol"),
-        "side": payload.get("side"),
-        "position_intent": payload.get("position_intent"),
-        "emergency_flatten": payload.get("emergency_flatten"),
-    }
     digest = hashlib.sha256(
-        json.dumps(material, sort_keys=True, default=str).encode()
+        json.dumps(
+            _order_material(payload, include_limit=True), sort_keys=True, default=str
+        ).encode()
     ).hexdigest()[:32]
     client_order_id = f"oc{digest}"
     payload["client_order_id"] = client_order_id

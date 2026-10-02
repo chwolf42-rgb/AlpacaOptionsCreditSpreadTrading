@@ -383,6 +383,108 @@ def test_rejected_mleg_submit_is_not_reconciled_or_retried():
     assert trading.lookups == 0
 
 
+class _HttpStatus(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"http {status}")
+        self.response = SimpleNamespace(status_code=status)
+
+
+class _OrderMissing(Exception):
+    def __init__(self) -> None:
+        super().__init__("order not found")
+        self.response = SimpleNamespace(status_code=404)
+
+
+def _ambiguous_failure(kind: int | str) -> BaseException:
+    if kind == "timeout":
+        return requests.Timeout("submit hung")
+    return _HttpStatus(int(kind))
+
+
+@pytest.mark.parametrize("failure", [429, 500, 503, 504, "timeout"])
+@pytest.mark.parametrize("move_limit", [False, True])
+def test_ambiguous_mleg_is_found_by_client_order_id_on_the_next_poll(failure, move_limit):
+    """The engine rebuilds the payload on the next poll. A moved close debit
+    must not POST again until the earlier client_order_id has been looked up.
+    """
+
+    class _Trading:
+        def __init__(self) -> None:
+            self.submits = 0
+            self.events: list[tuple[str, str]] = []
+
+        def submit_order(self, req):
+            self.events.append(("submit", str(req.client_order_id)))
+            self.submits += 1
+            raise _ambiguous_failure(failure)
+
+        def get_order_by_client_id(self, client_id):
+            self.events.append(("lookup", str(client_id)))
+            lookups = sum(1 for kind, _ in self.events if kind == "lookup")
+            if lookups < 2:
+                raise _OrderMissing()
+            return SimpleNamespace(id="ord-99", client_order_id=client_id, status="new")
+
+    trading = _Trading()
+    broker = _broker(trading)
+    first = _mleg_payload()
+    with pytest.raises((SubmitUnconfirmed, _HttpStatus, requests.Timeout)):
+        broker._submit_mleg(first)
+    assert trading.submits == 1
+    first_id = first["client_order_id"]
+    # Next poll: a new dict, the way the engine rebuilds the close. The debit
+    # moves when the mark moves; the attempt key does not.
+    second = _mleg_payload()
+    if move_limit:
+        second["limit_price"] = "0.55"
+    order_id = broker._submit_mleg(second)
+    assert order_id == "ord-99"
+    assert trading.submits == 1
+    assert [kind for kind, _ in trading.events].count("submit") == 1
+    assert trading.events[-1] == ("lookup", first_id)
+    if move_limit:
+        assert second["client_order_id"] != first_id
+    else:
+        assert second["client_order_id"] == first_id
+
+
+def test_restarted_broker_looks_up_the_ambiguous_submit_before_posting(tmp_path: Path):
+    class _Trading:
+        def __init__(self, *, visible: bool) -> None:
+            self.visible = visible
+            self.submits = 0
+            self.lookups: list[str] = []
+
+        def submit_order(self, req):
+            self.submits += 1
+            raise _HttpStatus(429)
+
+        def get_order_by_client_id(self, client_id):
+            self.lookups.append(str(client_id))
+            if not self.visible:
+                raise _OrderMissing()
+            return SimpleNamespace(id="ord-7", client_order_id=client_id, status="accepted")
+
+    state = tmp_path / "mleg_submit_attempts.json"
+    first_trading = _Trading(visible=False)
+    first = _broker(first_trading)
+    first._submit_state_path = state
+    payload = _mleg_payload()
+    with pytest.raises(_HttpStatus):
+        first._submit_mleg(payload)
+    assert first_trading.submits == 1
+    assert state.is_file()
+
+    second_trading = _Trading(visible=True)
+    second = _broker(second_trading)
+    second._submit_state_path = state
+    rebuilt = _mleg_payload()
+    rebuilt["limit_price"] = "0.40"
+    assert second._submit_mleg(rebuilt) == "ord-7"
+    assert second_trading.submits == 0
+    assert second_trading.lookups == [payload["client_order_id"]]
+
+
 def test_stale_heartbeat_log_names_blocking_op(tmp_path: Path, caplog):
     path = tmp_path / "heartbeat.json"
     since = datetime(2026, 10, 2, 16, 18, 58, tzinfo=UTC)
