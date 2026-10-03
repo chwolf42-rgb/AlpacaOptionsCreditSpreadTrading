@@ -93,9 +93,11 @@ universe:
 
 ## Observe vs supervise vs paper
 
+`pyproject.toml` keeps runtime dependencies as ranges. [`constraints.txt`](constraints.txt) pins the full transitive set from the running Python 3.13.5 paper venv (`alpaca-py==0.44.0`, `pandas==3.0.6`, `numpy==2.5.3`, `websockets==17.1`, and the rest of that freeze) plus the `dev` extra. Install with the constraints file so a fresh venv cannot float.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]' -c constraints.txt
+source .venv/bin/activate
 
 # No keys: synthetic bars, proposed mleg payloads logged, zero orders.
 alpaca-options-credit observe --fixture --once
@@ -192,6 +194,8 @@ Investigated against current **alpaca-py** + Trading API:
 5. When proposals look sane: `alpaca-options-credit supervise` (paper mleg). Keep `bot.dry_run: false` only then.
 
 ## Tests
+
+`pytest` is the `dev` extra, pinned in `constraints.txt` to 9.1.1 (supports Python 3.13). After the install above:
 
 ```bash
 pytest

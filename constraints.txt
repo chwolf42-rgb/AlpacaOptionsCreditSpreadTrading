@@ -1,0 +1,34 @@
+# Locked set for Python 3.13.5.
+# Runtime pins match `pip freeze --exclude-editable` from the running paper venv.
+# pyproject.toml keeps compatible ranges; this file stops a fresh install from floating.
+#
+#   python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]' -c constraints.txt
+
+alpaca-py==0.44.0
+annotated-types==0.8.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+msgpack==1.2.3
+numpy==2.5.3
+pandas==3.0.6
+pydantic==2.13.5
+pydantic_core==2.46.5
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.4
+pytz==2026.4
+PyYAML==6.0.3
+requests==2.34.2
+six==1.17.0
+sseclient-py==1.9.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+websockets==17.1
+
+# Dev extra (not in the paper venv). pytest 9.1.1 supports Python 3.13.
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1
