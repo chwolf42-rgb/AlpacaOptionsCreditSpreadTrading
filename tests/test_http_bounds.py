@@ -321,10 +321,6 @@ def test_timed_out_mleg_submit_reconciles_by_client_order_id_once():
     assert trading.lookups == [payload["client_order_id"]]
     assert trading.request.client_order_id == payload["client_order_id"]
     assert len(trading.request.legs) == 2
-    # The reconciled id is not posted a second time.
-    again = broker._submit_mleg(payload)
-    assert again == "ord-99"
-    assert trading.submits == 1
 
 
 def test_timed_out_mleg_submit_is_not_resent_when_lookup_also_fails():

@@ -126,11 +126,13 @@ class AlpacaBroker:
         self.creds = creds
         self._http = policy_from_config(cfg)
         # order_attempt_key -> client_order_id saved before that attempt's POST.
-        # Only the unresolved attempt is kept. A resolved one is dropped so a
-        # later identical order gets a new nonce instead of an old fill.
+        # Only an unresolved attempt is kept. Handing an id back, including a
+        # live one, drops it so a later identical order is a new nonce.
         self._attempted_ids: dict[str, str] = {}
+        self._attempted_at: dict[str, datetime] = {}
         self._submit_state_path = _submit_state_path(cfg)
         self._submit_state_loaded = False
+        self._submit_state_blocked = False
         self._trading = TradingClient(
             creds.api_key_id,
             creds.api_secret_key,
@@ -145,6 +147,10 @@ class AlpacaBroker:
         if trading_blocked:
             raise PaperOnlyError("account trading_blocked")
         self._account = acct
+        try:
+            self.sweep_submit_attempts()
+        except Exception:
+            log.exception("submit-attempt sweep failed")
 
     def account_equity(self) -> float:
         raw = getattr(self._account, "equity", None) or getattr(self._account, "portfolio_value", 0)
@@ -296,23 +302,50 @@ class AlpacaBroker:
     def _ensure_submit_memory(self) -> None:
         if not hasattr(self, "_attempted_ids"):
             self._attempted_ids = {}
+        if not hasattr(self, "_attempted_at"):
+            self._attempted_at = {}
         if not hasattr(self, "_submit_state_path"):
             self._submit_state_path = None
+        if not hasattr(self, "_submit_state_blocked"):
+            self._submit_state_blocked = False
         if not getattr(self, "_submit_state_loaded", False):
             self._submit_state_loaded = True
             self._load_submit_state()
 
     def _remember_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
-        """Persist the id before POST so a crash can still look it up."""
-        self._attempted_ids[order_attempt_key(payload)] = client_order_id
+        """Persist the id before POST so a crash can still look it up.
+
+        A disk error propagates: the POST must not run if this id was not saved.
+        Rewriting the same id does not refresh ``created_at``.
+        """
+        identity = order_attempt_key(payload)
+        if self._attempted_ids.get(identity) != client_order_id:
+            self._attempted_at[identity] = datetime.now(timezone.utc)
+        self._attempted_ids[identity] = client_order_id
         self._persist_submit_state()
 
     def _forget_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
-        """Drop a resolved attempt so a later identical order starts fresh."""
+        """Drop a resolved attempt so a later identical order starts fresh.
+
+        The save is logged, not raised. A full disk must not kill the poll
+        after the broker already has an answer.
+        """
         identity = order_attempt_key(payload)
         if self._attempted_ids.get(identity) == client_order_id:
             self._attempted_ids.pop(identity, None)
-        self._persist_submit_state()
+            self._attempted_at.pop(identity, None)
+        self._save_submit_state()
+
+    def _drop_attempt_key(self, identity: str) -> None:
+        self._attempted_ids.pop(identity, None)
+        self._attempted_at.pop(identity, None)
+        self._save_submit_state()
+
+    def _save_submit_state(self) -> None:
+        try:
+            self._persist_submit_state()
+        except OSError as exc:
+            log.error("could not save submit-attempt state (%s)", exc)
 
     def _saved_attempt(self, payload: dict[str, Any]) -> Optional[str]:
         return self._attempted_ids.get(order_attempt_key(payload))
@@ -321,11 +354,12 @@ class AlpacaBroker:
         """One POST per new attempt. An open attempt is looked up first.
 
         The id is written to disk before ``submit_order``. HTTP 429, 5xx, and
-        timeouts leave that id in place. The next poll, including a restarted
-        child, looks it up and does not post a second live order. A 404 or a
-        terminal non-fill (expired, canceled, rejected) retires it and allows
-        exactly one new attempt, with a new nonce. A clean accept is retired
-        too, so a later identical order is not handed the old fill.
+        timeouts leave that id in place until lookup answers. The next poll,
+        including a restarted child, looks it up and does not post a second
+        live order while that attempt is open. Returning the id — live, filled,
+        or a terminal partial — retires the attempt, the same as a clean accept,
+        so a later identical order is a new POST. A 404 or a terminal non-fill
+        (expired, canceled, rejected) allows exactly one new attempt.
         """
         self._ensure_submit_memory()
         with symbol_hint(_order_label(payload)):
@@ -356,14 +390,7 @@ class AlpacaBroker:
                     raise SubmitUnconfirmed(
                         f"order {client_order_id} is still unconfirmed; not resubmitting"
                     ) from exc
-                if _hit_kind(found) == "filled":
-                    self._forget_attempt(payload, client_order_id)
-                log.warning(
-                    "reconciled client_order_id=%s as order %s after ambiguous submit",
-                    client_order_id,
-                    found.order_id,
-                )
-                return found.order_id
+                return self._return_found(payload, client_order_id, found)
             # The caller has the broker id. Drop the attempt so the next
             # identical payload is a new order, not this one.
             self._forget_attempt(payload, client_order_id)
@@ -383,50 +410,161 @@ class AlpacaBroker:
         if found is _NOT_FOUND or _hit_kind(found) == "terminal":
             self._forget_attempt(payload, client_order_id)
             return _RELEASE
-        if _hit_kind(found) == "filled":
-            self._forget_attempt(payload, client_order_id)
+        return self._return_found(payload, client_order_id, found)
+
+    def _return_found(self, payload: dict[str, Any], client_order_id: str, found: Any) -> str:
+        """Hand back an order that is already on the book, and retire the attempt.
+
+        A terminal partial is not a full fill and is not a dead order. The
+        engine records the id and reads ``filled_qty`` from the order itself
+        (``classify_close_order``). Reposting the original qty would add size
+        the account already holds, so this returns the existing id and logs
+        the quantity.
+        """
+        kind = _hit_kind(found)
+        if kind == "partial":
+            log.error(
+                "client_order_id=%s order %s is terminal status=%s with filled_qty=%s; "
+                "returning it instead of reposting",
+                client_order_id,
+                found.order_id,
+                found.status,
+                found.filled_qty,
+            )
+        elif kind == "filled":
             log.warning(
                 "reconciled client_order_id=%s as filled order %s",
                 client_order_id,
                 found.order_id,
             )
-            return found.order_id
-        log.warning(
-            "reconciled client_order_id=%s as order %s; not resubmitting",
-            client_order_id,
-            found.order_id,
-        )
-        return found.order_id
+        else:
+            log.warning(
+                "reconciled client_order_id=%s as order %s; not resubmitting",
+                client_order_id,
+                found.order_id,
+            )
+        self._forget_attempt(payload, client_order_id)
+        return str(found.order_id)
 
     def _load_submit_state(self) -> None:
         path = getattr(self, "_submit_state_path", None)
         if path is None or not Path(path).is_file():
             return
+        dest = Path(path)
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            log.error("submit-attempt state unreadable (%s)", type(exc).__name__)
+            raw = dest.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.error("submit-attempt state unreadable (%s)", exc)
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            self._quarantine_submit_state(dest, "invalid JSON")
             return
         attempts = data.get("attempts") if isinstance(data, dict) else None
         if not isinstance(attempts, dict):
+            self._quarantine_submit_state(dest, "attempts is not an object")
             return
-        for key, cid in attempts.items():
-            if not key or not cid:
-                continue
-            self._attempted_ids[str(key)] = str(cid)
+        loaded_ids: dict[str, str] = {}
+        loaded_at: dict[str, datetime] = {}
+        for key, record in attempts.items():
+            if not key:
+                self._quarantine_submit_state(dest, "blank attempt key")
+                return
+            cid, created = _parse_attempt_record(record)
+            if not cid:
+                self._quarantine_submit_state(dest, f"bad attempt record for {key}")
+                return
+            loaded_ids[str(key)] = cid
+            if created is not None:
+                loaded_at[str(key)] = created
+        self._attempted_ids.update(loaded_ids)
+        self._attempted_at.update(loaded_at)
+
+    def _quarantine_submit_state(self, path: Path, reason: str) -> None:
+        """Move a corrupt attempts file aside. Never overwrite those bytes."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+        try:
+            path.replace(dest)
+        except OSError as exc:
+            self._submit_state_blocked = True
+            log.error(
+                "submit-attempt state corrupt (%s) and could not be renamed (%s)",
+                reason,
+                exc,
+            )
+            return
+        self._attempted_ids.clear()
+        self._attempted_at.clear()
+        log.error("submit-attempt state corrupt (%s); renamed to %s", reason, dest.name)
 
     def _persist_submit_state(self) -> None:
+        if getattr(self, "_submit_state_blocked", False):
+            log.error("submit-attempt state not saved; corrupt file could not be moved aside")
+            return
         path = getattr(self, "_submit_state_path", None)
         if path is None:
             return
         dest = Path(path)
+        records: dict[str, dict[str, str]] = {}
+        for key, cid in self._attempted_ids.items():
+            record = {"client_order_id": cid}
+            created = self._attempted_at.get(key)
+            if created is not None:
+                record["created_at"] = _format_created_at(created)
+            records[key] = record
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".tmp")
         tmp.write_text(
-            json.dumps({"attempts": self._attempted_ids}, sort_keys=True),
+            json.dumps({"attempts": records}, sort_keys=True),
             encoding="utf-8",
         )
         tmp.replace(dest)
+
+    def sweep_submit_attempts(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        max_age: Optional[timedelta] = None,
+    ) -> None:
+        """Alert on live or filled orphans. Drop dead attempts and old ones.
+
+        Called at startup and at the start of each poll. A 404 or a terminal
+        order with no fill is dead. Anything older than ``max_age`` is dropped
+        even if it is still live. A record with no ``created_at`` is not aged out.
+        """
+        self._ensure_submit_memory()
+        if not self._attempted_ids:
+            return
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        limit = _ATTEMPT_MAX_AGE if max_age is None else max_age
+        for identity, cid in list(self._attempted_ids.items()):
+            created = self._attempted_at.get(identity)
+            if created is not None and moment - created > limit:
+                log.error(
+                    "dropping submit attempt %s older than %s",
+                    cid,
+                    limit,
+                )
+                self._drop_attempt_key(identity)
+                continue
+            found = self._reconcile_client_order(cid)
+            if found is _UNKNOWN:
+                log.error("submit attempt %s lookup failed; leaving it", cid)
+                continue
+            if found is _NOT_FOUND or _hit_kind(found) == "terminal":
+                log.warning("dropping dead submit attempt %s", cid)
+                self._drop_attempt_key(identity)
+                continue
+            log.warning(
+                "orphan submit attempt %s is %s order %s",
+                cid,
+                _hit_kind(found),
+                found.order_id,
+            )
 
     def _reconcile_client_order(self, client_order_id: str) -> Any:
         """``_OrderHit``, ``_NOT_FOUND``, or ``_UNKNOWN`` (do not POST)."""
@@ -448,13 +586,15 @@ class AlpacaBroker:
         if not oid:
             return _UNKNOWN
         kind = _classify_order(order)
+        status = _order_status_name(order)
+        filled = _filled_qty(order)
         if kind == "terminal":
             log.warning(
                 "client_order_id=%s status=%s is not live",
                 client_order_id,
-                _order_status_name(order),
+                status,
             )
-        return _OrderHit(kind, oid)
+        return _OrderHit(kind, oid, filled, status)
 
 
 class AlpacaMarketData:
@@ -879,8 +1019,10 @@ def _submit_state_path(cfg: Optional[dict[str, Any]]) -> Optional[Path]:
     return var_dir(cfg) / "mleg_submit_attempts.json"
 
 
-# Working orders block a second POST. A fill is this attempt's result.
-# Terminal non-fills may be replaced by exactly one new attempt.
+# Working orders block a second POST while the attempt is still saved.
+# Returning that id retires the attempt. Terminal non-fills may be replaced
+# by exactly one new attempt. Saved attempts older than this are dropped.
+_ATTEMPT_MAX_AGE = timedelta(days=7)
 _LIVE_ORDER_STATUSES = frozenset(
     {
         "new",
@@ -920,14 +1062,29 @@ def _order_status_name(order: Any) -> str:
     return text
 
 
-def _classify_order(order: Any) -> str:
-    """``live``, ``filled``, or ``terminal``.
+def _filled_qty(order: Any) -> int:
+    raw = getattr(order, "filled_qty", None)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
 
-    An unknown status is treated as live so we do not post a second order.
+
+def _classify_order(order: Any) -> str:
+    """``live``, ``filled``, ``partial``, or ``terminal``.
+
+    A terminal status with ``filled_qty > 0`` is ``partial``: the size already
+    traded must be returned, not posted again at the original qty. An unknown
+    status is live so we do not post a second order. ``partially_filled`` stays
+    live while the order is still working.
     """
     status = _order_status_name(order)
     if status == "filled":
         return "filled"
+    if status in _TERMINAL_ORDER_STATUSES and _filled_qty(order) > 0:
+        return "partial"
     if status in _TERMINAL_ORDER_STATUSES:
         return "terminal"
     if status in _LIVE_ORDER_STATUSES or not status:
@@ -935,12 +1092,49 @@ def _classify_order(order: Any) -> str:
     return "live"
 
 
+def _parse_created_at(raw: Any) -> Optional[datetime]:
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        ts = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _format_created_at(ts: datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_attempt_record(record: Any) -> tuple[Optional[str], Optional[datetime]]:
+    """A saved attempt is a client_order_id string, or an object with one.
+
+    Returns ``(None, None)`` when the record is not either of those.
+    """
+    if isinstance(record, str) and record.strip():
+        return record, None
+    if isinstance(record, dict):
+        cid = record.get("client_order_id")
+        if isinstance(cid, str) and cid.strip():
+            return cid, _parse_created_at(record.get("created_at"))
+    return None, None
+
+
 class _OrderHit:
     """A client_order_id lookup that found an order."""
 
-    def __init__(self, kind: str, order_id: str) -> None:
+    def __init__(self, kind: str, order_id: str, filled_qty: int = 0, status: str = "") -> None:
         self.kind = kind
         self.order_id = order_id
+        self.filled_qty = filled_qty
+        self.status = status
 
 
 def _hit_kind(found: Any) -> Optional[str]:

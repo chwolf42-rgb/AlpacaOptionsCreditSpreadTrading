@@ -158,6 +158,12 @@ class Engine:
         )
 
     def tick(self) -> TickResult:
+        sweeper = getattr(self.broker, "sweep_submit_attempts", None)
+        if sweeper is not None:
+            try:
+                sweeper()
+            except Exception:
+                log.exception("submit-attempt sweep failed")
         self.loop += 1
         now = self.now_fn()
         rth = self._rth(now)
