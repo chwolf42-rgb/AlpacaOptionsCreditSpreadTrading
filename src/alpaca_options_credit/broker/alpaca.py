@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from alpaca_options_credit.bar_quality import (
@@ -19,14 +21,15 @@ from alpaca_options_credit.bar_quality import (
 from alpaca_options_credit.broker.payloads import (
     assert_atomic_mleg,
     close_credit_spread_payload,
+    mint_client_order_id,
     open_credit_spread_payload,
+    order_attempt_key,
 )
-from alpaca_options_credit.errors import AtomicSpreadError
 from alpaca_options_credit.credentials import Credentials, assert_expected_account
-from alpaca_options_credit.errors import PaperOnlyError
+from alpaca_options_credit.errors import AtomicSpreadError, PaperOnlyError, SubmitUnconfirmed
+from alpaca_options_credit.http_bounds import bind_rest_client, policy_from_config, symbol_hint
 from alpaca_options_credit.market_data_limit import (
     grant_count,
-    install_market_data_client,
     pages_for_bar_rows,
 )
 from alpaca_options_credit.close_prices import (
@@ -115,18 +118,28 @@ class AlpacaBroker:
 
     dry_run = False
 
-    def __init__(self, creds: Credentials):
+    def __init__(self, creds: Credentials, cfg: Optional[dict[str, Any]] = None):
         if not creds.paper:
             raise PaperOnlyError("AlpacaBroker refuses paper=False")
         from alpaca.trading.client import TradingClient
 
         self.creds = creds
+        self._http = policy_from_config(cfg)
+        # order_attempt_key -> client_order_id saved before that attempt's POST.
+        # Only an unresolved attempt is kept. Handing an id back, including a
+        # live one, drops it so a later identical order is a new nonce.
+        self._attempted_ids: dict[str, str] = {}
+        self._attempted_at: dict[str, datetime] = {}
+        self._submit_state_path = _submit_state_path(cfg)
+        self._submit_state_loaded = False
+        self._submit_state_blocked = False
         self._trading = TradingClient(
             creds.api_key_id,
             creds.api_secret_key,
             paper=True,
             url_override=creds.base_url,
         )
+        bind_rest_client(self._trading, self._http, limit_data=False)
         acct = self._trading.get_account()
         number = getattr(acct, "account_number", None)
         assert_expected_account(number, creds.expected_account_number)
@@ -134,6 +147,10 @@ class AlpacaBroker:
         if trading_blocked:
             raise PaperOnlyError("account trading_blocked")
         self._account = acct
+        try:
+            self.sweep_submit_attempts()
+        except Exception:
+            log.exception("submit-attempt sweep failed")
 
     def account_equity(self) -> float:
         raw = getattr(self._account, "equity", None) or getattr(self._account, "portfolio_value", 0)
@@ -221,58 +238,363 @@ class AlpacaBroker:
         return [str(getattr(o, "id", "")) for o in orders if getattr(o, "id", None)]
 
     def _submit_mleg(self, payload: dict[str, Any]) -> Optional[str]:
-        from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+        """One atomic 2-leg POST. A timeout is reconciled, never posted again."""
 
-        intent_map = {
-            "buy_to_open": PositionIntent.BUY_TO_OPEN,
-            "sell_to_open": PositionIntent.SELL_TO_OPEN,
-            "buy_to_close": PositionIntent.BUY_TO_CLOSE,
-            "sell_to_close": PositionIntent.SELL_TO_CLOSE,
-        }
-        side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
-        tif = TimeInForce.DAY if payload.get("time_in_force", "day") == "day" else TimeInForce.GTC
-        legs = [
-            OptionLegRequest(
-                symbol=leg["symbol"],
-                ratio_qty=float(leg["ratio_qty"]),
-                side=side_map[leg["side"]],
-                position_intent=intent_map[leg["position_intent"]],
+        def _send() -> Any:
+            from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
+            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+
+            intent_map = {
+                "buy_to_open": PositionIntent.BUY_TO_OPEN,
+                "sell_to_open": PositionIntent.SELL_TO_OPEN,
+                "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+                "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+            }
+            side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
+            tif = TimeInForce.DAY if payload.get("time_in_force", "day") == "day" else TimeInForce.GTC
+            legs = [
+                OptionLegRequest(
+                    symbol=leg["symbol"],
+                    ratio_qty=float(leg["ratio_qty"]),
+                    side=side_map[leg["side"]],
+                    position_intent=intent_map[leg["position_intent"]],
+                )
+                for leg in payload["legs"]
+            ]
+            req = LimitOrderRequest(
+                qty=float(payload["qty"]),
+                order_class=OrderClass.MLEG,
+                time_in_force=tif,
+                limit_price=float(payload["limit_price"]),
+                legs=legs,
+                client_order_id=str(payload["client_order_id"]),
             )
-            for leg in payload["legs"]
-        ]
-        req = LimitOrderRequest(
-            qty=float(payload["qty"]),
-            order_class=OrderClass.MLEG,
-            time_in_force=tif,
-            limit_price=float(payload["limit_price"]),
-            legs=legs,
-            client_order_id=payload.get("client_order_id"),
-        )
-        order = self._trading.submit_order(req)
-        return str(getattr(order, "id", "") or "") or None
+            return self._trading.submit_order(req)
+
+        return self._post_once(payload, _send)
 
     def _submit_simple(self, payload: dict[str, Any]) -> Optional[str]:
-        from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest
+        """One residual-leg POST. Same timeout rule: reconcile, do not resubmit."""
 
-        intent_map = {
-            "buy_to_close": PositionIntent.BUY_TO_CLOSE,
-            "sell_to_close": PositionIntent.SELL_TO_CLOSE,
-        }
-        side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
-        tif = TimeInForce.DAY if payload.get("time_in_force", "day") == "day" else TimeInForce.GTC
-        req = LimitOrderRequest(
-            symbol=payload["symbol"],
-            qty=float(payload["qty"]),
-            side=side_map[payload["side"]],
-            time_in_force=tif,
-            limit_price=float(payload["limit_price"]),
-            position_intent=intent_map[payload["position_intent"]],
-            client_order_id=payload.get("client_order_id"),
+        def _send() -> Any:
+            from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
+            from alpaca.trading.requests import LimitOrderRequest
+
+            intent_map = {
+                "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+                "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+            }
+            side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
+            tif = TimeInForce.DAY if payload.get("time_in_force", "day") == "day" else TimeInForce.GTC
+            req = LimitOrderRequest(
+                symbol=payload["symbol"],
+                qty=float(payload["qty"]),
+                side=side_map[payload["side"]],
+                time_in_force=tif,
+                limit_price=float(payload["limit_price"]),
+                position_intent=intent_map[payload["position_intent"]],
+                client_order_id=str(payload["client_order_id"]),
+            )
+            return self._trading.submit_order(req)
+
+        return self._post_once(payload, _send)
+
+    def _ensure_submit_memory(self) -> None:
+        if not hasattr(self, "_attempted_ids"):
+            self._attempted_ids = {}
+        if not hasattr(self, "_attempted_at"):
+            self._attempted_at = {}
+        if not hasattr(self, "_submit_state_path"):
+            self._submit_state_path = None
+        if not hasattr(self, "_submit_state_blocked"):
+            self._submit_state_blocked = False
+        if not getattr(self, "_submit_state_loaded", False):
+            self._submit_state_loaded = True
+            self._load_submit_state()
+
+    def _remember_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
+        """Persist the id before POST so a crash can still look it up.
+
+        A disk error propagates: the POST must not run if this id was not saved.
+        Rewriting the same id does not refresh ``created_at``.
+        """
+        identity = order_attempt_key(payload)
+        if self._attempted_ids.get(identity) != client_order_id:
+            self._attempted_at[identity] = datetime.now(timezone.utc)
+        self._attempted_ids[identity] = client_order_id
+        self._persist_submit_state()
+
+    def _forget_attempt(self, payload: dict[str, Any], client_order_id: str) -> None:
+        """Drop a resolved attempt so a later identical order starts fresh.
+
+        The save is logged, not raised. A full disk must not kill the poll
+        after the broker already has an answer.
+        """
+        identity = order_attempt_key(payload)
+        if self._attempted_ids.get(identity) == client_order_id:
+            self._attempted_ids.pop(identity, None)
+            self._attempted_at.pop(identity, None)
+        self._save_submit_state()
+
+    def _drop_attempt_key(self, identity: str) -> None:
+        self._attempted_ids.pop(identity, None)
+        self._attempted_at.pop(identity, None)
+        self._save_submit_state()
+
+    def _save_submit_state(self) -> None:
+        try:
+            self._persist_submit_state()
+        except OSError as exc:
+            log.error("could not save submit-attempt state (%s)", exc)
+
+    def _saved_attempt(self, payload: dict[str, Any]) -> Optional[str]:
+        return self._attempted_ids.get(order_attempt_key(payload))
+
+    def _post_once(self, payload: dict[str, Any], send: Any) -> Optional[str]:
+        """One POST per new attempt. An open attempt is looked up first.
+
+        The id is written to disk before ``submit_order``. HTTP 429, 5xx, and
+        timeouts leave that id in place until lookup answers. The next poll,
+        including a restarted child, looks it up and does not post a second
+        live order while that attempt is open. Returning the id — live, filled,
+        or a terminal partial — retires the attempt, the same as a clean accept,
+        so a later identical order is a new POST. A 404 or a terminal non-fill
+        (expired, canceled, rejected) allows exactly one new attempt.
+        """
+        self._ensure_submit_memory()
+        with symbol_hint(_order_label(payload)):
+            saved = self._saved_attempt(payload)
+            if saved:
+                held = self._hold_or_release(payload, saved)
+                if held is not _RELEASE:
+                    return held
+            client_order_id = mint_client_order_id(payload)
+            self._remember_attempt(payload, client_order_id)
+            try:
+                order = send()
+            except Exception as exc:
+                if not _ambiguous_submit(exc):
+                    # Validation reject: the id was not accepted. Retire it.
+                    self._forget_attempt(payload, client_order_id)
+                    raise
+                log.warning(
+                    "order submit ambiguous (%s) client_order_id=%s; "
+                    "reconciling by client_order_id, not resubmitting",
+                    type(exc).__name__,
+                    client_order_id,
+                )
+                found = self._reconcile_client_order(client_order_id)
+                if found is _UNKNOWN or found is _NOT_FOUND or _hit_kind(found) == "terminal":
+                    # Keep the saved id. This call does not POST again.
+                    # The next poll looks it up; 404 or terminal starts one new attempt.
+                    raise SubmitUnconfirmed(
+                        f"order {client_order_id} is still unconfirmed; not resubmitting"
+                    ) from exc
+                return self._return_found(payload, client_order_id, found)
+            # The caller has the broker id. Drop the attempt so the next
+            # identical payload is a new order, not this one.
+            self._forget_attempt(payload, client_order_id)
+            return _order_id(order)
+
+    def _hold_or_release(self, payload: dict[str, Any], client_order_id: str) -> Any:
+        """Lookup result for an open attempt.
+
+        Returns an order id to hand back, or ``_RELEASE`` when this call may
+        start one new attempt.
+        """
+        found = self._reconcile_client_order(client_order_id)
+        if found is _UNKNOWN:
+            raise SubmitUnconfirmed(
+                f"order {client_order_id} is still unconfirmed; not resubmitting"
+            )
+        if found is _NOT_FOUND or _hit_kind(found) == "terminal":
+            self._forget_attempt(payload, client_order_id)
+            return _RELEASE
+        return self._return_found(payload, client_order_id, found)
+
+    def _return_found(self, payload: dict[str, Any], client_order_id: str, found: Any) -> str:
+        """Hand back an order that is already on the book, and retire the attempt.
+
+        A terminal partial is not a full fill and is not a dead order. The
+        engine records the id and reads ``filled_qty`` from the order itself
+        (``classify_close_order``). Reposting the original qty would add size
+        the account already holds, so this returns the existing id and logs
+        the quantity.
+        """
+        kind = _hit_kind(found)
+        if kind == "partial":
+            log.error(
+                "client_order_id=%s order %s is terminal status=%s with filled_qty=%s; "
+                "returning it instead of reposting",
+                client_order_id,
+                found.order_id,
+                found.status,
+                found.filled_qty,
+            )
+        elif kind == "filled":
+            log.warning(
+                "reconciled client_order_id=%s as filled order %s",
+                client_order_id,
+                found.order_id,
+            )
+        else:
+            log.warning(
+                "reconciled client_order_id=%s as order %s; not resubmitting",
+                client_order_id,
+                found.order_id,
+            )
+        self._forget_attempt(payload, client_order_id)
+        return str(found.order_id)
+
+    def _load_submit_state(self) -> None:
+        path = getattr(self, "_submit_state_path", None)
+        if path is None or not Path(path).is_file():
+            return
+        dest = Path(path)
+        try:
+            raw = dest.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.error("submit-attempt state unreadable (%s)", exc)
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            self._quarantine_submit_state(dest, "invalid JSON")
+            return
+        attempts = data.get("attempts") if isinstance(data, dict) else None
+        if not isinstance(attempts, dict):
+            self._quarantine_submit_state(dest, "attempts is not an object")
+            return
+        loaded_ids: dict[str, str] = {}
+        loaded_at: dict[str, datetime] = {}
+        for key, record in attempts.items():
+            if not key:
+                self._quarantine_submit_state(dest, "blank attempt key")
+                return
+            cid, created = _parse_attempt_record(record)
+            if not cid:
+                self._quarantine_submit_state(dest, f"bad attempt record for {key}")
+                return
+            loaded_ids[str(key)] = cid
+            if created is not None:
+                loaded_at[str(key)] = created
+        self._attempted_ids.update(loaded_ids)
+        self._attempted_at.update(loaded_at)
+
+    def _quarantine_submit_state(self, path: Path, reason: str) -> None:
+        """Move a corrupt attempts file aside. Never overwrite those bytes."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+        try:
+            path.replace(dest)
+        except OSError as exc:
+            self._submit_state_blocked = True
+            log.error(
+                "submit-attempt state corrupt (%s) and could not be renamed (%s)",
+                reason,
+                exc,
+            )
+            return
+        self._attempted_ids.clear()
+        self._attempted_at.clear()
+        log.error("submit-attempt state corrupt (%s); renamed to %s", reason, dest.name)
+
+    def _persist_submit_state(self) -> None:
+        if getattr(self, "_submit_state_blocked", False):
+            log.error("submit-attempt state not saved; corrupt file could not be moved aside")
+            return
+        path = getattr(self, "_submit_state_path", None)
+        if path is None:
+            return
+        dest = Path(path)
+        records: dict[str, dict[str, str]] = {}
+        for key, cid in self._attempted_ids.items():
+            record = {"client_order_id": cid}
+            created = self._attempted_at.get(key)
+            if created is not None:
+                record["created_at"] = _format_created_at(created)
+            records[key] = record
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"attempts": records}, sort_keys=True),
+            encoding="utf-8",
         )
-        order = self._trading.submit_order(req)
-        return str(getattr(order, "id", "") or "") or None
+        tmp.replace(dest)
+
+    def sweep_submit_attempts(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        max_age: Optional[timedelta] = None,
+    ) -> None:
+        """Alert on live or filled orphans. Drop dead attempts and old ones.
+
+        Called at startup and at the start of each poll. A 404 or a terminal
+        order with no fill is dead. Anything older than ``max_age`` is dropped
+        even if it is still live. A record with no ``created_at`` is not aged out.
+        """
+        self._ensure_submit_memory()
+        if not self._attempted_ids:
+            return
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        limit = _ATTEMPT_MAX_AGE if max_age is None else max_age
+        for identity, cid in list(self._attempted_ids.items()):
+            created = self._attempted_at.get(identity)
+            if created is not None and moment - created > limit:
+                log.error(
+                    "dropping submit attempt %s older than %s",
+                    cid,
+                    limit,
+                )
+                self._drop_attempt_key(identity)
+                continue
+            found = self._reconcile_client_order(cid)
+            if found is _UNKNOWN:
+                log.error("submit attempt %s lookup failed; leaving it", cid)
+                continue
+            if found is _NOT_FOUND or _hit_kind(found) == "terminal":
+                log.warning("dropping dead submit attempt %s", cid)
+                self._drop_attempt_key(identity)
+                continue
+            log.warning(
+                "orphan submit attempt %s is %s order %s",
+                cid,
+                _hit_kind(found),
+                found.order_id,
+            )
+
+    def _reconcile_client_order(self, client_order_id: str) -> Any:
+        """``_OrderHit``, ``_NOT_FOUND``, or ``_UNKNOWN`` (do not POST)."""
+        try:
+            order = self._trading.get_order_by_client_id(client_order_id)
+        except Exception as exc:
+            if _is_not_found(exc):
+                log.warning("client_order_id=%s not found", client_order_id)
+                return _NOT_FOUND
+            log.error(
+                "client_order_id=%s lookup failed (%s); not resubmitting",
+                client_order_id,
+                type(exc).__name__,
+            )
+            return _UNKNOWN
+        if order is None:
+            return _NOT_FOUND
+        oid = _order_id(order)
+        if not oid:
+            return _UNKNOWN
+        kind = _classify_order(order)
+        status = _order_status_name(order)
+        filled = _filled_qty(order)
+        if kind == "terminal":
+            log.warning(
+                "client_order_id=%s status=%s is not live",
+                client_order_id,
+                status,
+            )
+        return _OrderHit(kind, oid, filled, status)
 
 
 class AlpacaMarketData:
@@ -287,20 +609,22 @@ class AlpacaMarketData:
 
         self.creds = creds
         self.cfg = cfg
+        self._http = policy_from_config(cfg)
         self._stock = StockHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
         self._opt_data = OptionHistoricalDataClient(creds.api_key_id, creds.api_secret_key)
         # One process-wide limiter, shared by both data clients. Paginated
-        # pages and SDK retries all go through the session, so each HTTP
-        # response counts once. The trading client is a separate host and
-        # stays unwrapped.
-        install_market_data_client(self._stock)
-        install_market_data_client(self._opt_data)
+        # pages and bounded read retries all go through the session, so each
+        # HTTP response counts once. The trading client is a separate host
+        # and stays outside that limiter. Every client still gets a timeout.
+        bind_rest_client(self._stock, self._http, limit_data=True)
+        bind_rest_client(self._opt_data, self._http, limit_data=True)
         self._trading = TradingClient(
             creds.api_key_id,
             creds.api_secret_key,
             paper=True,
             url_override=creds.base_url,
         )
+        bind_rest_client(self._trading, self._http, limit_data=False)
 
     def bars(self, symbol: str, timeframe: str, limit: int, now: Optional[datetime] = None) -> list[Bar]:
         batch = self.bars_for_symbols([symbol], timeframe, limit, now=now)
@@ -684,6 +1008,203 @@ def _series_for_symbol(result: Any, symbol: str) -> list[Any]:
     if isinstance(raw, list):
         return raw
     return list(raw)
+
+
+def _submit_state_path(cfg: Optional[dict[str, Any]]) -> Optional[Path]:
+    """Where a restarted child reads client_order_ids that may already be live."""
+    if not cfg:
+        return None
+    from alpaca_options_credit.config import var_dir
+
+    return var_dir(cfg) / "mleg_submit_attempts.json"
+
+
+# Working orders block a second POST while the attempt is still saved.
+# Returning that id retires the attempt. Terminal non-fills may be replaced
+# by exactly one new attempt. Saved attempts older than this are dropped.
+_ATTEMPT_MAX_AGE = timedelta(days=7)
+_LIVE_ORDER_STATUSES = frozenset(
+    {
+        "new",
+        "accepted",
+        "pending",
+        "pending_new",
+        "pending_cancel",
+        "pending_replace",
+        "partially_filled",
+        "accepted_for_bidding",
+        "calculated",
+        "held",
+        "stopped",
+    }
+)
+_TERMINAL_ORDER_STATUSES = frozenset(
+    {
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+        "suspended",
+        "done_for_day",
+        "replaced",
+    }
+)
+
+
+def _order_status_name(order: Any) -> str:
+    status = getattr(order, "status", None)
+    if status is None:
+        return ""
+    value = getattr(status, "value", status)
+    text = str(value).strip().lower().replace("-", "_")
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def _filled_qty(order: Any) -> int:
+    raw = getattr(order, "filled_qty", None)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _classify_order(order: Any) -> str:
+    """``live``, ``filled``, ``partial``, or ``terminal``.
+
+    A terminal status with ``filled_qty > 0`` is ``partial``: the size already
+    traded must be returned, not posted again at the original qty. An unknown
+    status is live so we do not post a second order. ``partially_filled`` stays
+    live while the order is still working.
+    """
+    status = _order_status_name(order)
+    if status == "filled":
+        return "filled"
+    if status in _TERMINAL_ORDER_STATUSES and _filled_qty(order) > 0:
+        return "partial"
+    if status in _TERMINAL_ORDER_STATUSES:
+        return "terminal"
+    if status in _LIVE_ORDER_STATUSES or not status:
+        return "live"
+    return "live"
+
+
+def _parse_created_at(raw: Any) -> Optional[datetime]:
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        ts = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _format_created_at(ts: datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_attempt_record(record: Any) -> tuple[Optional[str], Optional[datetime]]:
+    """A saved attempt is a client_order_id string, or an object with one.
+
+    Returns ``(None, None)`` when the record is not either of those.
+    """
+    if isinstance(record, str) and record.strip():
+        return record, None
+    if isinstance(record, dict):
+        cid = record.get("client_order_id")
+        if isinstance(cid, str) and cid.strip():
+            return cid, _parse_created_at(record.get("created_at"))
+    return None, None
+
+
+class _OrderHit:
+    """A client_order_id lookup that found an order."""
+
+    def __init__(self, kind: str, order_id: str, filled_qty: int = 0, status: str = "") -> None:
+        self.kind = kind
+        self.order_id = order_id
+        self.filled_qty = filled_qty
+        self.status = status
+
+
+def _hit_kind(found: Any) -> Optional[str]:
+    return getattr(found, "kind", None)
+
+
+class _Lookup:
+    """Sentinel for a client_order_id reconcile. Not an order id."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+_NOT_FOUND = _Lookup("NOT_FOUND")
+_UNKNOWN = _Lookup("UNKNOWN")
+# The saved attempt is gone or terminal. The caller may POST one new id.
+_RELEASE = _Lookup("RELEASE")
+
+
+def _order_id(order: Any) -> Optional[str]:
+    return str(getattr(order, "id", "") or "") or None
+
+
+def _order_label(payload: dict[str, Any]) -> str:
+    legs = payload.get("legs") or []
+    symbols = [str(leg.get("symbol") or "") for leg in legs if isinstance(leg, dict) and leg.get("symbol")]
+    if symbols:
+        return ",".join(symbols)
+    return str(payload.get("symbol") or "")
+
+
+def _status_code(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    if response is None:
+        http_error = getattr(exc, "_http_error", None)
+        response = getattr(http_error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ambiguous_submit(exc: BaseException) -> bool:
+    """True when the POST may already be on the book. Never treat that as 'try again'."""
+    import requests
+
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    status = _status_code(exc)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).lower()
+    if "client_order_id" in text and "unique" in text:
+        return True
+    if "timed out" in text or "timeout" in text:
+        return True
+    return False
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    if _status_code(exc) == 404:
+        return True
+    text = str(exc).lower()
+    return "not found" in text or "404" in text
 
 
 # Re-export payload helpers so engine never imports alpaca-py.

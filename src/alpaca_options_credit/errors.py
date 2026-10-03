@@ -33,5 +33,12 @@ class AtomicSpreadError(BotError):
     """Open/close must be a single 2-leg mleg. No legging out."""
 
 
+class SubmitUnconfirmed(BotError):
+    """POST may have landed, and the client_order_id lookup did not answer.
+
+    The broker must not submit that order again until the lookup succeeds.
+    """
+
+
 class NakedLegError(BotError):
     """Partial fill left a residual option leg. Flatten immediately."""

@@ -206,3 +206,14 @@ Coverage includes credential isolation, strike-near-invalidation, credit/width g
 ## Config
 
 See comments in [`config/default.yaml`](config/default.yaml). Knobs for width, DTE, credit gate, risk, roll stub, RTH, heartbeat, the locked daily + 1Hour hybrid (`structure_bar` / `timing_bar`), and the **locked options-native exit policy** (`exits.path`, `forbid_equity_oco_bracket`, `never_cancel_working_close`) live there.
+
+Poll-loop HTTP bounds (Alpaca trading and market-data REST). These are the tracked defaults in `config/default.yaml`. `config/paper-live.yaml` is not in this repo; copy the same keys there if that file should override them. Do not change a live file's other values just to add these.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `http.timeout_seconds` | 15 | Connect timeout and read timeout, in seconds, on every poll-loop Alpaca REST call. A hung `session.request` otherwise blocks the heartbeat until the OS gives up. |
+| `http.read_attempts` | 3 | How many times an idempotent GET or HEAD may be tried, including the first try. Order submits (POST) are not retried. |
+| `http.read_backoff_seconds` | 0.5, 1.0 | Sleep between read retries, in seconds. One value is used per gap, in order. |
+| `http.read_budget_seconds` | 50 | Cap on one read including retries and backoff. Kept under `heartbeat.stale_after_seconds_rth` (90) so a slow GET cannot stale the heartbeat. Submits do not use this budget. |
+
+Each order attempt gets its own `client_order_id`: `oc` + a 12-hex nonce + a 32-hex digest of the body (the limit is part of the digest). Alpaca never accepts an id again, even after the order expires or fills. The id actually posted, and a `created_at` timestamp, is written to `<bot.var_dir>/mleg_submit_attempts.json` before the POST. The default `bot.var_dir` is `var/options`. A 429, 5xx, or timeout looks that id up on the next poll, including after a restart. Returning a live or filled id retires the attempt, so a later identical order is a new POST. A 404 or a terminal order with no fill allows one new attempt with a new nonce. A terminal order with `filled_qty > 0` is returned and not reposted at the full qty. Each poll, and at startup, saved attempts are swept: a live or filled orphan is logged, and a dead attempt (404 or terminal with no fill) or one older than 7 days is dropped. When the heartbeat is stale, the supervisor logs `blocked_in=<op> for <s>s` from the in-flight call recorded on that beat.
