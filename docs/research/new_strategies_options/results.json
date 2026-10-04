@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-04T01:12:02.662952+00:00",
-  "stage": "oos",
+  "generated_at": "2026-10-04T01:16:52.440269+00:00",
+  "stage": "all",
   "protocol": {
     "is": [
       "2018-01-02",
@@ -778,6 +778,66 @@
       "selected": false
     },
     {
+      "strategy": "debit_momentum",
+      "role": "holdout_fit",
+      "params_id": "debit_momentum|cheap_iv=False|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.0008295234626860075,
+      "n_trades": 204,
+      "selected": false
+    },
+    {
+      "strategy": "debit_momentum",
+      "role": "holdout_fit",
+      "params_id": "debit_momentum|cheap_iv=False|dte=30|long_delta=0.55|mom=10|short_delta=0.3|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0005362036360936257,
+      "n_trades": 182,
+      "selected": false
+    },
+    {
+      "strategy": "debit_momentum",
+      "role": "holdout_fit",
+      "params_id": "debit_momentum|cheap_iv=False|dte=21|long_delta=0.5|mom=10|short_delta=0.25|sma=20",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.005208387955250763,
+      "n_trades": 359,
+      "selected": false
+    },
+    {
+      "strategy": "debit_momentum",
+      "role": "holdout_fit",
+      "params_id": "debit_momentum|cheap_iv=False|dte=42|long_delta=0.5|mom=20|short_delta=0.25|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.001131981021215506,
+      "n_trades": 124,
+      "selected": false
+    },
+    {
+      "strategy": "debit_momentum",
+      "role": "holdout_fit",
+      "params_id": "debit_momentum|cheap_iv=True|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0008323707151017913,
+      "n_trades": 136,
+      "selected": true
+    },
+    {
       "strategy": "short_dated",
       "role": "is_grid",
       "params_id": "short_dated|dte=5|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
@@ -1375,6 +1435,54 @@
       ],
       "mean_monthly": -0.008390608025684726,
       "n_trades": 635,
+      "selected": false
+    },
+    {
+      "strategy": "short_dated",
+      "role": "holdout_fit",
+      "params_id": "short_dated|dte=5|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.01018272595628185,
+      "n_trades": 480,
+      "selected": false
+    },
+    {
+      "strategy": "short_dated",
+      "role": "holdout_fit",
+      "params_id": "short_dated|dte=5|long_delta=0.5|lookback=5|short_delta=0.3|sma=20|thresh=0.005",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.010210321234600887,
+      "n_trades": 475,
+      "selected": false
+    },
+    {
+      "strategy": "short_dated",
+      "role": "holdout_fit",
+      "params_id": "short_dated|dte=7|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.0072311362210701995,
+      "n_trades": 433,
+      "selected": true
+    },
+    {
+      "strategy": "short_dated",
+      "role": "holdout_fit",
+      "params_id": "short_dated|dte=7|long_delta=0.5|lookback=5|short_delta=0.3|sma=20|thresh=0.005",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.0073073105704123086,
+      "n_trades": 425,
       "selected": false
     },
     {
@@ -1978,6 +2086,54 @@
       "selected": false
     },
     {
+      "strategy": "condor",
+      "role": "holdout_fit",
+      "params_id": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.16|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00010114458489031598,
+      "n_trades": 126,
+      "selected": false
+    },
+    {
+      "strategy": "condor",
+      "role": "holdout_fit",
+      "params_id": "condor|dte=45|iv_mode=vix_pct_60|short_delta=0.16|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 9.813085094134298e-05,
+      "n_trades": 92,
+      "selected": false
+    },
+    {
+      "strategy": "condor",
+      "role": "holdout_fit",
+      "params_id": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.25|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0001101854337946231,
+      "n_trades": 127,
+      "selected": true
+    },
+    {
+      "strategy": "condor",
+      "role": "holdout_fit",
+      "params_id": "condor|dte=30|iv_mode=contango|short_delta=0.2|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00080955301147794,
+      "n_trades": 232,
+      "selected": false
+    },
+    {
       "strategy": "butterfly",
       "role": "is_grid",
       "params_id": "butterfly|dte=21|rv_filter=rv10_lt_rv60|width=5.0",
@@ -2575,6 +2731,54 @@
       ],
       "mean_monthly": 5.7188447547721405e-05,
       "n_trades": 508,
+      "selected": false
+    },
+    {
+      "strategy": "butterfly",
+      "role": "holdout_fit",
+      "params_id": "butterfly|dte=21|rv_filter=rv10_lt_rv60|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00037876524123428,
+      "n_trades": 349,
+      "selected": false
+    },
+    {
+      "strategy": "butterfly",
+      "role": "holdout_fit",
+      "params_id": "butterfly|dte=35|rv_filter=rv10_lt_rv60|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0002211987848358705,
+      "n_trades": 315,
+      "selected": true
+    },
+    {
+      "strategy": "butterfly",
+      "role": "holdout_fit",
+      "params_id": "butterfly|dte=21|rv_filter=near_sma|width=10.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0,
+      "n_trades": 0,
+      "selected": false
+    },
+    {
+      "strategy": "butterfly",
+      "role": "holdout_fit",
+      "params_id": "butterfly|dte=21|rv_filter=vix_pct_lt_40|width=5.0",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 9.260855609649161e-05,
+      "n_trades": 234,
       "selected": false
     },
     {
@@ -3178,6 +3382,54 @@
       "selected": false
     },
     {
+      "strategy": "calendar",
+      "role": "holdout_fit",
+      "params_id": "calendar|back_dte=45|band=0.01|front_dte=14|ratio=1.05",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00011772933609429573,
+      "n_trades": 7,
+      "selected": false
+    },
+    {
+      "strategy": "calendar",
+      "role": "holdout_fit",
+      "params_id": "calendar|back_dte=30|band=0.015|front_dte=7|ratio=1.08",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00025466365766270497,
+      "n_trades": 11,
+      "selected": true
+    },
+    {
+      "strategy": "calendar",
+      "role": "holdout_fit",
+      "params_id": "calendar|back_dte=60|band=0.02|front_dte=14|ratio=1.02",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -8.114321567012892e-05,
+      "n_trades": 4,
+      "selected": false
+    },
+    {
+      "strategy": "calendar",
+      "role": "holdout_fit",
+      "params_id": "calendar|back_dte=45|band=0.01|front_dte=21|ratio=1.05",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.000415196299843473,
+      "n_trades": 11,
+      "selected": false
+    },
+    {
       "strategy": "diagonal",
       "role": "is_grid",
       "params_id": "diagonal|back_delta=0.6|back_dte=45|front_delta=0.3|front_dte=14|sma=50",
@@ -3632,13 +3884,49 @@
       "mean_monthly": 6.215097665583687e-05,
       "n_trades": 13,
       "selected": false
+    },
+    {
+      "strategy": "diagonal",
+      "role": "holdout_fit",
+      "params_id": "diagonal|back_delta=0.6|back_dte=45|front_delta=0.3|front_dte=14|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": 0.0,
+      "n_trades": 0,
+      "selected": false
+    },
+    {
+      "strategy": "diagonal",
+      "role": "holdout_fit",
+      "params_id": "diagonal|back_delta=0.55|back_dte=35|front_delta=0.25|front_dte=7|sma=20",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.00030416290420516676,
+      "n_trades": 20,
+      "selected": true
+    },
+    {
+      "strategy": "diagonal",
+      "role": "holdout_fit",
+      "params_id": "diagonal|back_delta=0.5|back_dte=45|front_delta=0.35|front_dte=14|sma=50",
+      "window": [
+        "2023-10-02",
+        "2025-09-30"
+      ],
+      "mean_monthly": -0.0005147201834477185,
+      "n_trades": 43,
+      "selected": false
     }
   ],
   "candidates": [
     {
       "strategy": "debit_momentum",
       "unique_configs": 5,
-      "variants_tried": 62,
+      "variants_tried": 67,
       "data_budget": {
         "alpaca_requests_per_scan": 12,
         "scans_per_day": 1,
@@ -5238,8 +5526,117 @@
         "structure_trades": 0,
         "params_id": "debit_momentum|cheap_iv=False|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": -0.0007329362668326216,
+          "lo": -0.0018423812905436201,
+          "hi": 0.0003272215979209325,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": -0.004800297926602115,
+        "max_drawdown": {
+          "dollars": 1860.183942339936,
+          "pct": 0.018541790067184278
+        },
+        "trades_per_month": 2.1666666666666665,
+        "trade_stats": {
+          "n": 26,
+          "win_rate": 0.4230769230769231,
+          "avg_r": -0.055371595217002904,
+          "profit_factor": 0.7377835065505555,
+          "pnl": -879.5235201991459,
+          "n_window_mtm": 1
+        },
+        "exposure": {
+          "avg_spreads": 0.7808764940239044,
+          "peak_spreads": 2,
+          "avg_open_risk": 342.8624555436718,
+          "peak_open_risk": 921.2698628860032,
+          "avg_gross": 342.8624555436718,
+          "peak_gross": 921.2698628860032,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": 0.0020392381763787606,
+            "trades": 1
+          },
+          {
+            "month": "2025-11",
+            "return": -0.004356367956030141,
+            "trades": 2
+          },
+          {
+            "month": "2025-12",
+            "return": -0.00310058234614354,
+            "trades": 6
+          },
+          {
+            "month": "2026-01",
+            "return": 0.004552292406507994,
+            "trades": 7
+          },
+          {
+            "month": "2026-02",
+            "return": -0.0013808297568880619,
+            "trades": 2
+          },
+          {
+            "month": "2026-03",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-04",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-05",
+            "return": -0.0024162056349493672,
+            "trades": 1
+          },
+          {
+            "month": "2026-06",
+            "return": -0.002433384084747434,
+            "trades": 1
+          },
+          {
+            "month": "2026-07",
+            "return": -0.002352220112431018,
+            "trades": 2
+          },
+          {
+            "month": "2026-08",
+            "return": -0.004800297926602115,
+            "trades": 2
+          },
+          {
+            "month": "2026-09",
+            "return": 0.005453122032913463,
+            "trades": 2
+          }
+        ],
+        "orphan_trades": 0,
+        "structure_trades": 0,
+        "params_id": "debit_momentum|cheap_iv=True|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50",
+        "params": {
+          "sma": 50,
+          "mom": 20,
+          "long_delta": 0.55,
+          "short_delta": 0.3,
+          "dte": 30,
+          "cheap_iv": true
+        }
+      },
+      "holdout_params": "debit_momentum|cheap_iv=True|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50",
       "folds": [
         {
           "fit": [
@@ -5389,7 +5786,7 @@
     {
       "strategy": "short_dated",
       "unique_configs": 4,
-      "variants_tried": 50,
+      "variants_tried": 54,
       "data_budget": {
         "alpaca_requests_per_scan": 5,
         "scans_per_day": 1,
@@ -6989,8 +7386,117 @@
         "structure_trades": 0,
         "params_id": "short_dated|dte=5|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": -0.006686529948690736,
+          "lo": -0.014118069548542405,
+          "hi": 0.0012995465723325275,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": -0.02698432494686975,
+        "max_drawdown": {
+          "dollars": 10695.433847788387,
+          "pct": 0.10675421342372923
+        },
+        "trades_per_month": 17.166666666666668,
+        "trade_stats": {
+          "n": 206,
+          "win_rate": 0.33980582524271846,
+          "avg_r": -0.11461648534340499,
+          "profit_factor": 0.7015022345748995,
+          "pnl": -8023.835938428883,
+          "n_window_mtm": 2
+        },
+        "exposure": {
+          "avg_spreads": 1.3824701195219125,
+          "peak_spreads": 3,
+          "avg_open_risk": 502.76697670326206,
+          "peak_open_risk": 1318.2450018958457,
+          "avg_gross": 502.76697670326206,
+          "peak_gross": 1318.2450018958457,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": -0.01857763136585545,
+            "trades": 19
+          },
+          {
+            "month": "2025-11",
+            "return": -0.018274057536207432,
+            "trades": 16
+          },
+          {
+            "month": "2025-12",
+            "return": -0.009039412696281002,
+            "trades": 19
+          },
+          {
+            "month": "2026-01",
+            "return": -0.01903654107921433,
+            "trades": 17
+          },
+          {
+            "month": "2026-02",
+            "return": -0.02698432494686975,
+            "trades": 17
+          },
+          {
+            "month": "2026-03",
+            "return": -0.0023849696422218658,
+            "trades": 16
+          },
+          {
+            "month": "2026-04",
+            "return": 0.02242390488012104,
+            "trades": 17
+          },
+          {
+            "month": "2026-05",
+            "return": 0.009004205919468933,
+            "trades": 17
+          },
+          {
+            "month": "2026-06",
+            "return": -0.006848779265416168,
+            "trades": 17
+          },
+          {
+            "month": "2026-07",
+            "return": 0.0022128885220715913,
+            "trades": 16
+          },
+          {
+            "month": "2026-08",
+            "return": -0.006235617013186979,
+            "trades": 19
+          },
+          {
+            "month": "2026-09",
+            "return": -0.0064980251606974225,
+            "trades": 16
+          }
+        ],
+        "orphan_trades": 0,
+        "structure_trades": 0,
+        "params_id": "short_dated|dte=7|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
+        "params": {
+          "lookback": 3,
+          "thresh": 0.003,
+          "sma": 20,
+          "long_delta": 0.5,
+          "short_delta": 0.3,
+          "dte": 7
+        }
+      },
+      "holdout_params": "short_dated|dte=7|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
       "folds": [
         {
           "fit": [
@@ -7140,7 +7646,7 @@
     {
       "strategy": "condor",
       "unique_configs": 4,
-      "variants_tried": 50,
+      "variants_tried": 54,
       "data_budget": {
         "alpaca_requests_per_scan": 5,
         "scans_per_day": 1,
@@ -8738,8 +9244,115 @@
         "structure_trades": 178,
         "params_id": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.16|width=5.0"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": 0.0008306698972505667,
+          "lo": 0.0003723038749556891,
+          "hi": 0.0013835154227795615,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": -0.001063357593789031,
+        "max_drawdown": {
+          "dollars": 230.47114089180832,
+          "pct": 0.002301236467108373
+        },
+        "trades_per_month": 6.0,
+        "trade_stats": {
+          "n": 72,
+          "win_rate": 0.6388888888888888,
+          "avg_r": 0.03604409293607247,
+          "profit_factor": 1.723993837197672,
+          "pnl": 996.8038767006801,
+          "n_window_mtm": 2
+        },
+        "exposure": {
+          "avg_spreads": 2.733067729083665,
+          "peak_spreads": 5,
+          "avg_open_risk": 1084.4864044679782,
+          "peak_open_risk": 2194.5201047250343,
+          "avg_gross": 1084.4864044679782,
+          "peak_gross": 2194.5201047250343,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": 0.0004936405898671939,
+            "trades": 10
+          },
+          {
+            "month": "2025-11",
+            "return": -0.001063357593789031,
+            "trades": 5
+          },
+          {
+            "month": "2025-12",
+            "return": 0.0020162874902365582,
+            "trades": 5
+          },
+          {
+            "month": "2026-01",
+            "return": 0.0010779465904412252,
+            "trades": 5
+          },
+          {
+            "month": "2026-02",
+            "return": 0.00020434510886360705,
+            "trades": 9
+          },
+          {
+            "month": "2026-03",
+            "return": 0.0006079455688633092,
+            "trades": 9
+          },
+          {
+            "month": "2026-04",
+            "return": 0.0007669576972509247,
+            "trades": 3
+          },
+          {
+            "month": "2026-05",
+            "return": -0.0008798035029818363,
+            "trades": 2
+          },
+          {
+            "month": "2026-06",
+            "return": 0.002738531987369949,
+            "trades": 7
+          },
+          {
+            "month": "2026-07",
+            "return": 0.003494473002762736,
+            "trades": 10
+          },
+          {
+            "month": "2026-08",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-09",
+            "return": 0.000511071828122164,
+            "trades": 7
+          }
+        ],
+        "orphan_trades": 12,
+        "structure_trades": 72,
+        "params_id": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.25|width=5.0",
+        "params": {
+          "short_delta": 0.25,
+          "dte": 35,
+          "width": 5.0,
+          "iv_mode": "vix_gt_sma20"
+        }
+      },
+      "holdout_params": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.25|width=5.0",
       "folds": [
         {
           "fit": [
@@ -8889,7 +9502,7 @@
     {
       "strategy": "butterfly",
       "unique_configs": 4,
-      "variants_tried": 50,
+      "variants_tried": 54,
       "data_budget": {
         "alpaca_requests_per_scan": 5,
         "scans_per_day": 1,
@@ -10486,8 +11099,114 @@
         "structure_trades": 508,
         "params_id": "butterfly|dte=21|rv_filter=rv10_lt_rv60|width=5.0"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": -4.615075586385396e-05,
+          "lo": -0.000865666352392768,
+          "hi": 0.000831225418245252,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": -0.002777567304828278,
+        "max_drawdown": {
+          "dollars": 674.7394945651467,
+          "pct": 0.0067398488353898126
+        },
+        "trades_per_month": 11.416666666666666,
+        "trade_stats": {
+          "n": 137,
+          "win_rate": 0.35766423357664234,
+          "avg_r": -0.0033212928653430936,
+          "profit_factor": 0.9803456630419846,
+          "pnl": -55.380907036624784,
+          "n_window_mtm": 4
+        },
+        "exposure": {
+          "avg_spreads": 2.394422310756972,
+          "peak_spreads": 5,
+          "avg_open_risk": 791.0931056911976,
+          "peak_open_risk": 1879.944333864703,
+          "avg_gross": 791.0931056911976,
+          "peak_gross": 1879.944333864703,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": 0.0009650775439722455,
+            "trades": 11
+          },
+          {
+            "month": "2025-11",
+            "return": -0.0003716049222980959,
+            "trades": 6
+          },
+          {
+            "month": "2025-12",
+            "return": -0.0013966619989160126,
+            "trades": 14
+          },
+          {
+            "month": "2026-01",
+            "return": 0.0007406892036039972,
+            "trades": 21
+          },
+          {
+            "month": "2026-02",
+            "return": -0.0026767363894619786,
+            "trades": 3
+          },
+          {
+            "month": "2026-03",
+            "return": -0.002777567304828278,
+            "trades": 8
+          },
+          {
+            "month": "2026-04",
+            "return": 0.001035335961215592,
+            "trades": 3
+          },
+          {
+            "month": "2026-05",
+            "return": 0.005270334130379765,
+            "trades": 19
+          },
+          {
+            "month": "2026-06",
+            "return": -0.0004907704929723443,
+            "trades": 8
+          },
+          {
+            "month": "2026-07",
+            "return": -0.0008594628207724942,
+            "trades": 11
+          },
+          {
+            "month": "2026-08",
+            "return": 0.00099089931577674,
+            "trades": 17
+          },
+          {
+            "month": "2026-09",
+            "return": -0.0009833412960653834,
+            "trades": 16
+          }
+        ],
+        "orphan_trades": 27,
+        "structure_trades": 137,
+        "params_id": "butterfly|dte=35|rv_filter=rv10_lt_rv60|width=5.0",
+        "params": {
+          "width": 5.0,
+          "dte": 35,
+          "rv_filter": "rv10_lt_rv60"
+        }
+      },
+      "holdout_params": "butterfly|dte=35|rv_filter=rv10_lt_rv60|width=5.0",
       "folds": [
         {
           "fit": [
@@ -10637,7 +11356,7 @@
     {
       "strategy": "calendar",
       "unique_configs": 4,
-      "variants_tried": 50,
+      "variants_tried": 54,
       "data_budget": {
         "alpaca_requests_per_scan": 5,
         "scans_per_day": 1,
@@ -12235,8 +12954,115 @@
         "structure_trades": 0,
         "params_id": "calendar|back_dte=45|band=0.01|front_dte=14|ratio=1.05"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": 2.559460161129541e-05,
+          "lo": 0.0,
+          "hi": 7.678380483388624e-05,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": 0.0,
+        "max_drawdown": {
+          "dollars": 41.049478450164315,
+          "pct": 0.00041049478450164314
+        },
+        "trades_per_month": 0.08333333333333333,
+        "trade_stats": {
+          "n": 1,
+          "win_rate": 1.0,
+          "avg_r": 0.09066153207402289,
+          "profit_factor": null,
+          "pnl": 30.713521933554492,
+          "n_window_mtm": 0
+        },
+        "exposure": {
+          "avg_spreads": 0.01593625498007968,
+          "peak_spreads": 1,
+          "avg_open_risk": 5.398745263534302,
+          "peak_open_risk": 338.77126528677746,
+          "avg_gross": 5.398745263534302,
+          "peak_gross": 338.77126528677746,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2025-11",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2025-12",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-01",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-02",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-03",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-04",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-05",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-06",
+            "return": 0.00030713521933554494,
+            "trades": 1
+          },
+          {
+            "month": "2026-07",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-08",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-09",
+            "return": 0.0,
+            "trades": 0
+          }
+        ],
+        "orphan_trades": 0,
+        "structure_trades": 0,
+        "params_id": "calendar|back_dte=30|band=0.015|front_dte=7|ratio=1.08",
+        "params": {
+          "front_dte": 7,
+          "back_dte": 30,
+          "ratio": 1.08,
+          "band": 0.015
+        }
+      },
+      "holdout_params": "calendar|back_dte=30|band=0.015|front_dte=7|ratio=1.08",
       "folds": [
         {
           "fit": [
@@ -12386,7 +13212,7 @@
     {
       "strategy": "diagonal",
       "unique_configs": 3,
-      "variants_tried": 38,
+      "variants_tried": 41,
       "data_budget": {
         "alpaca_requests_per_scan": 5,
         "scans_per_day": 1,
@@ -13985,8 +14811,115 @@
         "structure_trades": 0,
         "params_id": "diagonal|back_delta=0.6|back_dte=45|front_delta=0.3|front_dte=14|sma=50"
       },
-      "holdout": null,
-      "holdout_params": null,
+      "holdout": {
+        "start": "2025-10-01",
+        "end": "2026-09-30",
+        "n_months": 12,
+        "monthly": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0,
+          "n": 12,
+          "resamples": 5000,
+          "seed": 20261004,
+          "block": 3
+        },
+        "worst_month": 0.0,
+        "max_drawdown": {
+          "dollars": 0.0,
+          "pct": 0.0
+        },
+        "trades_per_month": 0.0,
+        "trade_stats": {
+          "n": 0,
+          "win_rate": null,
+          "avg_r": null,
+          "profit_factor": null,
+          "pnl": 0.0
+        },
+        "exposure": {
+          "avg_spreads": 0.0,
+          "peak_spreads": 0,
+          "avg_open_risk": 0.0,
+          "peak_open_risk": 0,
+          "avg_gross": 0.0,
+          "peak_gross": 0,
+          "days": 251
+        },
+        "months": [
+          {
+            "month": "2025-10",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2025-11",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2025-12",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-01",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-02",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-03",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-04",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-05",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-06",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-07",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-08",
+            "return": 0.0,
+            "trades": 0
+          },
+          {
+            "month": "2026-09",
+            "return": 0.0,
+            "trades": 0
+          }
+        ],
+        "orphan_trades": 0,
+        "structure_trades": 0,
+        "params_id": "diagonal|back_delta=0.55|back_dte=35|front_delta=0.25|front_dte=7|sma=20",
+        "params": {
+          "sma": 20,
+          "front_delta": 0.25,
+          "back_delta": 0.55,
+          "front_dte": 7,
+          "back_dte": 35
+        }
+      },
+      "holdout_params": "diagonal|back_delta=0.55|back_dte=35|front_delta=0.25|front_dte=7|sma=20",
       "folds": [
         {
           "fit": [

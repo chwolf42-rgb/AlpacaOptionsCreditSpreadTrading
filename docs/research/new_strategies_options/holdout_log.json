@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-10-04T01:16:52.440269+00:00",
+  "note": "Holdout window evaluated once in this run, after walk-forward selection was frozen per strategy.",
+  "holdout": [
+    "2025-10-01",
+    "2026-09-30"
+  ],
+  "choices": {
+    "debit_momentum": "debit_momentum|cheap_iv=True|dte=30|long_delta=0.55|mom=20|short_delta=0.3|sma=50",
+    "short_dated": "short_dated|dte=7|long_delta=0.5|lookback=3|short_delta=0.3|sma=20|thresh=0.003",
+    "condor": "condor|dte=35|iv_mode=vix_gt_sma20|short_delta=0.25|width=5.0",
+    "butterfly": "butterfly|dte=35|rv_filter=rv10_lt_rv60|width=5.0",
+    "calendar": "calendar|back_dte=30|band=0.015|front_dte=7|ratio=1.08",
+    "diagonal": "diagonal|back_delta=0.55|back_dte=35|front_delta=0.25|front_dte=7|sma=20"
+  }
+}
