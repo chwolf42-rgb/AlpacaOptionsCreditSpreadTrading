@@ -47,3 +47,15 @@ def test_early_close_is_shorter():
     assert bool(last_hour["partial"]) is True
     close = out_1d["available_at"].iloc[0].astimezone(ET)
     assert close.hour == 13 and close.minute == 0
+    assert int(out_1d["n_bars"].iloc[0]) == 42
+
+
+def test_daily_bar_survives_a_missing_last_print():
+    day = trend_bars()
+    day = day[day["session"] == day["session"].iloc[0]].iloc[:-1]
+    daily = resample(day, "1d")
+    intraday = resample(day, "15m")
+    assert len(daily) == 1
+    assert int(daily["n_bars"].iloc[0]) == 77
+    assert int(intraday.attrs["dropped_buckets"]) >= 1
+    assert len(intraday) < 26

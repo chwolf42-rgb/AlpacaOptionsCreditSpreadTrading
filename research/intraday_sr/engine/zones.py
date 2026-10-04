@@ -14,6 +14,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
+from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.engine.levels import _strict_mask
 from research.intraday_sr.types import BarSet, EngineCfg, Zone
 
@@ -90,7 +91,7 @@ def _one_zone(
 
 def zones_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Zone]:
     """Zones knowable at ``as_of``. Empty until ATR_d through yesterday exists."""
-    frame = bars.visible(as_of)
+    frame = prices_as_of(bars.visible(as_of), as_of)
     if frame.empty or "symbol" not in frame.columns:
         return []
     atr = _atr_through_yesterday(frame, as_of, int(cfg.atr_length))

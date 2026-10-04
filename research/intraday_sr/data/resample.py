@@ -32,19 +32,26 @@ HTF_COLUMNS = (
     "session",
     "adj_factor",
     "partial",
+    "n_bars",
 )
 
 _WIDTH = {"15m": timedelta(minutes=15), "1h": timedelta(hours=1)}
 
 
 def resample(bars: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """Build completed ``tf`` bars from 5m rows. ``tf`` is 15m, 1h, or 1d."""
+    """Build ``tf`` bars from 5m rows. ``tf`` is 15m, 1h, or 1d.
+
+    A 15m or 1h bucket is emitted only when its last 5m bar is present.
+    The daily bar is always emitted from the bars that exist, with ``n_bars``.
+    ``resample.last_dropped`` is the number of 15m/1h buckets left out.
+    """
     if tf not in ("15m", "1h", "1d"):
         raise ValueError(f"unsupported timeframe {tf}")
     empty = pd.DataFrame(columns=list(HTF_COLUMNS))
     if bars is None or len(bars) == 0:
         return empty
     frame = bars.sort_values(["symbol", "ts"])
+    _session_buckets.dropped = 0
     rows: list[dict] = []
     for (symbol, session), group in frame.groupby(["symbol", "session"], sort=True):
         if isinstance(session, datetime):
@@ -52,10 +59,15 @@ def resample(bars: pd.DataFrame, tf: str) -> pd.DataFrame:
         elif not isinstance(session, date):
             session = pd.Timestamp(session).date()
         rows.extend(_session_buckets(group, symbol, session, tf))
+    dropped = int(getattr(_session_buckets, "dropped", 0))
+    resample.last_dropped = dropped
     if not rows:
+        empty.attrs["dropped_buckets"] = dropped
         return empty
     out = pd.DataFrame(rows)
-    return out.loc[:, list(HTF_COLUMNS)].reset_index(drop=True)
+    out = out.loc[:, list(HTF_COLUMNS)].reset_index(drop=True)
+    out.attrs["dropped_buckets"] = dropped
+    return out
 
 
 def _session_buckets(group: pd.DataFrame, symbol: str, session, tf: str) -> list[dict]:
@@ -78,13 +90,21 @@ def _session_buckets(group: pd.DataFrame, symbol: str, session, tf: str) -> list
             buckets.append((cursor, end, partial))
             cursor = end
     built: list[dict] = []
+    dropped = 0
     for start, end, partial in buckets:
         # 5m bars that open in [start, end) close by `end` on this grid.
-        # The bucket stays hidden until the bar that closes exactly at `end` exists.
         const = group[(group["ts"] >= start) & (group["available_at"] <= end)]
-        if const.empty or not (const["available_at"] == end).any():
+        closing = (not const.empty) and bool((const["available_at"] == end).any())
+        if tf == "1d":
+            if const.empty:
+                continue
+        elif const.empty or not closing:
+            if not const.empty:
+                dropped += 1
             continue
         built.append(_aggregate(const, symbol, session, tf, start, end, partial))
+    if tf != "1d" and dropped:
+        _session_buckets.dropped = getattr(_session_buckets, "dropped", 0) + dropped
     return built
 
 
@@ -123,4 +143,5 @@ def _aggregate(
         "session": session,
         "adj_factor": np.float32(factor),
         "partial": bool(partial),
+        "n_bars": int(len(const)),
     }

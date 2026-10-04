@@ -13,6 +13,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.types import BarSet, EngineCfg, Level
 
 
@@ -37,7 +38,7 @@ def _strict_mask(values: np.ndarray, n: int, *, high: bool) -> np.ndarray:
 
 def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
     """Strict 5m pivots whose confirming bar has already closed."""
-    frame = bars.visible(as_of)
+    frame = prices_as_of(bars.visible(as_of), as_of)
     if frame.empty or "symbol" not in frame.columns:
         return []
     n = int(cfg.n_5m)
