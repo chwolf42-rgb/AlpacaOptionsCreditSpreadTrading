@@ -10,6 +10,7 @@ from research.intraday_sr.grids import (
     CAP_OPTIONS_0DTE,
     CAP_TEST_A,
     CAP_TEST_B,
+    COMPARISON_GUARDRAILS,
     DAILY_LOSS_STOP,
     FORMATIONS,
     GRID_SHA256,
@@ -19,8 +20,9 @@ from research.intraday_sr.grids import (
     MAX_PER_SYMBOL,
     N_TRIALS,
     OPTIONS,
-    PRIMARY_GUARDRAIL,
     OPTIONS_0DTE,
+    PRIMARY_GUARDRAIL,
+    SPEC_VERSION,
     TEST_A,
     TEST_B,
     UNIVERSE,
@@ -30,6 +32,7 @@ from research.intraday_sr.grids import (
     load_universe_symbols,
     universe_sha256,
 )
+from research.intraday_sr.types import EngineCfg
 
 
 def test_equity_caps_and_axes():
@@ -41,7 +44,7 @@ def test_equity_caps_and_axes():
         assert row["oscillator"] in ("rsi14_30_70", "stoch14_3_3_20_80")
         assert row["rvol_min"] in (1.5, 2.0)
         assert row["entry_tf"] in ("5m", "15m")
-        assert row["target"] in ("1R", "2R", "next_zone")
+        assert row["target"] in ("1R", "2R", "zone")
         assert row["k_confirm"] in (0, 1, 2, 3)
     assert {row["k_confirm"] for row in TEST_A} == {0, 1, 2, 3}
     a_ids = {row["variant_id"][1:] for row in TEST_A}
@@ -70,25 +73,47 @@ def test_fixed_constants_and_primary_guardrail():
     assert MAX_CONCURRENT == 4
     assert MAX_PER_SYMBOL == 1
     assert DAILY_LOSS_STOP == -0.015
-    assert PRIMARY_GUARDRAIL == (2, 5)
+    assert SPEC_VERSION == "v1.3.1"
+    assert PRIMARY_GUARDRAIL == {"daily_losses": 2, "weekly_losses": 5}
+    assert COMPARISON_GUARDRAILS == (
+        {"name": "none"},
+        {"name": "d2+w6", "daily_losses": 2, "weekly_losses": 6},
+    )
     raw = canonical_json()
     document = json.loads(raw)
     assert set(document) == {
+        "comparison_guardrails",
+        "engine_cfg",
         "fixed",
         "formations",
         "options",
         "options_0dte",
         "primary_guardrail",
+        "spec_version",
         "test_a",
         "test_b",
         "universe",
+        "universe_sha256",
     }
-    assert document["primary_guardrail"] == [2, 5]
+    assert document["spec_version"] == "v1.3.1"
+    assert document["primary_guardrail"] == {"daily_losses": 2, "weekly_losses": 5}
+    assert document["comparison_guardrails"] == [
+        {"name": "none"},
+        {"name": "d2+w6", "daily_losses": 2, "weekly_losses": 6},
+    ]
+    assert document["universe_sha256"] == universe_sha256()
+    assert document["engine_cfg"]["k_cluster"] == 0.25
+    assert document["engine_cfg"]["max_losses_day"] == 2
+    assert document["engine_cfg"]["max_losses_week"] == 5
+    assert document["engine_cfg"]["dev_end"] == "2026-03-31"
+    assert document["fixed"]["primary_guardrail"] == document["primary_guardrail"]
+    from dataclasses import asdict
+
+    assert document["engine_cfg"] == asdict(EngineCfg())
+    forbidden = {"daily_losses", "weekly_losses", "guardrail", "max_losses_day", "max_losses_week", "k_cluster"}
+    for row in document["test_a"] + document["test_b"] + document["formations"] + document["options"] + document["options_0dte"]:
+        assert forbidden.isdisjoint(row)
     assert N_TRIALS == 450
-    # The primary pair is hashed. It is not an axis, so N does not grow.
-    assert "d2" not in document
-    assert "w5" not in document
-    assert "w6" not in document
 
 
 def test_hash_is_stable_and_in_the_summary():
@@ -99,7 +124,8 @@ def test_hash_is_stable_and_in_the_summary():
     assert "192" in summary
     assert "options_0dte 9" in summary
     assert "N 450" in summary
-    assert "primary_guardrail max_losses_day=2 max_losses_week=5" in summary
+    assert "primary_guardrail daily_losses=2 weekly_losses=5" in summary
+    assert "v1.3.1" in summary
     assert universe_sha256() in summary
 
 

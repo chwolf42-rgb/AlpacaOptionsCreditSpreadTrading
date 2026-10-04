@@ -1,4 +1,4 @@
-"""Resample skeleton. Counts are asserted once D2-1 replaces the stub."""
+"""Resample counts and the partial last hour."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import pytest
 
 from research.intraday_sr.data.resample import resample
 from research.intraday_sr.tests.fixtures import early_close_bars, trend_bars
+from research.intraday_sr.types import ET
 
 
 def test_resample_rejects_an_unknown_timeframe():
@@ -19,11 +20,14 @@ def test_full_session_bucket_counts():
     out_15 = resample(day, "15m")
     out_1h = resample(day, "1h")
     out_1d = resample(day, "1d")
-    if out_15.empty and out_1h.empty and out_1d.empty:
-        pytest.skip("resample stub; D2-1 asserts 26 x 15m, 7 x 1h, 1 x 1d")
     assert len(out_15) == 26
+    assert out_15["ts"].iloc[0].astimezone(ET).hour == 9
+    assert out_15["ts"].iloc[0].astimezone(ET).minute == 30
     assert len(out_1h) == 7
-    assert bool(out_1h["partial"].iloc[-1]) is True
+    last_hour = out_1h.iloc[-1]
+    assert last_hour["ts"].astimezone(ET).hour == 15
+    assert last_hour["ts"].astimezone(ET).minute == 30
+    assert bool(last_hour["partial"]) is True
     assert int(out_1h["partial"].sum()) == 1
     assert len(out_1d) == 1
     assert bool(out_1d["partial"].iloc[0]) is False
@@ -34,8 +38,12 @@ def test_early_close_is_shorter():
     early = frame[frame["session"] == frame["session"].iloc[-1]]
     out_15 = resample(early, "15m")
     out_1h = resample(early, "1h")
-    if out_15.empty and out_1h.empty:
-        pytest.skip("resample stub; D2-1 asserts the 13:00 session")
+    out_1d = resample(early, "1d")
     assert len(out_15) == 14
     assert len(out_1h) == 4
-    assert bool(out_1h["partial"].iloc[-1]) is True
+    last_hour = out_1h.iloc[-1]
+    assert last_hour["ts"].astimezone(ET).hour == 12
+    assert last_hour["ts"].astimezone(ET).minute == 30
+    assert bool(last_hour["partial"]) is True
+    close = out_1d["available_at"].iloc[0].astimezone(ET)
+    assert close.hour == 13 and close.minute == 0

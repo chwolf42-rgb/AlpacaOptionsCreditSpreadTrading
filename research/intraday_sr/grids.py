@@ -1,13 +1,8 @@
-"""Frozen §5 grids (spec v1.1 A1–A2, unchanged in v1.3).
+"""Frozen grids and constants (spec v1.3.1).
 
-Caps are enforced at import. The sha256 is of the canonical JSON of the
-equity grids, both options grids, the fixed constants, the locked
-universe, and ``PRIMARY_GUARDRAIL``. Trial count N is 450. v1.3 adds the
-guardrail to the hash and adds no trials. The universe is read only from
-``universe_fixed33.json`` in this package.
-
-``k_confirm`` is how many of the three optional stack conditions a variant
-requires (at least that many). ``Signal.confluence`` is how many held.
+``grids.py`` is the single source for every frozen constant. Trial count
+N is 450. The primary loss guardrail and the two comparison guardrails
+are constants, not axes, so no grid row carries a guardrail key.
 """
 
 from __future__ import annotations
@@ -17,15 +12,68 @@ import json
 from pathlib import Path
 from typing import Iterable, Mapping
 
-# Fixed engine / portfolio constants. Not axes.
-# v1.3 primary loss guardrail: max losing trades per day, then per week.
-# Not a grid axis. Comparison configs stay on the harness side.
-PRIMARY_GUARDRAIL = (2, 5)
+from research.intraday_sr.io import read_bytes, read_text
+
+SPEC_VERSION = "v1.3.1"
+
+# v1.3.1 C3. The harness builds RiskCfg(max_losses_day, max_losses_week) from this.
+PRIMARY_GUARDRAIL = {"daily_losses": 2, "weekly_losses": 5}
+COMPARISON_GUARDRAILS = (
+    {"name": "none"},
+    {"name": "d2+w6", "daily_losses": 2, "weekly_losses": 6},
+)
+
 K_CLUSTER = 0.25
 MAX_ENTRIES_PER_DAY = 12
 MAX_CONCURRENT = 4
 MAX_PER_SYMBOL = 1
 DAILY_LOSS_STOP = -0.015
+NO_NEW_ENTRIES_AFTER_ET = "15:00"
+FORCED_EXIT_BAR_OPEN_ET = "15:55"
+RISK_FRACTION = 0.005
+MODEL_EQUITY = 100_000
+NOTIONAL_CAP_POSITION = 1.0
+NOTIONAL_CAP_TOTAL = 3.0
+OPENING_RANGE_START_ET = "09:30"
+OPENING_RANGE_END_ET = "10:00"
+WARMUP_DATE = "2019-02-01"
+DEV_START = "2019-01-02"
+DEV_END = "2026-03-31"
+HOLDOUT_START = "2026-04-01"
+HOLDOUT_END = "2026-09-30"
+STOP_BUFFER_ATR = 0.05
+STOP_FLOOR_ATR = 0.10
+ARM_ATR = 0.10
+CANCEL_BARS = 6
+ENTRY_OFFSET = 0.01
+RVOL_SESSIONS = 20
+RSI_LENGTH = 14
+STOCH_K = 14
+STOCH_D = 3
+STOCH_SMOOTH = 3
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+INDICATOR_WARMUP_BARS = 100
+ATR_LENGTH = 14
+PROFILE_SESSIONS = 5
+PROFILE_PERCENTILE = 0.70
+PROFILE_BIN_ATR = 0.05
+ZONE_PAD_ATR = 0.05
+CANDIDATE_BAND_ATR = 2.0
+TOUCH_SESSIONS = 20
+RECENCY_HALF_LIFE_SESSIONS = 5.0
+ROUND_STEP_UNDER_50 = 1.0
+ROUND_STEP_UNDER_250 = 5.0
+ROUND_STEP_UNDER_1000 = 10.0
+ROUND_STEP_ELSE = 50.0
+BOOTSTRAP_SEED = 20260925
+BOOTSTRAP_RESAMPLES = 5000
+TOUCH_WINDOW_BARS = 3
+FORMATION_PIVOT_GAP_MIN = 5
+FORMATION_PIVOT_GAP_MAX = 60
+SHOULDER_ATR = 0.10
+HVN_REJECTION_WICK = 0.50
 PIVOT_N = {"5m": 3, "15m": 3, "1h": 2, "1d": 2}
 SCORE_WEIGHTS = {
     "touches": 0.30,
@@ -34,14 +82,21 @@ SCORE_WEIGHTS = {
     "volume": 0.20,
 }
 
-# Locked list lives in universe_fixed33.json (verbatim). Cache files store BRK.B as BRK-B.
 _UNIVERSE_PATH = Path(__file__).resolve().parent / "universe_fixed33.json"
+_ROW_GUARD_KEYS = (
+    "daily_losses",
+    "weekly_losses",
+    "guardrail",
+    "max_losses_day",
+    "max_losses_week",
+    "k_cluster",
+)
 
 _K = (3, 5)
 _OSCILLATORS = ("rsi14_30_70", "stoch14_3_3_20_80")
 _RVOL = (1.5, 2.0)
 _ENTRY_TF = ("5m", "15m")
-_TARGETS = ("1R", "2R", "next_zone")
+_TARGETS = ("1R", "2R", "zone")
 _K_CONFIRM = (0, 1, 2, 3)
 _FORMATION_KINDS = ("W", "IHS", "M", "HS")
 _PIVOT_TOL = (0.15, 0.25)
@@ -66,15 +121,15 @@ def universe_path() -> Path:
 
 
 def universe_sha256(path: Path | None = None) -> str:
-    """sha256 of the universe file bytes. This is the value for the FREEZE manifest."""
+    """sha256 of the universe file bytes."""
     target = _UNIVERSE_PATH if path is None else Path(path)
-    return hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashlib.sha256(read_bytes(target)).hexdigest()
 
 
 def load_universe_symbols(path: Path | None = None) -> tuple[str, ...]:
     """Symbol list from ``universe_fixed33.json``. No other universe file is read."""
     target = _UNIVERSE_PATH if path is None else Path(path)
-    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload = json.loads(read_text(target))
     symbols = tuple(payload["symbols"])
     if len(symbols) != 33 or len(set(symbols)) != 33:
         raise RuntimeError("universe file must list 33 distinct symbols")
@@ -83,17 +138,74 @@ def load_universe_symbols(path: Path | None = None) -> tuple[str, ...]:
     return symbols
 
 
-UNIVERSE: tuple[str, ...] = load_universe_symbols()
+def frozen_engine_values() -> dict:
+    """Frozen ``EngineCfg`` fields. ``k_zones`` is the only variant field."""
+    return {
+        "k_cluster": K_CLUSTER,
+        "n_5m": PIVOT_N["5m"],
+        "n_15m": PIVOT_N["15m"],
+        "n_1h": PIVOT_N["1h"],
+        "n_1d": PIVOT_N["1d"],
+        "atr_length": ATR_LENGTH,
+        "profile_sessions": PROFILE_SESSIONS,
+        "profile_percentile": PROFILE_PERCENTILE,
+        "profile_bin_atr": PROFILE_BIN_ATR,
+        "zone_pad_atr": ZONE_PAD_ATR,
+        "candidate_band_atr": CANDIDATE_BAND_ATR,
+        "touch_sessions": TOUCH_SESSIONS,
+        "recency_half_life_sessions": RECENCY_HALF_LIFE_SESSIONS,
+        "score_touches": SCORE_WEIGHTS["touches"],
+        "score_rejections": SCORE_WEIGHTS["rejections"],
+        "score_recency": SCORE_WEIGHTS["recency"],
+        "score_volume": SCORE_WEIGHTS["volume"],
+        "opening_range_start_et": OPENING_RANGE_START_ET,
+        "opening_range_end_et": OPENING_RANGE_END_ET,
+        "warmup_date": WARMUP_DATE,
+        "dev_start": DEV_START,
+        "dev_end": DEV_END,
+        "holdout_start": HOLDOUT_START,
+        "holdout_end": HOLDOUT_END,
+        "no_new_entries_after_et": NO_NEW_ENTRIES_AFTER_ET,
+        "forced_exit_bar_open_et": FORCED_EXIT_BAR_OPEN_ET,
+        "stop_buffer_atr": STOP_BUFFER_ATR,
+        "stop_floor_atr": STOP_FLOOR_ATR,
+        "arm_atr": ARM_ATR,
+        "cancel_bars": CANCEL_BARS,
+        "entry_offset": ENTRY_OFFSET,
+        "risk_fraction": RISK_FRACTION,
+        "notional_cap_position": NOTIONAL_CAP_POSITION,
+        "notional_cap_total": NOTIONAL_CAP_TOTAL,
+        "model_equity": MODEL_EQUITY,
+        "max_entries_per_day": MAX_ENTRIES_PER_DAY,
+        "max_concurrent": MAX_CONCURRENT,
+        "max_per_symbol": MAX_PER_SYMBOL,
+        "daily_loss_stop": DAILY_LOSS_STOP,
+        "max_losses_day": PRIMARY_GUARDRAIL["daily_losses"],
+        "max_losses_week": PRIMARY_GUARDRAIL["weekly_losses"],
+        "rvol_sessions": RVOL_SESSIONS,
+        "rsi_length": RSI_LENGTH,
+        "stoch_k": STOCH_K,
+        "stoch_d": STOCH_D,
+        "stoch_smooth": STOCH_SMOOTH,
+        "macd_fast": MACD_FAST,
+        "macd_slow": MACD_SLOW,
+        "macd_signal": MACD_SIGNAL,
+        "indicator_warmup_bars": INDICATOR_WARMUP_BARS,
+        "round_step_under_50": ROUND_STEP_UNDER_50,
+        "round_step_under_250": ROUND_STEP_UNDER_250,
+        "round_step_under_1000": ROUND_STEP_UNDER_1000,
+        "round_step_else": ROUND_STEP_ELSE,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "touch_window_bars": TOUCH_WINDOW_BARS,
+        "formation_pivot_gap_min": FORMATION_PIVOT_GAP_MIN,
+        "formation_pivot_gap_max": FORMATION_PIVOT_GAP_MAX,
+        "shoulder_atr": SHOULDER_ATR,
+        "hvn_rejection_wick": HVN_REJECTION_WICK,
+    }
 
-FIXED: dict = {
-    "k_cluster_atr": K_CLUSTER,
-    "entries_per_day": MAX_ENTRIES_PER_DAY,
-    "max_concurrent": MAX_CONCURRENT,
-    "max_per_symbol": MAX_PER_SYMBOL,
-    "daily_loss_stop": DAILY_LOSS_STOP,
-    "pivot_n": dict(PIVOT_N),
-    "score_weights": dict(SCORE_WEIGHTS),
-}
+
+UNIVERSE: tuple[str, ...] = load_universe_symbols()
 
 
 def _equity_grid(test: str) -> tuple[dict, ...]:
@@ -189,6 +301,22 @@ FORMATIONS: tuple[dict, ...] = _formation_grid()
 OPTIONS: tuple[dict, ...] = _options_grid()
 OPTIONS_0DTE: tuple[dict, ...] = _options_0dte_grid()
 
+FIXED: dict = {
+    "primary_guardrail": dict(PRIMARY_GUARDRAIL),
+    "k_cluster_atr": K_CLUSTER,
+    "entries_per_day": MAX_ENTRIES_PER_DAY,
+    "max_concurrent": MAX_CONCURRENT,
+    "max_per_symbol": MAX_PER_SYMBOL,
+    "daily_loss_stop": DAILY_LOSS_STOP,
+    "no_new_entries_after_et": NO_NEW_ENTRIES_AFTER_ET,
+    "forced_exit_bar_open_et": FORCED_EXIT_BAR_OPEN_ET,
+    "risk_fraction": RISK_FRACTION,
+    "model_equity": MODEL_EQUITY,
+    "pivot_n": dict(PIVOT_N),
+    "score_weights": dict(SCORE_WEIGHTS),
+    "engine": frozen_engine_values(),
+}
+
 
 def _enforce_caps() -> None:
     if len(TEST_A) != CAP_TEST_A:
@@ -210,26 +338,43 @@ def _enforce_caps() -> None:
         raise RuntimeError("universe must be 33 distinct symbols")
     if K_CLUSTER != 0.25:
         raise RuntimeError("k_cluster is fixed at 0.25")
-    if PRIMARY_GUARDRAIL != (2, 5):
-        raise RuntimeError("PRIMARY_GUARDRAIL must be (2, 5)")
-    for row in TEST_A + TEST_B:
-        if "k_cluster" in row:
-            raise RuntimeError("k_cluster must not be a grid axis")
-        if row["k_confirm"] not in _K_CONFIRM:
+    if PRIMARY_GUARDRAIL != {"daily_losses": 2, "weekly_losses": 5}:
+        raise RuntimeError("PRIMARY_GUARDRAIL must be daily_losses 2 and weekly_losses 5")
+    if COMPARISON_GUARDRAILS != (
+        {"name": "none"},
+        {"name": "d2+w6", "daily_losses": 2, "weekly_losses": 6},
+    ):
+        raise RuntimeError("COMPARISON_GUARDRAILS drifted")
+    if SPEC_VERSION != "v1.3.1":
+        raise RuntimeError("spec_version must be v1.3.1")
+    rows = TEST_A + TEST_B + FORMATIONS + OPTIONS + OPTIONS_0DTE
+    for row in rows:
+        for key in _ROW_GUARD_KEYS:
+            if key in row:
+                raise RuntimeError(f"{key} must not be a grid-row key")
+        if "k_confirm" in row and row["k_confirm"] not in _K_CONFIRM:
             raise RuntimeError("k_confirm outside {0, 1, 2, 3}")
 
 
 def grid_document() -> dict:
-    """JSON-ready document. Key order does not matter; ``canonical_json`` sorts."""
+    """Canonical document. Includes the default engine config and the universe hash."""
+    from dataclasses import asdict
+
+    from research.intraday_sr.types import EngineCfg
+
     return {
+        "spec_version": SPEC_VERSION,
+        "universe_sha256": universe_sha256(),
+        "primary_guardrail": dict(PRIMARY_GUARDRAIL),
+        "comparison_guardrails": [dict(row) for row in COMPARISON_GUARDRAILS],
         "fixed": FIXED,
+        "engine_cfg": asdict(EngineCfg()),
         "formations": list(FORMATIONS),
         "options": list(OPTIONS),
         "options_0dte": list(OPTIONS_0DTE),
         "test_a": list(TEST_A),
         "test_b": list(TEST_B),
         "universe": list(UNIVERSE),
-        "primary_guardrail": [int(PRIMARY_GUARDRAIL[0]), int(PRIMARY_GUARDRAIL[1])],
     }
 
 
@@ -242,8 +387,13 @@ def grid_sha256(document: Mapping | None = None) -> str:
     return hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
 
 
+def __getattr__(name: str):
+    if name == "GRID_SHA256":
+        return grid_sha256()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 _enforce_caps()
-GRID_SHA256 = grid_sha256()
 
 
 def iter_variants(rows: Iterable[Mapping]) -> Iterable[Mapping]:
@@ -251,22 +401,29 @@ def iter_variants(rows: Iterable[Mapping]) -> Iterable[Mapping]:
 
 
 def format_grid_summary() -> str:
-    """Printable CP0 summary of both equity and options grids."""
+    """Printable summary of the frozen grids."""
+    digest = grid_sha256()
     lines = [
-        "intraday-sr grids (spec v1.3; axes unchanged from v1.1 A1-A2)",
-        f"sha256 {GRID_SHA256}",
+        "intraday-sr grids (spec v1.3.1; axes unchanged from v1.1 A1-A2)",
+        f"sha256 {digest}",
+        f"spec_version {SPEC_VERSION}",
         f"universe_sha256 {universe_sha256()}",
         f"N {N_TRIALS}",
-        f"primary_guardrail max_losses_day={PRIMARY_GUARDRAIL[0]} max_losses_week={PRIMARY_GUARDRAIL[1]}",
+        (
+            "primary_guardrail "
+            f"daily_losses={PRIMARY_GUARDRAIL['daily_losses']} "
+            f"weekly_losses={PRIMARY_GUARDRAIL['weekly_losses']}"
+        ),
+        "comparison_guardrails none, d2+w6",
         f"test_a {len(TEST_A)}  (cap {CAP_TEST_A})",
         f"test_b {len(TEST_B)}  (cap {CAP_TEST_B})",
         (
             "test_a/b axes: K{3,5} x oscillator{rsi14_30_70, stoch14_3_3_20_80} "
-            "x rvol_min{1.5,2.0} x entry_tf{5m,15m} x target{1R,2R,next_zone} "
+            "x rvol_min{1.5,2.0} x entry_tf{5m,15m} x target{1R,2R,zone} "
             "x k_confirm{0,1,2,3}"
         ),
         f"formations {len(FORMATIONS)}  (cap {CAP_FORMATIONS})",
-        "formations axes: kind{W,IHS,M,HS} x entry_tf{5m,15m} x target{1R,2R,next_zone} x pivot_tol_atr{0.15,0.25}",
+        "formations axes: kind{W,IHS,M,HS} x entry_tf{5m,15m} x target{1R,2R,zone} x pivot_tol_atr{0.15,0.25}",
         f"options {len(OPTIONS)}  structure{{long_atm, long_otm_1, debit_vertical}} x dte{{0-1, 2-4, 5-7}}",
         (
             f"options_0dte {len(OPTIONS_0DTE)}  stop_pct{{-30,-40,-50}} x "

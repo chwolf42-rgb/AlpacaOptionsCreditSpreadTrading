@@ -1,15 +1,21 @@
-"""Synthetic fixtures cover the six shapes S0 asked for."""
+"""Synthetic fixtures: long paths, strict pivots, and both 2024 DST switches."""
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, time, timedelta
 
+import numpy as np
+
+from research.intraday_sr.data.resample import resample
 from research.intraday_sr.types import ET
 from research.intraday_sr.tests.fixtures import (
+    dst_fall_bars,
+    dst_spring_bars,
     early_close_bars,
     gap_bars,
     ihs_bars,
     range_bars,
+    thanksgiving_early_bars,
     trend_bars,
     w_bars,
 )
@@ -63,6 +69,70 @@ def test_gap_opens_away_from_the_prior_close():
     first = frame[frame["session"] == sessions[0]]
     second = frame[frame["session"] == sessions[1]]
     assert float(second["open"].iloc[0]) == float(first["close"].iloc[-1]) + 4.0
+
+
+def _strict_lows(lows: np.ndarray, n: int = 3) -> list[int]:
+    found = []
+    for index in range(n, len(lows) - n):
+        if lows[index] < lows[index - n : index].min() and lows[index] < lows[index + 1 : index + n + 1].min():
+            found.append(index)
+    return found
+
+
+def test_long_fixtures_have_thirty_sessions_and_varying_volume():
+    for frame in (trend_bars(), range_bars(), w_bars(), ihs_bars(), gap_bars(), early_close_bars()):
+        assert frame["session"].nunique() >= 30
+        assert frame["volume"].nunique() > 1
+
+
+def test_w_and_ihs_strict_pivots():
+    w = w_bars()
+    day = w[w["session"] == w["session"].iloc[0]]
+    lows = _strict_lows(day["low"].to_numpy(dtype=np.float64))
+    assert 10 in lows
+    assert 50 in lows
+    ihs = ihs_bars()
+    day = ihs[ihs["session"] == ihs["session"].iloc[0]]
+    lows = _strict_lows(day["low"].to_numpy(dtype=np.float64))
+    assert 12 in lows
+    assert 32 in lows
+    assert 52 in lows
+
+
+def _opens_at_0930(frame) -> None:
+    opens = frame["ts"].dt.tz_convert(ET)
+    first = frame[frame["session"] == frame["session"].iloc[0]]
+    assert first["ts"].iloc[0].astimezone(ET).hour == 9
+    assert first["ts"].iloc[0].astimezone(ET).minute == 30
+    assert (opens.dt.hour * 60 + opens.dt.minute >= 9 * 60 + 30).all()
+
+
+def test_dst_weeks_and_the_november_early_close():
+    spring = dst_spring_bars()
+    fall = dst_fall_bars()
+    early = thanksgiving_early_bars()
+    _opens_at_0930(spring)
+    _opens_at_0930(fall)
+    _opens_at_0930(early)
+    march_8 = spring[spring["session"] == date(2024, 3, 8)]
+    march_11 = spring[spring["session"] == date(2024, 3, 11)]
+    nov_1 = fall[fall["session"] == date(2024, 11, 1)]
+    nov_4 = fall[fall["session"] == date(2024, 11, 4)]
+    assert len(march_8) == 78 and len(march_11) == 78
+    assert len(nov_1) == 78 and len(nov_4) == 78
+    assert len(early) == 42
+    assert march_8["ts"].iloc[0].utcoffset() == timedelta(hours=-5)
+    assert march_11["ts"].iloc[0].utcoffset() == timedelta(hours=-4)
+    assert nov_1["ts"].iloc[0].utcoffset() == timedelta(hours=-4)
+    assert nov_4["ts"].iloc[0].utcoffset() == timedelta(hours=-5)
+    assert early["ts"].iloc[0].utcoffset() == timedelta(hours=-5)
+    assert early["available_at"].iloc[-1].astimezone(ET).hour == 13
+    for frame in (spring, fall):
+        bars = resample(frame, "15m")
+        first = bars["ts"].iloc[0].astimezone(ET)
+        second = bars["ts"].iloc[1].astimezone(ET)
+        assert first.hour == 9 and first.minute == 30
+        assert second.hour == 9 and second.minute == 45
 
 
 def test_w_and_ihs_have_the_expected_extremes():

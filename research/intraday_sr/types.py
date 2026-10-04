@@ -1,11 +1,8 @@
-"""Shared dataclasses from spec §3.
+"""Shared dataclasses from spec §3 (v1.3.1).
 
-Field names and meanings match ``docs/intraday-sr/SPEC.md`` (v1.2).
 Harness config classes (``RiskCfg``, ``CostCfg``, ``Fold``) are Developer 1's
-and are not defined here.
-
-S0 additions, pending CP0, are the fields and the helper marked below.
-Each added field has a default so a §3 constructor still works.
+and are not defined here. Frozen numbers live in ``grids.py``. ``EngineCfg``
+defaults are those numbers.
 """
 
 from __future__ import annotations
@@ -13,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from research.intraday_sr import grids as _grids
 
 TZ = "America/New_York"
 ET = ZoneInfo(TZ)
@@ -29,7 +28,10 @@ EntryTF = Literal["5m", "15m"]
 Direction = Literal[1, -1]
 TestName = Literal["A", "B", "F_W", "F_IHS", "F_M", "F_HS"]
 FormationKind = Literal["W", "IHS", "M", "HS"]
-TargetName = Literal["1R", "2R", "next_zone"]
+TargetName = Literal["1R", "2R", "zone"]
+_OPTIONAL_FLAGS = ("oscillator", "macd", "rvol")
+_TARGET_KEYS = frozenset({"1R", "2R", "zone"})
+_ENTRY_WIDTH = {"5m": timedelta(minutes=5), "15m": timedelta(minutes=15)}
 OscillatorName = Literal["rsi14_30_70", "stoch14_3_3_20_80"]
 
 
@@ -63,14 +65,15 @@ def zone_id_for(
     low: float,
     high: float,
     engine_cfg: str,
+    tf: str,
 ) -> str:
-    """Stable id: sha256 of symbol, side, midpoint rounded half-up to 1e-4, engine_cfg.
+    """Stable id: sha256 of symbol, side, tf, midpoint rounded half-up to 1e-4, engine_cfg.
 
-    S0 addition, pending CP0.
+    ``tf`` is part of the identity so a 5m zone and a 15m zone cannot collide.
     """
     mid = (float(low) + float(high)) / 2.0
     rounded = round_half_up(mid, 4)
-    payload = f"{symbol}|{side}|{rounded:.4f}|{engine_cfg}"
+    payload = f"{symbol}|{side}|{tf}|{rounded:.4f}|{engine_cfg}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -142,10 +145,9 @@ class Zone:
     valid_from_ts: datetime
     available_at: datetime
     engine_cfg: str
-    # S0 additions, pending CP0.
+    tf: EntryTF
+    atr_d: float
     zone_id: str = ""
-    tf: str = ""
-    atr_d: float = float("nan")
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "low", float(self.low))
@@ -157,26 +159,37 @@ class Zone:
         object.__setattr__(self, "valid_from_ts", as_et(self.valid_from_ts, "Zone.valid_from_ts"))
         object.__setattr__(self, "available_at", as_et(self.available_at, "Zone.available_at"))
         object.__setattr__(self, "atr_d", float(self.atr_d))
+        if self.low > self.high:
+            raise ValueError("Zone.low must be <= Zone.high")
+        if self.tf not in ("5m", "15m"):
+            raise ValueError("Zone.tf must be 5m or 15m")
+        if not math.isfinite(self.atr_d) or self.atr_d <= 0.0:
+            raise ValueError("Zone.atr_d must be finite and > 0")
+        if self.valid_from_ts != self.available_at:
+            raise ValueError("Zone.valid_from_ts must equal available_at")
+        if self.as_of_ts > self.available_at:
+            raise ValueError("Zone.as_of_ts must be <= available_at")
+        expected = zone_id_for(self.symbol, self.side, self.low, self.high, self.engine_cfg, self.tf)
         if self.zone_id == "":
-            object.__setattr__(
-                self,
-                "zone_id",
-                zone_id_for(self.symbol, self.side, self.low, self.high, self.engine_cfg),
-            )
+            object.__setattr__(self, "zone_id", expected)
+        elif self.zone_id != expected:
+            raise ValueError("Zone.zone_id does not match symbol, side, tf, midpoint, and engine_cfg")
 
 
 def _extreme_from_pivots(
     kind: str,
     pivots: Sequence[tuple[datetime, float]],
-    fallback_ts: datetime,
 ) -> tuple[datetime, float]:
+    """Pattern low (W, IHS) or pattern high (M, HS). Ties take the earliest pivot."""
     if not pivots:
-        return fallback_ts, float("nan")
-    # W / IHS stop reference is the lowest trough. M / HS is the highest peak.
+        raise ValueError("Formation.extreme is derived from pivots")
     if kind in ("W", "IHS"):
-        ts, price = min(pivots, key=lambda item: (item[1], item[0]))
+        price = min(item[1] for item in pivots)
+    elif kind in ("M", "HS"):
+        price = max(item[1] for item in pivots)
     else:
-        ts, price = max(pivots, key=lambda item: (item[1], item[0]))
+        raise ValueError("Formation.kind is not W, IHS, M, or HS")
+    ts = min(item[0] for item in pivots if item[1] == price)
     return ts, float(price)
 
 
@@ -187,7 +200,13 @@ def formation_id_for(
     confirmed_ts: datetime,
     pivots: Sequence[tuple[datetime, float]],
 ) -> str:
-    """S0 addition, pending CP0. Identity of a confirmed pattern, not its later break."""
+    """Identity of a confirmed pattern.
+
+    The hash covers kind, symbol, timeframe, confirmation time, and the
+    pivot timestamps and prices. It does not include the formation grid's
+    ``pivot_tol_atr``: that tolerance is how the pattern was selected, not
+    which pattern it is.
+    """
     parts = [kind, symbol, tf, confirmed_ts.isoformat()]
     for ts, price in pivots:
         parts.append(f"{ts.isoformat()}@{price:.6f}")
@@ -214,55 +233,60 @@ class Formation:
     as_of_ts: datetime
     available_at: datetime
     zone_id: str | None
-    # S0 additions, pending CP0.
     formation_id: str = ""
     extreme: tuple[datetime, float] | None = None
-    measured_move: float = float("nan")
 
     def __post_init__(self) -> None:
+        if self.tf not in _ENTRY_WIDTH:
+            raise ValueError("Formation.tf must be 5m or 15m")
         pivots = tuple((as_et(ts, "Formation.pivots.ts"), float(price)) for ts, price in self.pivots)
         object.__setattr__(self, "pivots", pivots)
         object.__setattr__(self, "neckline", (float(self.neckline[0]), float(self.neckline[1])))
         object.__setattr__(self, "invalidation", float(self.invalidation))
         object.__setattr__(self, "break_ts", as_et(self.break_ts, "Formation.break_ts"))
-        if self.retest_ts is not None:
-            object.__setattr__(self, "retest_ts", as_et(self.retest_ts, "Formation.retest_ts"))
+        retest = None if self.retest_ts is None else as_et(self.retest_ts, "Formation.retest_ts")
+        object.__setattr__(self, "retest_ts", retest)
         confirmed = as_et(self.confirmed_ts, "Formation.confirmed_ts")
         object.__setattr__(self, "confirmed_ts", confirmed)
         object.__setattr__(self, "as_of_ts", as_et(self.as_of_ts, "Formation.as_of_ts"))
         object.__setattr__(self, "available_at", as_et(self.available_at, "Formation.available_at"))
-        extreme = self.extreme
-        if extreme is None:
-            extreme = _extreme_from_pivots(self.kind, pivots, confirmed)
-        else:
-            extreme = (as_et(extreme[0], "Formation.extreme.ts"), float(extreme[1]))
-        object.__setattr__(self, "extreme", extreme)
+        derived = _extreme_from_pivots(self.kind, pivots)
+        if self.extreme is not None:
+            given_ts = as_et(self.extreme[0], "Formation.extreme.ts")
+            given_px = float(self.extreme[1])
+            if given_ts != derived[0] or given_px != derived[1]:
+                raise ValueError("Formation.extreme is derived from pivots")
+        object.__setattr__(self, "extreme", derived)
+        lag = _grids.PIVOT_N[self.tf] * _ENTRY_WIDTH[self.tf]
+        last_pivot = max(ts for ts, _ in pivots)
+        if confirmed < last_pivot + lag:
+            raise ValueError("Formation.confirmed_ts is before the last pivot is knowable")
+        if not (confirmed <= self.break_ts <= self.available_at):
+            raise ValueError("Formation requires confirmed_ts <= break_ts <= available_at")
+        if retest is not None and retest <= self.break_ts:
+            raise ValueError("Formation.retest_ts must be after break_ts")
+        if derived[0] > confirmed or derived[0] not in {ts for ts, _ in pivots}:
+            raise ValueError("Formation.extreme must be a pivot at or before confirmation")
         if self.formation_id == "":
             object.__setattr__(
                 self,
                 "formation_id",
                 formation_id_for(self.kind, self.symbol, self.tf, confirmed, pivots),
             )
-        measured = float(self.measured_move)
-        if math.isnan(measured) and not math.isnan(extreme[1]):
-            neck = float(self.neckline[0])
-            # Pending CP0: projected from the neckline price at the break.
-            if self.kind in ("W", "IHS"):
-                measured = neck + (neck - extreme[1])
-            else:
-                measured = neck - (extreme[1] - neck)
-        object.__setattr__(self, "measured_move", measured)
 
 
 @dataclass(frozen=True)
 class Signal:
-    """One armed entry. ``confluence`` is an S0 addition, pending CP0.
+    """One armed entry.
+
+    ``trigger``, ``stop``, and ``targets`` are adjusted prices.
+    ``as_traded = adjusted * Bar.adj_factor``, where ``Bar.adj_factor`` is
+    raw/adjusted. ``targets`` keys are exactly ``1R``, ``2R``, and ``zone``.
 
     ``confluence`` is how many of the three optional conditions held
-    (oscillator, MACD, RVOL), from 0 to 3. It is not the variant's
-    ``k_confirm`` threshold. v1.1 A1: a variant requires at least
-    ``k_confirm`` of those conditions; the hold and the re-confirmation
-    stay mandatory.
+    (oscillator, MACD, RVOL), from 0 to 3. It equals the count of those
+    flags in ``components``. It is not a score and it is not ``k_confirm``.
+    Ties stay on zone score, then symbol.
     """
 
     symbol: str
@@ -282,12 +306,25 @@ class Signal:
     confluence: int = 0
 
     def __post_init__(self) -> None:
+        if self.direction not in (1, -1):
+            raise ValueError("Signal.direction must be 1 or -1")
+        if self.tf not in ("5m", "15m"):
+            raise ValueError("Signal.tf must be 5m or 15m")
+        if self.test not in ("A", "B", "F_W", "F_IHS", "F_M", "F_HS"):
+            raise ValueError("Signal.test is not a known test name")
         if self.confluence not in (0, 1, 2, 3):
             raise ValueError("Signal.confluence must be 0, 1, 2, or 3")
+        if not math.isfinite(float(self.zone.atr_d)) or float(self.zone.atr_d) <= 0.0:
+            raise ValueError("Signal.zone.atr_d must be finite and > 0")
         object.__setattr__(self, "trigger", float(self.trigger))
         object.__setattr__(self, "stop", float(self.stop))
         object.__setattr__(self, "targets", freeze_map(self.targets))
         object.__setattr__(self, "components", freeze_map(self.components))
+        if set(self.targets) != _TARGET_KEYS:
+            raise ValueError("Signal.targets keys must be exactly 1R, 2R, and zone")
+        flag_count = sum(1 for name in _OPTIONAL_FLAGS if float(self.components.get(name, 0.0)) != 0.0)
+        if flag_count != self.confluence:
+            raise ValueError("Signal.confluence must equal the optional-condition count")
         object.__setattr__(self, "expires_at", as_et(self.expires_at, "Signal.expires_at"))
         object.__setattr__(self, "as_of_ts", as_et(self.as_of_ts, "Signal.as_of_ts"))
         object.__setattr__(self, "available_at", as_et(self.available_at, "Signal.available_at"))
@@ -335,47 +372,96 @@ class BarSet:
     ``available_at`` is at or before ``as_of``.
     """
 
-    frame: pd.DataFrame
+    _frame: pd.DataFrame
 
     def visible(self, as_of: datetime) -> pd.DataFrame:
+        """Rows with ``available_at <= as_of``.
+
+        ``available_at`` must be sorted ascending. The slice is a prefix
+        from ``searchsorted``.
+        """
         as_of = as_et(as_of, "as_of")
-        frame = self.frame
+        frame = self._frame
         if frame.empty:
-            return frame.copy()
-        return frame.loc[frame["available_at"] <= as_of].copy()
+            return frame.iloc[0:0]
+        cutoff = pd.Timestamp(as_of)
+        index = int(frame["available_at"].searchsorted(cutoff, side="right"))
+        return frame.iloc[:index]
 
 
 @dataclass(frozen=True)
 class EngineCfg:
-    """Engine constants implied by §4 and §5. ``k_cluster`` is fixed, not a grid axis.
-
-    ``k_zones`` is the variant's K. Everything else is frozen.
-    """
+    """Engine constants. ``k_zones`` is the variant's K. Every other field is frozen in ``grids.py``."""
 
     k_zones: int = 5
-    k_cluster: float = 0.25
-    n_5m: int = 3
-    n_15m: int = 3
-    n_1h: int = 2
-    n_1d: int = 2
-    atr_length: int = 14
-    profile_sessions: int = 5
-    profile_percentile: float = 0.70
-    profile_bin_atr: float = 0.05
-    zone_pad_atr: float = 0.05
-    candidate_band_atr: float = 2.0
-    touch_sessions: int = 20
-    recency_half_life_sessions: float = 5.0
-    score_touches: float = 0.30
-    score_rejections: float = 0.30
-    score_recency: float = 0.20
-    score_volume: float = 0.20
+    k_cluster: float = _grids.K_CLUSTER
+    n_5m: int = _grids.PIVOT_N["5m"]
+    n_15m: int = _grids.PIVOT_N["15m"]
+    n_1h: int = _grids.PIVOT_N["1h"]
+    n_1d: int = _grids.PIVOT_N["1d"]
+    atr_length: int = _grids.ATR_LENGTH
+    profile_sessions: int = _grids.PROFILE_SESSIONS
+    profile_percentile: float = _grids.PROFILE_PERCENTILE
+    profile_bin_atr: float = _grids.PROFILE_BIN_ATR
+    zone_pad_atr: float = _grids.ZONE_PAD_ATR
+    candidate_band_atr: float = _grids.CANDIDATE_BAND_ATR
+    touch_sessions: int = _grids.TOUCH_SESSIONS
+    recency_half_life_sessions: float = _grids.RECENCY_HALF_LIFE_SESSIONS
+    score_touches: float = _grids.SCORE_WEIGHTS["touches"]
+    score_rejections: float = _grids.SCORE_WEIGHTS["rejections"]
+    score_recency: float = _grids.SCORE_WEIGHTS["recency"]
+    score_volume: float = _grids.SCORE_WEIGHTS["volume"]
+    opening_range_start_et: str = _grids.OPENING_RANGE_START_ET
+    opening_range_end_et: str = _grids.OPENING_RANGE_END_ET
+    warmup_date: str = _grids.WARMUP_DATE
+    dev_start: str = _grids.DEV_START
+    dev_end: str = _grids.DEV_END
+    holdout_start: str = _grids.HOLDOUT_START
+    holdout_end: str = _grids.HOLDOUT_END
+    no_new_entries_after_et: str = _grids.NO_NEW_ENTRIES_AFTER_ET
+    forced_exit_bar_open_et: str = _grids.FORCED_EXIT_BAR_OPEN_ET
+    stop_buffer_atr: float = _grids.STOP_BUFFER_ATR
+    stop_floor_atr: float = _grids.STOP_FLOOR_ATR
+    arm_atr: float = _grids.ARM_ATR
+    cancel_bars: int = _grids.CANCEL_BARS
+    entry_offset: float = _grids.ENTRY_OFFSET
+    risk_fraction: float = _grids.RISK_FRACTION
+    notional_cap_position: float = _grids.NOTIONAL_CAP_POSITION
+    notional_cap_total: float = _grids.NOTIONAL_CAP_TOTAL
+    model_equity: int = _grids.MODEL_EQUITY
+    max_entries_per_day: int = _grids.MAX_ENTRIES_PER_DAY
+    max_concurrent: int = _grids.MAX_CONCURRENT
+    max_per_symbol: int = _grids.MAX_PER_SYMBOL
+    daily_loss_stop: float = _grids.DAILY_LOSS_STOP
+    max_losses_day: int = _grids.PRIMARY_GUARDRAIL["daily_losses"]
+    max_losses_week: int = _grids.PRIMARY_GUARDRAIL["weekly_losses"]
+    rvol_sessions: int = _grids.RVOL_SESSIONS
+    rsi_length: int = _grids.RSI_LENGTH
+    stoch_k: int = _grids.STOCH_K
+    stoch_d: int = _grids.STOCH_D
+    stoch_smooth: int = _grids.STOCH_SMOOTH
+    macd_fast: int = _grids.MACD_FAST
+    macd_slow: int = _grids.MACD_SLOW
+    macd_signal: int = _grids.MACD_SIGNAL
+    indicator_warmup_bars: int = _grids.INDICATOR_WARMUP_BARS
+    round_step_under_50: float = _grids.ROUND_STEP_UNDER_50
+    round_step_under_250: float = _grids.ROUND_STEP_UNDER_250
+    round_step_under_1000: float = _grids.ROUND_STEP_UNDER_1000
+    round_step_else: float = _grids.ROUND_STEP_ELSE
+    bootstrap_seed: int = _grids.BOOTSTRAP_SEED
+    bootstrap_resamples: int = _grids.BOOTSTRAP_RESAMPLES
+    touch_window_bars: int = _grids.TOUCH_WINDOW_BARS
+    formation_pivot_gap_min: int = _grids.FORMATION_PIVOT_GAP_MIN
+    formation_pivot_gap_max: int = _grids.FORMATION_PIVOT_GAP_MAX
+    shoulder_atr: float = _grids.SHOULDER_ATR
+    hvn_rejection_wick: float = _grids.HVN_REJECTION_WICK
 
     def __post_init__(self) -> None:
-        if self.k_cluster != 0.25:
-            raise ValueError("k_cluster is fixed at 0.25 ATR_d (spec v1.1)")
         if self.k_zones not in (3, 5):
             raise ValueError("K must be 3 or 5")
+        for name, value in _grids.frozen_engine_values().items():
+            if getattr(self, name) != value:
+                raise ValueError(f"{name} is frozen in grids.py")
 
 
 @dataclass(frozen=True)
@@ -396,21 +482,39 @@ class SignalCfg:
         object.__setattr__(self, "rvol_min", float(self.rvol_min))
 
 
-def nearest_zones(zones: Sequence[Zone], price: float) -> tuple[Zone | None, Zone | None]:
-    """Nearest published zone strictly below and above ``price``.
+def nearest_zones_at(
+    zones: Sequence[Zone],
+    symbol: str,
+    price: float,
+    as_of: datetime,
+) -> tuple[Zone | None, Zone | None]:
+    """Nearest support below ``price`` and resistance above it, as of ``as_of``.
 
-    S0 addition, pending CP0. Midpoint is ``(low + high) / 2``. A zone that
-    contains ``price`` is not returned as either target. Ties break on
-    ``zone_id`` so the choice is stable.
+    Keeps zones for ``symbol`` with ``available_at <= as_of``, then only the
+    latest recompute (``as_of_ts`` equal to the max that is still ``<= as_of``).
+    A zone that contains ``price`` is excluded. Support is used only when the
+    zone sits entirely below ``price``; resistance only when it sits entirely
+    above. Ties break on ``zone_id``.
     """
+    as_of = as_et(as_of, "as_of")
+    eligible = [
+        zone
+        for zone in zones
+        if zone.symbol == symbol and zone.available_at <= as_of and zone.as_of_ts <= as_of
+    ]
+    if not eligible:
+        return None, None
+    latest = max(zone.as_of_ts for zone in eligible)
+    current = [zone for zone in eligible if zone.as_of_ts == latest]
     below: Zone | None = None
     above: Zone | None = None
-    below_mid = float("-inf")
-    above_mid = float("inf")
-    for zone in zones:
-        mid = (zone.low + zone.high) / 2.0
-        if mid < price and (below is None or mid > below_mid or (mid == below_mid and zone.zone_id < below.zone_id)):
-            below, below_mid = zone, mid
-        elif mid > price and (above is None or mid < above_mid or (mid == above_mid and zone.zone_id < above.zone_id)):
-            above, above_mid = zone, mid
+    for zone in current:
+        if zone.low <= price <= zone.high:
+            continue
+        if zone.side == "support" and zone.high < price:
+            if below is None or zone.high > below.high or (zone.high == below.high and zone.zone_id < below.zone_id):
+                below = zone
+        elif zone.side == "resistance" and zone.low > price:
+            if above is None or zone.low < above.low or (zone.low == above.low and zone.zone_id < above.zone_id):
+                above = zone
     return below, above
