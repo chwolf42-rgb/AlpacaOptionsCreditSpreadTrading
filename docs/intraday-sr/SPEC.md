@@ -1,4 +1,4 @@
-# Intraday S/R confluence research: spec v1.1 (frozen before any run)
+# Intraday S/R confluence research: spec v1.2 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
 Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT). Values marked
@@ -42,10 +42,18 @@ Source: Christian's asks relayed via Trading after v1.0 was frozen. Committed be
 ## 1. Universe (pre-declared, frozen once filled)
 - Fixed list: **SPY, QQQ, IWM + 30 single names = 33 symbols.** Same list for every fold, the interim
   runs, and the holdout.
-- **[PLACEHOLDER: filled verbatim from Trading's list file, path to be forwarded by Trading.]**
-  The handoff (`/workspace/research2/intraday_lab_handoff.md`) and the cache contain *quarterly*
+- **LOCKED (v1.2, Sun 2026-10-04 CT), from Trading's `/workspace/research2/sr_fixed33_universe.json` (`asof_session` 2018-12-31):**
+  `SPY QQQ IWM AMZN AAPL MSFT NFLX META NVDA GOOGL AMD BAC V JPM BA INTC MU BRK.B ADBE WFC CSCO C MA JNJ CRM HD XOM UNH DIS ORCL PG WMT MRK`
+  - Rule as applied: PIT S&P 500 members on 2018-12-31, ranked by 60-session median dollar volume through that close; one share
+    class per company (GOOGL kept, GOOG dropped, so NVDA enters as the 31st-ranked name); FB followed as META; still tradable on
+    Alpaca through 2026-09. That last filter is a declared survivorship screen, but it removed **no** names, so the list equals the
+    2019-01-02 PIT list and the "survivorship-biased universe" label below does **not** apply.
+  - Data: `/workspace/research2/data/alpaca_intraday/m5rth_fixed33/` (per-symbol parquet, 5m SIP, adjustment=all, RTH only,
+    2019-01-02 to 2026-09-30, early closes handled; BRK.B stored as `BRK-B`; notes in `README_fixed33.md`). 15m comes from
+    `research/intraday_lab/resample.py::build_15m()` (09:30-anchored). Cloud workers get a packaged copy from Trading, never a re-pull.
+- Background: the handoff (`/workspace/research2/intraday_lab_handoff.md`) and the cache also contain *quarterly*
   point-in-time (PIT) top-30 lists (`research/intraday_lab/plans/universes.json`, 39 quarters,
-  2017-01-03 … 2026-07-01), not one fixed list.
+  2017-01-03 … 2026-07-01). Those are not used for selection.
 - Selection rule the list must satisfy: top 30 non-ETF names by median dollar volume over the 60
   sessions **ending 2018-12-31**, among names that were tradable then (the same rule as `universe.py`). This
   is the 2019-01-02 PIT list, so it has no survivorship bias over the 2019+ test window. Reference copy of
