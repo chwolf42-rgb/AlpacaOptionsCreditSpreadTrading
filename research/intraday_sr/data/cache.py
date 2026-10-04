@@ -27,6 +27,9 @@ from research.intraday_sr.data.adjust import factor_for
 from research.intraday_sr.data.calendar import is_session, last_bar_open
 from research.intraday_sr.types import ET
 
+# Per-symbol RTH parquet. The root is always passed in; this is only the documented default.
+DEFAULT_CACHE_ROOT = Path("/workspace/research2/data/alpaca_intraday/m5rth_fixed33")
+
 STUDY_START = date(2019, 1, 2)
 STUDY_END = date(2026, 9, 30)
 RTH_OPEN = time(9, 30)
@@ -220,3 +223,181 @@ def _drop_spikes(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if not keep_parts:
         return frame.iloc[0:0].copy(), dropped
     return pd.concat(keep_parts, ignore_index=True), dropped
+
+
+def cache_filename(symbol: str) -> str:
+    """Parquet stem for ``symbol``. The cache stores BRK.B as ``BRK-B``."""
+    if symbol == "BRK.B":
+        return "BRK-B"
+    return symbol
+
+
+def symbol_from_cache_name(name: str) -> str:
+    """Inverse of ``cache_filename``. ``FB`` stitches into META."""
+    stem = name[:-8] if name.endswith(".parquet") else name
+    if stem == "BRK-B":
+        return "BRK.B"
+    if stem == "FB":
+        return "META"
+    return stem
+
+
+def symbol_cache_path(cache_root: str | Path, symbol: str) -> Path:
+    return Path(cache_root) / f"{cache_filename(symbol)}.parquet"
+
+
+def expected_bar_count(day: date) -> int | None:
+    """5m bars in one RTH session: 78, or 42 when the NYSE closes at 13:00."""
+    last = last_bar_open(day)
+    if last is None:
+        return None
+    start_min = RTH_OPEN.hour * 60 + RTH_OPEN.minute
+    end_min = last.hour * 60 + last.minute
+    return (end_min - start_min) // 5 + 1
+
+
+@dataclass(frozen=True)
+class SymbolValidation:
+    """Result of checking one symbol's raw cache file before the study reads it."""
+
+    symbol: str
+    rows: int
+    duplicate_timestamps: int
+    outside_rth: int
+    bad_bars: int
+    count_mismatches: tuple[tuple[str, int, int], ...]
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.duplicate_timestamps == 0
+            and self.outside_rth == 0
+            and self.bad_bars == 0
+            and not self.count_mismatches
+        )
+
+
+class SymbolValidationError(ValueError):
+    """Raised when a cache file fails ``validate_symbol`` so the study does not read it."""
+
+    def __init__(self, report: SymbolValidation):
+        self.report = report
+        super().__init__(
+            f"{report.symbol} failed cache validation: "
+            f"duplicates={report.duplicate_timestamps} outside_rth={report.outside_rth} "
+            f"bad_bars={report.bad_bars} session_count_mismatches={len(report.count_mismatches)}"
+        )
+
+
+def validate_symbol(raw: pd.DataFrame, symbol: str) -> SymbolValidation:
+    """Check bar count per session, RTH bounds, duplicate timestamps, and bad bars.
+
+    ``raw`` is the cache file, before bad bars are dropped. A full session must
+    have 78 bars (09:30 through 15:55). An early close must have 42 (through
+    12:55). Anything else, a duplicate open, a print outside that window, or a
+    bar with high < low or a non-positive price fails the symbol.
+    """
+    wanted = SYMBOL_ALIASES.get(symbol, symbol)
+    frame = raw.copy()
+    if "symbol" not in frame.columns:
+        frame["symbol"] = wanted
+    else:
+        frame["symbol"] = frame["symbol"].astype(str).replace(SYMBOL_ALIASES)
+    frame = frame.loc[frame["symbol"] == wanted]
+    if "ts" not in frame.columns:
+        raise ValueError(f"{symbol} cache frame has no ts column")
+    frame = frame.copy()
+    frame["ts"] = _as_et_open(frame["ts"])
+    rows = int(len(frame))
+    duplicate_timestamps = int(frame.duplicated(subset=["ts"]).sum()) if rows else 0
+
+    outside = 0
+    sessions: list[date] = []
+    for ts in frame["ts"]:
+        day = ts.date()
+        last_open = last_bar_open(day)
+        if last_open is None or not (RTH_OPEN <= ts.time() <= last_open):
+            outside += 1
+            sessions.append(day)
+        else:
+            sessions.append(day)
+
+    bad = 0
+    if rows and {"open", "high", "low", "close"}.issubset(frame.columns):
+        prices = frame.loc[:, ["open", "high", "low", "close"]].to_numpy(dtype=np.float64)
+        bad_hl = prices[:, 1] < prices[:, 2]
+        bad_px = (prices <= 0).any(axis=1) | ~np.isfinite(prices).all(axis=1)
+        bad = int((bad_hl | bad_px).sum())
+    elif rows:
+        bad = rows
+
+    mismatches: list[tuple[str, int, int]] = []
+    if rows:
+        counted = pd.Series(sessions).value_counts()
+        for day, actual in counted.items():
+            expected = expected_bar_count(day)
+            if expected is None or int(actual) != expected:
+                mismatches.append((day.isoformat(), int(actual), -1 if expected is None else expected))
+    mismatches.sort()
+    return SymbolValidation(
+        symbol=wanted,
+        rows=rows,
+        duplicate_timestamps=duplicate_timestamps,
+        outside_rth=outside,
+        bad_bars=bad,
+        count_mismatches=tuple(mismatches),
+    )
+
+
+def load_symbol(
+    cache_root: str | Path,
+    symbol: str,
+    *,
+    factors: pd.Series | None = None,
+    start: date = STUDY_START,
+    end: date = STUDY_END,
+) -> tuple[pd.DataFrame, CleanReport]:
+    """Validate one symbol's parquet, then normalize it. An invalid file is not returned."""
+    path = symbol_cache_path(cache_root, symbol)
+    raw = pd.read_parquet(path)
+    report = validate_symbol(raw, symbol)
+    if not report.ok:
+        raise SymbolValidationError(report)
+    return normalize_bars(raw, factors=factors, start=start, end=end, symbol=symbol)
+
+
+def load_universe_bars(
+    cache_root: str | Path,
+    *,
+    factors: pd.Series | None = None,
+    symbols: tuple[str, ...] | list[str] | None = None,
+    start: date = STUDY_START,
+    end: date = STUDY_END,
+) -> tuple[tuple[pd.DataFrame, ...], tuple[CleanReport, ...], tuple[SymbolValidation, ...]]:
+    """Validate every symbol before any normalized frame is built.
+
+    The study must not read a tape that has not passed ``validate_symbol``.
+    When any symbol fails, this raises and returns nothing.
+    """
+    if symbols is None:
+        from research.intraday_sr.grids import UNIVERSE
+
+        names = UNIVERSE
+    else:
+        names = tuple(symbols)
+    raws: list[pd.DataFrame] = []
+    reports: list[SymbolValidation] = []
+    for symbol in names:
+        raw = pd.read_parquet(symbol_cache_path(cache_root, symbol))
+        report = validate_symbol(raw, symbol)
+        if not report.ok:
+            raise SymbolValidationError(report)
+        raws.append(raw)
+        reports.append(report)
+    frames: list[pd.DataFrame] = []
+    cleans: list[CleanReport] = []
+    for symbol, raw in zip(names, raws):
+        frame, clean = normalize_bars(raw, factors=factors, start=start, end=end, symbol=symbol)
+        frames.append(frame)
+        cleans.append(clean)
+    return tuple(frames), tuple(cleans), tuple(reports)

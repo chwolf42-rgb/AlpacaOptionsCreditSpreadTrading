@@ -9,7 +9,17 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from research.intraday_sr.data.cache import normalize_bars
+from research.intraday_sr.data.cache import (
+    SymbolValidationError,
+    cache_filename,
+    expected_bar_count,
+    load_universe_bars,
+    normalize_bars,
+    symbol_cache_path,
+    symbol_from_cache_name,
+    validate_symbol,
+)
+from research.intraday_sr.data.calendar import last_bar_open
 from research.intraday_sr.data.pull import (
     BARS_PATH,
     HttpResponse,
@@ -85,6 +95,78 @@ def test_early_close_drops_the_afternoon():
     assert len(frame) == 42
     last = frame["ts"].iloc[-1].tz_convert(ET)
     assert last.hour == 12 and last.minute == 55
+
+
+def _complete_session(day: date, symbol: str = "SPY") -> list[dict]:
+    last = last_bar_open(day)
+    assert last is not None
+    rows = []
+    ts = datetime(day.year, day.month, day.day, 9, 30, tzinfo=ET)
+    end = datetime(day.year, day.month, day.day, last.hour, last.minute, tzinfo=ET)
+    price = 10.0
+    while ts <= end:
+        rows.append(_bar(ts, price, symbol=symbol))
+        ts += timedelta(minutes=5)
+        price += 0.01
+    return rows
+
+
+def test_validate_symbol_accepts_a_full_session_and_an_early_close():
+    full = date(2024, 6, 3)
+    early = date(2024, 7, 3)
+    assert expected_bar_count(full) == 78
+    assert expected_bar_count(early) == 42
+    full_rows = _complete_session(full, "ADBE")
+    early_rows = _complete_session(early, "ADBE")
+    assert len(full_rows) == 78 and len(early_rows) == 42
+    ok = validate_symbol(pd.DataFrame(full_rows + early_rows), "ADBE")
+    assert ok.ok
+    assert ok.rows == 120
+
+
+def test_validate_symbol_rejects_duplicates_rth_bounds_bad_bars_and_short_sessions():
+    day = date(2024, 6, 3)
+    rows = _complete_session(day, "SPY")
+    dup = pd.DataFrame(rows + [rows[0]])
+    assert not validate_symbol(dup, "SPY").ok
+    assert validate_symbol(dup, "SPY").duplicate_timestamps == 1
+
+    late = rows + [_bar(datetime(2024, 6, 3, 16, 0, tzinfo=ET), 11.0, symbol="SPY")]
+    outside = validate_symbol(pd.DataFrame(late), "SPY")
+    assert outside.outside_rth == 1
+    assert outside.count_mismatches
+
+    bad = list(rows)
+    bad[3] = _bar(bad[3]["ts"], 10.0, high=9.0, low=11.0, symbol="SPY")
+    broken = validate_symbol(pd.DataFrame(bad), "SPY")
+    assert broken.bad_bars == 1
+    assert not broken.ok
+
+    short = validate_symbol(pd.DataFrame(rows[:-1]), "SPY")
+    assert short.count_mismatches == (("2024-06-03", 77, 78),)
+
+
+def test_cache_filename_maps_brk_b_and_blocks_a_bad_symbol_before_normalize(tmp_path: Path, monkeypatch):
+    assert cache_filename("BRK.B") == "BRK-B"
+    assert symbol_from_cache_name("BRK-B.parquet") == "BRK.B"
+    assert symbol_from_cache_name("FB") == "META"
+    day = date(2024, 6, 3)
+    good = pd.DataFrame(_complete_session(day, "SPY"))
+    bad_rows = _complete_session(day, "QQQ")[:-1]
+    good.to_parquet(symbol_cache_path(tmp_path, "SPY"))
+    pd.DataFrame(bad_rows).to_parquet(symbol_cache_path(tmp_path, "QQQ"))
+    calls: list[str] = []
+    real = normalize_bars
+
+    def _wrapped(*args, **kwargs):
+        calls.append("normalize")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("research.intraday_sr.data.cache.normalize_bars", _wrapped)
+    with pytest.raises(SymbolValidationError) as caught:
+        load_universe_bars(tmp_path, symbols=("SPY", "QQQ"), start=day, end=day)
+    assert "QQQ" in str(caught.value)
+    assert calls == []
 
 
 def test_symbol_aliases():

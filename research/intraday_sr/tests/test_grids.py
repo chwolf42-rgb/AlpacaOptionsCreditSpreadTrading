@@ -17,6 +17,7 @@ from research.intraday_sr.grids import (
     MAX_CONCURRENT,
     MAX_ENTRIES_PER_DAY,
     MAX_PER_SYMBOL,
+    N_TRIALS,
     OPTIONS,
     OPTIONS_0DTE,
     TEST_A,
@@ -25,6 +26,8 @@ from research.intraday_sr.grids import (
     canonical_json,
     format_grid_summary,
     grid_sha256,
+    load_universe_symbols,
+    universe_sha256,
 )
 
 
@@ -90,13 +93,24 @@ def test_hash_is_stable_and_in_the_summary():
     assert GRID_SHA256 in summary
     assert "192" in summary
     assert "options_0dte 9" in summary
-    assert "guardrails" in summary
+    assert "N 450" in summary
+    assert universe_sha256() in summary
 
 
-def test_universe_is_the_v12_list():
+def test_trial_count_is_450():
+    assert N_TRIALS == 450
+    assert len(TEST_A) + len(TEST_B) + len(FORMATIONS) + len(OPTIONS) + len(OPTIONS_0DTE) == 450
+
+
+def test_universe_is_loaded_from_the_json_file():
+    loaded = load_universe_symbols()
+    assert UNIVERSE == loaded
     assert len(UNIVERSE) == 33
     assert UNIVERSE[:3] == ("SPY", "QQQ", "IWM")
     assert "META" in UNIVERSE and "FB" not in UNIVERSE
     assert "GOOGL" in UNIVERSE and "GOOG" not in UNIVERSE
     assert "NVDA" in UNIVERSE and "BRK.B" in UNIVERSE
     assert UNIVERSE[-1] == "MRK"
+    digest = universe_sha256()
+    assert len(digest) == 64
+    assert digest == "9a8e2f03823873f046cb1b28338fdeaa042dc36028a330628ba096e3139de5f2"

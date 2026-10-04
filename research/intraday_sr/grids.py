@@ -1,9 +1,9 @@
-"""Frozen §5 grids (spec v1.2, v1.1 amendments A1–A2).
+"""Frozen §5 grids (spec v1.1 A1–A2, unchanged in v1.3).
 
 Caps are enforced at import. The sha256 is of the canonical JSON of the
 equity grids, both options grids, the fixed constants, and the locked
-universe. Loss guardrails (d2 / w5 / w6) are harness overlays and are not
-in this module.
+universe. Trial count N is 450. The universe is read only from
+``universe_fixed33.json`` in this package.
 
 ``k_confirm`` is how many of the three optional stack conditions a variant
 requires (at least that many). ``Signal.confluence`` is how many held.
@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Iterable, Mapping
 
-# Fixed engine / portfolio constants. Not axes. Guardrails are intentionally absent.
+# Fixed engine / portfolio constants. Not axes.
 K_CLUSTER = 0.25
 MAX_ENTRIES_PER_DAY = 12
 MAX_CONCURRENT = 4
@@ -29,42 +30,8 @@ SCORE_WEIGHTS = {
     "volume": 0.20,
 }
 
-# v1.2 locked list. Cache files store BRK.B as BRK-B. FB is stitched into META.
-UNIVERSE: tuple[str, ...] = (
-    "SPY",
-    "QQQ",
-    "IWM",
-    "AMZN",
-    "AAPL",
-    "MSFT",
-    "NFLX",
-    "META",
-    "NVDA",
-    "GOOGL",
-    "AMD",
-    "BAC",
-    "V",
-    "JPM",
-    "BA",
-    "INTC",
-    "MU",
-    "BRK.B",
-    "ADBE",
-    "WFC",
-    "CSCO",
-    "C",
-    "MA",
-    "JNJ",
-    "CRM",
-    "HD",
-    "XOM",
-    "UNH",
-    "DIS",
-    "ORCL",
-    "PG",
-    "WMT",
-    "MRK",
-)
+# Locked list lives in universe_fixed33.json (verbatim). Cache files store BRK.B as BRK-B.
+_UNIVERSE_PATH = Path(__file__).resolve().parent / "universe_fixed33.json"
 
 _K = (3, 5)
 _OSCILLATORS = ("rsi14_30_70", "stoch14_3_3_20_80")
@@ -86,6 +53,33 @@ CAP_FORMATIONS = 48
 CAP_OPTIONS = 9
 CAP_OPTIONS_0DTE = 9
 CAP_OPTIONS_TOTAL = 18
+N_TRIALS = CAP_TEST_A + CAP_TEST_B + CAP_FORMATIONS + CAP_OPTIONS_TOTAL
+
+
+def universe_path() -> Path:
+    """Path of the committed fixed-33 universe file."""
+    return _UNIVERSE_PATH
+
+
+def universe_sha256(path: Path | None = None) -> str:
+    """sha256 of the universe file bytes. This is the value for the FREEZE manifest."""
+    target = _UNIVERSE_PATH if path is None else Path(path)
+    return hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def load_universe_symbols(path: Path | None = None) -> tuple[str, ...]:
+    """Symbol list from ``universe_fixed33.json``. No other universe file is read."""
+    target = _UNIVERSE_PATH if path is None else Path(path)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    symbols = tuple(payload["symbols"])
+    if len(symbols) != 33 or len(set(symbols)) != 33:
+        raise RuntimeError("universe file must list 33 distinct symbols")
+    if symbols[:3] != ("SPY", "QQQ", "IWM"):
+        raise RuntimeError("universe must start with SPY QQQ IWM")
+    return symbols
+
+
+UNIVERSE: tuple[str, ...] = load_universe_symbols()
 
 FIXED: dict = {
     "k_cluster_atr": K_CLUSTER,
@@ -205,6 +199,9 @@ def _enforce_caps() -> None:
         raise RuntimeError(f"0DTE grid has {len(OPTIONS_0DTE)}; cap is {CAP_OPTIONS_0DTE}")
     if len(OPTIONS) + len(OPTIONS_0DTE) != CAP_OPTIONS_TOTAL:
         raise RuntimeError("options variants must total 18")
+    n_trials = len(TEST_A) + len(TEST_B) + len(FORMATIONS) + len(OPTIONS) + len(OPTIONS_0DTE)
+    if n_trials != N_TRIALS or N_TRIALS != 450:
+        raise RuntimeError(f"trial count N must be 450, got {n_trials}")
     if len(UNIVERSE) != 33 or len(set(UNIVERSE)) != 33:
         raise RuntimeError("universe must be 33 distinct symbols")
     if K_CLUSTER != 0.25:
@@ -249,8 +246,10 @@ def iter_variants(rows: Iterable[Mapping]) -> Iterable[Mapping]:
 def format_grid_summary() -> str:
     """Printable CP0 summary of both equity and options grids."""
     lines = [
-        "intraday-sr grids (spec v1.2, v1.1 amendments A1-A2)",
+        "intraday-sr grids (spec v1.3; axes unchanged from v1.1 A1-A2)",
         f"sha256 {GRID_SHA256}",
+        f"universe_sha256 {universe_sha256()}",
+        f"N {N_TRIALS}",
         f"test_a {len(TEST_A)}  (cap {CAP_TEST_A})",
         f"test_b {len(TEST_B)}  (cap {CAP_TEST_B})",
         (
@@ -275,7 +274,6 @@ def format_grid_summary() -> str:
         f"pivot_n {PIVOT_N}",
         f"score_weights {SCORE_WEIGHTS}",
         f"universe {len(UNIVERSE)}: {' '.join(UNIVERSE)}",
-        "guardrails d2/w5/w6 are not in this grid and add no trials",
         f"sample A {TEST_A[0]['variant_id']}",
         f"sample B {TEST_B[0]['variant_id']}",
         f"sample F {FORMATIONS[0]['variant_id']}",
