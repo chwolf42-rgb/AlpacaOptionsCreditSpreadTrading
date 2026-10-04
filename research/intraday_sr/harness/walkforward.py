@@ -75,7 +75,7 @@ def select(runs: Mapping[str, VariantRun], a: date, b: date) -> tuple[Optional[s
         t = _win(run.trades, a, b)
         n = 0 if t is None else len(t)
         if n >= MIN_TRAIN_TRADES:
-            cands.append((float(t["r"].mean()), n, vid))
+            cands.append((round(float(t["r"].mean()), 10), n, vid))   # rounding: float noise is not a tie-break
     if not cands:
         return None, {"eligible": 0}
     cands.sort(key=lambda x: (-x[0], -x[1], x[2]))

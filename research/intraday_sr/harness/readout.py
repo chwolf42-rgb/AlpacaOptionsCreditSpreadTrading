@@ -1,0 +1,290 @@
+"""READOUT.md generator (SPEC section 9 + v1.1 A1-A3). Pure formatting over harness outputs; no selection here.
+
+Sections: header (trial count, grid hash, INTERIM label), per-test headline (trades/day next to edge metrics),
+pass-bar checks in words, per-year / per-symbol tables, trade-off frontier (+ PNG) with the 150-250 trades/mo flag,
+options baseline table, 0DTE table (higher-risk, model-based, low-confidence caveat), guardrail overlay table.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from research.intraday_sr.harness import stats as S
+
+OOS_START, OOS_END = date(2020, 1, 1), date(2026, 3, 31)
+FLAG_LO, FLAG_HI = 150, 250
+ZERO_DTE_CAVEAT = ("0DTE: higher-risk scenario, model-based (no OPRA data). VIX9D-based IV understates near-expiry "
+                   "skew and gamma, so these numbers are low-confidence.")
+
+
+def _pct(x, nd=2):
+    return "n/a" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{100 * x:.{nd}f}%"
+
+
+def _num(x, nd=3):
+    return "n/a" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.{nd}f}"
+
+
+def _ci(d, f=_num):
+    if not d or d.get("mean") is None:
+        return "n/a"
+    return f"{f(d['mean'])} [{f(d['lo'])}, {f(d['hi'])}]"
+
+
+def _md(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "_(none)_\n"
+    cols = list(df.columns)
+    out = ["| " + " | ".join(map(str, cols)) + " |", "|" + "---|" * len(cols)]
+    out += ["| " + " | ".join(str(v) for v in row) + " |" for row in df.itertuples(index=False)]
+    return "\n".join(out) + "\n"
+
+
+def _window(trades: pd.DataFrame, daily: pd.Series, a=OOS_START, b=OOS_END):
+    t = trades
+    if t is not None and len(t):
+        s = pd.to_datetime(t["session"]).dt.date
+        t = t[(s >= a) & (s <= b)]
+    di = pd.to_datetime(daily.index).date
+    return t, daily[(di >= a) & (di <= b)]
+
+
+# ------------------------------------------------------------------ frontier (v1.1 A1)
+def _boot_ratio(num: np.ndarray, den: np.ndarray, seed=S.SEED, n=S.RESAMPLES):
+    nb = len(num)
+    if nb == 0 or den.sum() == 0:
+        return {"mean": None, "lo": None, "hi": None}
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, nb, size=(n, nb))
+    d = den[idx].sum(1)
+    v = np.where(d > 0, num[idx].sum(1) / np.maximum(d, 1e-12), np.nan)
+    lo, hi = np.nanquantile(v, [0.025, 0.975])
+    return {"mean": float(num.sum() / den.sum()), "lo": float(lo), "hi": float(hi)}
+
+
+def frontier_row(test: str, variant_id: str, trades: pd.DataFrame, daily: pd.Series) -> dict:
+    t, dly = _window(trades, daily)
+    m = S.monthly_returns(dly)
+    months = pd.PeriodIndex(m.index) if len(m) else pd.PeriodIndex([], freq="M")
+    if t is None or len(t) == 0:
+        cnt = np.zeros(len(months))
+        mr, wr = {"mean": None}, {"mean": None}
+    else:
+        per = pd.to_datetime(t["session"]).dt.to_period("M")
+        cnt = per.value_counts().reindex(months, fill_value=0).to_numpy(float)
+        day = pd.to_datetime(t["session"]).dt.date.to_numpy()
+        mr = S.day_block_mean_r(t["r"].to_numpy(float), day)
+        codes, uniq = pd.factorize(pd.Series(day))
+        wins = np.bincount(codes, weights=(t["pnl"].to_numpy(float) > 0).astype(float), minlength=len(uniq))
+        n = np.bincount(codes, minlength=len(uniq)).astype(float)
+        wr = _boot_ratio(wins, n)
+    tpm = S.block_mean(cnt) if len(cnt) else {"mean": None}
+    net = S.block_mean(m.to_numpy()) if len(m) else {"mean": None}
+    flag = (tpm.get("mean") is not None and FLAG_LO <= tpm["mean"] <= FLAG_HI
+            and mr.get("lo") is not None and mr["lo"] > 0)
+    return {"test": test, "variant_id": variant_id, "trades_per_mo": tpm, "win_rate": wr, "mean_r": mr,
+            "net_monthly": net, "flag_150_250_lbR_gt0": bool(flag)}
+
+
+def frontier_table(rows: Sequence[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "test": r["test"], "variant": r["variant_id"],
+        "trades/mo [95% CI]": _ci(r["trades_per_mo"], lambda x: f"{x:.0f}"),
+        "win rate": _ci(r["win_rate"], _pct), "avg R": _ci(r["mean_r"]),
+        "net monthly": _ci(r["net_monthly"], _pct), "flag": "FLAG" if r["flag_150_250_lbR_gt0"] else "",
+    } for r in sorted(rows, key=lambda r: -(r["trades_per_mo"].get("mean") or 0))])
+
+
+def frontier_png(rows: Sequence[dict], path: Path) -> Optional[Path]:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    for test, mk in (("A", "o"), ("B", "s"), ("F", "^")):
+        rr = [r for r in rows if r["test"] == test and r["trades_per_mo"].get("mean") is not None
+              and r["mean_r"].get("mean") is not None]
+        if not rr:
+            continue
+        x = np.array([r["trades_per_mo"]["mean"] for r in rr])
+        for k, key, scale in ((0, "mean_r", 1), (1, "net_monthly", 100)):
+            y = np.array([r[key]["mean"] for r in rr]) * scale
+            lo = np.array([r[key]["lo"] for r in rr]) * scale
+            hi = np.array([r[key]["hi"] for r in rr]) * scale
+            ax[k].errorbar(x, y, yerr=[y - lo, hi - y], fmt=mk, ms=3, alpha=.6, elinewidth=.5, label=f"Test {test}")
+    for k, lab in ((0, "OOS mean R / trade (95% CI)"), (1, "OOS net monthly % (95% CI)")):
+        ax[k].axvspan(FLAG_LO, FLAG_HI, color="g", alpha=.08)
+        ax[k].axhline(0, color="k", lw=.6)
+        ax[k].set_xlabel("trades / month")
+        ax[k].set_ylabel(lab)
+        ax[k].legend(fontsize=8)
+    fig.suptitle("Trade-off frontier, all logged variants (shaded: 150-250 trades/mo)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+# ------------------------------------------------------------------ headline / pass bar
+def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: int, var_sr: Optional[float] = None) -> dict:
+    n_sessions = len(daily)
+    day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if len(trades) else np.array([])
+    s = S.trade_summary(trades["r"].to_numpy(float) if len(trades) else np.array([]),
+                        trades["pnl"].to_numpy(float) if len(trades) else np.array([]), day, n_sessions, daily)
+    s["dsr"] = S.deflated_sharpe(daily, n_trials, var_sr)
+    if len(trades):
+        yrs = pd.to_datetime(trades["session"]).dt.year
+        my = S.monthly_returns(daily)
+        s["years_positive"] = {int(y): float(g["r"].mean()) for y, g in trades.groupby(yrs)}
+        s["monthly_by_year"] = {int(y): float(v.mean()) for y, v in my.groupby(my.index.year)} if len(my) else {}
+    return s
+
+
+def pass_bar_words(h: dict, cost_x2_mean_r: Optional[float] = None) -> list[str]:
+    """SPEC section 8 checks, stated in words. Returns one line per criterion (PASS/FAIL/UNKNOWN)."""
+    out = []
+    mr = h.get("mean_r_ci", {})
+    out.append(f"{'PASS' if mr.get('lo') is not None and mr['lo'] > 0 else 'FAIL'}: OOS mean R 95% lower bound "
+               f"{_num(mr.get('lo'))} must be > 0.")
+    mc = h.get("monthly_ci", {})
+    out.append(f"{'PASS' if mc.get('lo') is not None and mc['lo'] > 0 else 'FAIL'}: OOS monthly return 95% lower "
+               f"bound {_pct(mc.get('lo'))} must be > 0.")
+    d = h.get("dsr", {}).get("dsr")
+    out.append(f"{'PASS' if d is not None and d >= 0.95 else 'FAIL'}: deflated Sharpe {_num(d)} "
+               f"(N = {h.get('dsr', {}).get('n_trials')}) must be >= 0.95.")
+    yp = h.get("years_positive", {})
+    npos = sum(v > 0 for v in yp.values())
+    out.append(f"INFO: mean R positive in {npos} of {len(yp)} calendar years.")
+    if cost_x2_mean_r is not None:
+        out.append(f"{'PASS' if cost_x2_mean_r > 0 else 'FAIL'}: mean R at 2x costs {_num(cost_x2_mean_r)} must stay > 0.")
+    return out
+
+
+# ------------------------------------------------------------------ options tables
+def options_variant_row(name: str, daily: pd.Series, taken: pd.DataFrame, counters: Mapping, skipped: Mapping) -> dict:
+    m = S.monthly_returns(daily)
+    pnl = taken["pnl"].to_numpy(float) if len(taken) else np.array([])
+    w, l = pnl[pnl > 0], pnl[pnl <= 0]
+    aw, al = (w.mean() if w.size else np.nan), (l.mean() if l.size else np.nan)
+    be = abs(al) / (aw + abs(al)) if w.size and l.size else np.nan
+    mc = S.block_mean(m.to_numpy()) if len(m) else {"mean": None}
+    return {"variant": name, "trades": int(pnl.size), "trades/mo": _num(pnl.size / max(len(m), 1), 1),
+            "win rate": _pct(float((pnl > 0).mean()) if pnl.size else None),
+            "avg win $": _num(aw, 0), "avg loss $": _num(al, 0), "break-even win": _pct(be),
+            "monthly mean [95% CI]": _ci(mc, _pct), "max DD": _pct(S.max_drawdown(daily) if len(daily) else None),
+            "worst day": _pct(float(daily.min()) if len(daily) else None),
+            "skipped (no expiry)": int(skipped.get("no_same_day_expiry", skipped.get("no_expiry_in_bucket", 0)))}
+
+
+def guardrail_rows(results: Mapping[str, tuple]) -> pd.DataFrame:
+    """results: name -> (daily Series, n_trades, counters). Compared against 'none'."""
+    def wk_worst(d):
+        if not len(d):
+            return np.nan
+        idx = pd.DatetimeIndex(pd.to_datetime(d.index))
+        return float(((1 + pd.Series(d.to_numpy(), idx)).groupby(idx.to_period("W")).prod() - 1).min())
+    base_d, base_n, _ = results["none"]
+    bm = S.monthly_returns(base_d)
+    rows = []
+    for name, (d, n, c) in results.items():
+        m = S.monthly_returns(d)
+        days = max(len(d), 1)
+        weeks = max(len(pd.DatetimeIndex(pd.to_datetime(d.index)).to_period("W").unique()), 1) if len(d) else 1
+        rows.append({"overlay": name,
+                     "day trigger rate": _pct(c.get("guardrail_day_triggers", 0) / days, 1),
+                     "week trigger rate": _pct(c.get("guardrail_week_triggers", 0) / weeks, 1),
+                     "trades/mo": _num(n / max(len(m), 1), 1),
+                     "d trades/mo": _num((n / max(len(m), 1)) - base_n / max(len(bm), 1), 1),
+                     "monthly mean": _pct(float(m.mean()) if len(m) else None),
+                     "d monthly": _pct((float(m.mean()) - float(bm.mean())) if len(m) and len(bm) else None),
+                     "max DD": _pct(S.max_drawdown(d) if len(d) else None),
+                     "d max DD": _pct((S.max_drawdown(d) - S.max_drawdown(base_d)) if len(d) and len(base_d) else None),
+                     "worst week": _pct(wk_worst(d))})
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------ document
+@dataclass
+class ReadoutInputs:
+    spec_version: str
+    git_sha: str
+    grid_sha: str
+    trial_counts: Mapping[str, int]
+    symbols: Sequence[str]
+    n_universe: int = 33
+    headlines: Mapping[str, dict] = field(default_factory=dict)        # test -> headline()
+    picks: Mapping[str, pd.DataFrame] = field(default_factory=dict)    # test -> fold picks table
+    per_symbol: Mapping[str, pd.DataFrame] = field(default_factory=dict)
+    sensitivities: Mapping[str, pd.DataFrame] = field(default_factory=dict)
+    frontier: Sequence[dict] = ()
+    options_baseline: Optional[pd.DataFrame] = None
+    options_0dte: Optional[pd.DataFrame] = None
+    guardrails: Mapping[str, pd.DataFrame] = field(default_factory=dict)   # scope label -> guardrail_rows()
+    notes: Sequence[str] = ()
+    smoke: bool = False
+
+
+def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    L = []
+    interim = len(inp.symbols) < inp.n_universe
+    title = "PIPELINE SMOKE TEST — NOT A STRATEGY RESULT" if inp.smoke else (
+        f"INTERIM — {len(inp.symbols)} of {inp.n_universe} symbols — not a pass/fail result" if interim
+        else "Full universe, development window (holdout untouched)")
+    L += [f"# Intraday S/R readout: {title}", "",
+          f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
+          "- Trial count N: " + ", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items())
+          + " (guardrail overlays add no trials)",
+          f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
+          "- Model-based research only; holdout 2026-04-01..2026-09-30 not opened; CP4 review before Trading.", ""]
+    for test, h in inp.headlines.items():
+        L += [f"## Test {test}: walk-forward OOS (2020Q1-2026Q1, selected variant per fold)", "",
+              f"- Trades {h['trades']} | **trades/day {_num(h['trades_per_day'], 2)}** | trades/mo "
+              f"{_num(h['trades_per_month'], 1)} | win {_pct(h['win_rate'], 1)} | mean R {_ci(h['mean_r_ci'])} | "
+              f"PF {_num(h['profit_factor'], 2)}",
+              f"- Monthly {_ci(h['monthly_ci'], _pct)} | max DD {_pct(h['max_drawdown'])} | worst day "
+              f"{_pct(h['worst_day'])} | Sharpe(daily) {_num(h['sharpe_daily'])} | DSR {_num(h['dsr']['dsr'])} "
+              f"(N {h['dsr']['n_trials']}, var source: {h['dsr']['var_sr_source']})", "",
+              "Pass bar (SPEC section 8)" + (" — informational only in an interim run:" if interim else ":"), ""]
+        L += [f"- {x}" for x in pass_bar_words(h)] + [""]
+        if h.get("years_positive"):
+            L += ["Per year:", "", _md(pd.DataFrame([{"year": y, "mean R": _num(v),
+                                                      "monthly mean": _pct(h["monthly_by_year"].get(y))}
+                                                     for y, v in h["years_positive"].items()]))]
+        if test in inp.picks:
+            L += ["Fold picks:", "", _md(inp.picks[test])]
+        if test in inp.per_symbol:
+            L += ["Per symbol:", "", _md(inp.per_symbol[test])]
+        if test in inp.sensitivities:
+            L += ["Sensitivities:", "", _md(inp.sensitivities[test])]
+    if inp.frontier:
+        png = frontier_png(inp.frontier, out_dir / "frontier.png")
+        nflag = sum(r["flag_150_250_lbR_gt0"] for r in inp.frontier)
+        L += ["## Trade-off frontier (all logged variants, fixed-variant OOS 2020Q1-2026Q1)", "",
+              f"{nflag} setting(s) flagged at 150-250 trades/mo with OOS mean-R 95% lower bound > 0. A flag is "
+              "informational only: choosing from this curve is itself selection, so flagged settings must still "
+              "clear the full section 8 bar.", ""]
+        if png:
+            L += ["![frontier](frontier.png)", ""]
+        L += [_md(frontier_table(inp.frontier))]
+    if inp.options_baseline is not None:
+        L += ["## Options overlay, baseline (0.5% premium, frozen finalists only)", "", _md(inp.options_baseline)]
+    if inp.options_0dte is not None:
+        L += ["## 0DTE scenario ($2,000 premium on $100k; HIGHER-RISK, MODEL-BASED)", "", f"> {ZERO_DTE_CAVEAT}", "",
+              _md(inp.options_0dte)]
+    for scope, df in inp.guardrails.items():
+        L += [f"## Guardrail overlays: {scope} (applied after selection; not trials)", "",
+              "d2 directly limits the ~200 trades/mo goal.", "", _md(df)]
+    if inp.notes:
+        L += ["## Notes", ""] + [f"- {n}" for n in inp.notes] + [""]
+    p = out_dir / "READOUT.md"
+    p.write_text("\n".join(L))
+    return p
