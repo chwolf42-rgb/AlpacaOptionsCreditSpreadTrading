@@ -84,7 +84,8 @@ def test_loss_r_hand_computed_and_two_losses_block_rest_of_day_portfolio_wide():
     assert syms(r) == ["AAA", "BBB"]
     assert r.trades[0].r == pytest.approx(LOSS_R, abs=1e-6) and r.trades[0].pnl == pytest.approx(-235.654110, abs=1e-6)
     s = r.sessions.iloc[0]
-    assert s.day_limit_trip_ts == t(D, "10:35") and s.signals_blocked == 2 and s.day_losses == 2
+    assert s.day_limit_trip_ts == t(D, "10:35") and s.day_losses == 2
+    assert s.signals_cancelled_at_trip == 1 and s.signals_arrived_blocked == 1          # CCC armed, DDD arriving
     assert [m["tripped"] for m in r.meta] == [None, "day"]
     assert [m["day_losses_before"] for m in r.meta] == [0, 1]
     # comparison 'none': all four trade (CCC, DDD are flat after fill -> forced exit)
@@ -131,7 +132,8 @@ def test_fifth_weekly_loss_blocks_through_friday_and_resets_after_monday_holiday
     assert days[-1] == date(2024, 5, 28) and r.trades[-1].entry.symbol == "DDD"
     ss = r.sessions.set_index("session")
     assert ss.loc[date(2024, 5, 22), "week_limit_trip_ts"] == t("2024-05-22", "10:05")
-    assert bool(ss.loc[date(2024, 5, 23), "week_blocked_at_open"]) and ss.loc[date(2024, 5, 24), "signals_blocked"] == 1
+    assert bool(ss.loc[date(2024, 5, 23), "week_blocked_at_open"]) and ss.loc[date(2024, 5, 24), "signals_arrived_blocked"] == 1
+    assert ss.loc[date(2024, 5, 22), "signals_cancelled_at_trip"] == 0 and ss.loc[date(2024, 5, 22), "signals_arrived_blocked"] == 1
     assert ss.loc[date(2024, 5, 28), "week_losses_start"] == 0
     # d2+w6 comparison: the Wednesday 11:00 trade is allowed (5 < 6); it ends flat at 100.00 at the forced
     # exit (R < 0), the 6th loss, so Thu/Fri are blocked under d2+w6 as well
@@ -163,7 +165,7 @@ def test_exits_processed_before_entries_in_the_same_bar():
     b.bar("CCC", D, "11:05", FILL)
     r = b.run()
     assert syms(r) == ["AAA", "BBB"]           # CCC would have filled in step (ii) of the same bar -> blocked
-    assert r.sessions.iloc[0].signals_blocked == 1
+    assert r.sessions.iloc[0].signals_cancelled_at_trip == 1 and r.sessions.iloc[0].signals_arrived_blocked == 0
 
 
 def test_entry_stopped_in_fill_bar_counts_before_next_entry():

@@ -3,8 +3,10 @@ count per test (distinct variants) is the trial count N used by the deflated Sha
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -63,30 +65,83 @@ def git_sha(repo: Path | str = ".") -> str:
         return "unknown"
 
 
+DEFAULT_LEDGER = Path("/workspace/research4/runs/PROGRAM_LEDGER")    # box-wide program ledger (all runs)
+N_FLOOR = 450                                                          # SPEC v1.3 G2 declared trials
+
+
+class LedgerError(RuntimeError):
+    pass
+
+
 class TrialLog:
-    def __init__(self, path: Path | str):
+    """Append-only PROGRAM ledger (R1 ruling). `path` is a directory of immutable part files; each flush creates a
+    new part (exclusive create) and never rewrites or deletes an existing one. A trial is a distinct
+    (grid_sha256, run_id, test, variant_id) among non-smoke, non-overlay rows: re-running the same grid hash under a
+    new run id adds trials; re-flushing the same run id does not double count. The DSR N, FREEZE.md and the readout
+    header read N = max(450, program_trial_count) from here, cumulative at the candidate's freeze time.
+    """
+
+    def __init__(self, path: Path | str = DEFAULT_LEDGER):
         self.path = Path(path)
+        if self.path.suffix == ".parquet":
+            raise LedgerError("the trial log is a ledger directory of part files, not a single parquet file")
         self._rows: list[dict] = []
 
     def add(self, row: TrialRow) -> None:
         missing = set(SCHEMA) - set(asdict(row))
         if missing:
             raise ValueError(f"trial row missing {missing}")
+        if not row.grid_sha256 or not row.run_id:
+            raise LedgerError("ledger rows are keyed by grid_sha256 + run_id; both are required")
         self._rows.append(asdict(row))
 
+    def parts(self) -> list[Path]:
+        return sorted(self.path.glob("part-*.parquet")) if self.path.exists() else []
+
+    def read(self) -> pd.DataFrame:
+        ps = self.parts()
+        if not ps:
+            return pd.DataFrame(columns=list(SCHEMA)).astype(SCHEMA)
+        return pd.concat([pd.read_parquet(p) for p in ps], ignore_index=True)
+
     def flush(self) -> pd.DataFrame:
-        new = pd.DataFrame(self._rows, columns=list(SCHEMA)).astype(SCHEMA) if self._rows else None
-        old = pd.read_parquet(self.path) if self.path.exists() else None
-        frames = [f for f in (old, new) if f is not None]
-        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=list(SCHEMA)).astype(SCHEMA)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(self.path, index=False)
-        self._rows = []
-        return df
+        if self._rows:
+            new = pd.DataFrame(self._rows, columns=list(SCHEMA)).astype(SCHEMA)
+            self.path.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(CT).strftime("%Y%m%dT%H%M%S%f")
+            run = str(self._rows[0]["run_id"]).replace("/", "_")
+            p = self.path / f"part-{stamp}-{run}-{uuid.uuid4().hex[:8]}.parquet"
+            with open(p, "xb") as fh:              # exclusive create: append-only, never overwrite
+                new.to_parquet(fh, index=False)
+            self._rows = []
+        return self.read()
+
+    def sha256(self) -> str:
+        h = hashlib.sha256()
+        for p in self.parts():
+            h.update(p.name.encode())
+            h.update(hashlib.sha256(p.read_bytes()).digest())
+        return h.hexdigest()
 
     @staticmethod
     def trial_count(df: pd.DataFrame, test: str, include_overlays: bool = False) -> int:
+        """Per-test distinct variants in `df` (display only; the DSR uses program_trial_count)."""
         d = df[df["test"] == test]
         if not include_overlays:
             d = d[d["overlay"].fillna("") == ""]
         return int(d["variant_id"].nunique())
+
+    @staticmethod
+    def program_trial_count(df: pd.DataFrame, as_of_ct: Optional[str] = None) -> int:
+        """Cumulative program trials: distinct (grid_sha256, run_id, test, variant_id), all tests, all runs,
+        excluding smoke runs and overlay rows, created at or before `as_of_ct` (ISO CT; e.g. the freeze time)."""
+        if df is None or not len(df):
+            return 0
+        d = df[(df["run_kind"].fillna("") != "smoke") & (df["overlay"].fillna("") == "")]
+        if as_of_ct is not None:
+            ts = pd.to_datetime(d["created_at_ct"], utc=True, format="ISO8601")
+            d = d[ts <= pd.Timestamp(as_of_ct).tz_convert("UTC")]
+        return int(len(d.drop_duplicates(["grid_sha256", "run_id", "test", "variant_id"])))
+
+    def dsr_n(self, as_of_ct: Optional[str] = None) -> int:
+        return max(N_FLOOR, self.program_trial_count(self.read(), as_of_ct))

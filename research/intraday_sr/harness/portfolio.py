@@ -39,7 +39,7 @@ from research.intraday_sr.harness.guard import Guard, Guarded
 BAR_5M = timedelta(minutes=5)
 
 
-FLAG_COLS = ("bad_bar", "flagged", "bad_print")   # optional boolean bar flag from the data layer (any of these)
+FLAG_COLS = ("bad_print",)   # agreed with Developer 2: bool column `bad_print` on bar frames (optional)
 
 
 class FillOutsideBar(AssertionError):
@@ -198,19 +198,21 @@ def simulate(signals: Iterable, bars, risk: RiskCfg = RiskCfg(), costs: CostCfg 
     c["days_halted_day_limit"] = int(sess["day_limit_trip_ts"].notna().sum()) if len(sess) else 0
     c["weeks_halted_week_limit"] = int(sess["week_limit_trip_ts"].notna().sum()) if len(sess) else 0
     c["daily_stop_days"] = int(sess["daily_stop_ts"].notna().sum()) if len(sess) else 0
-    c["signals_blocked_guardrail"] = int(sess["signals_blocked"].sum()) if len(sess) else 0
+    c["signals_cancelled_at_trip"] = int(sess["signals_cancelled_at_trip"].sum()) if len(sess) else 0
+    c["signals_arrived_blocked"] = int(sess["signals_arrived_blocked"].sum()) if len(sess) else 0
     return SimResult(trades, meta, daily, dict(c), sess)
 
 
 SESSION_COLS = ["session", "pnl", "entries", "day_losses", "week_losses_start", "week_losses_end",
-                "day_limit_trip_ts", "week_limit_trip_ts", "daily_stop_ts", "signals_blocked", "week_blocked_at_open"]
+                "day_limit_trip_ts", "week_limit_trip_ts", "daily_stop_ts", "signals_cancelled_at_trip", "signals_arrived_blocked",
+                "week_blocked_at_open"]
 
 
 def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_losses, trades, meta, c):
     lim_d, lim_w = risk.max_losses_day, risk.max_losses_week
     st = {"session": d, "pnl": 0.0, "entries": 0, "day_losses": 0, "week_losses_start": week_losses,
           "week_losses_end": week_losses, "day_limit_trip_ts": None, "week_limit_trip_ts": None,
-          "daily_stop_ts": None, "signals_blocked": 0,
+          "daily_stop_ts": None, "signals_cancelled_at_trip": 0, "signals_arrived_blocked": 0,
           "week_blocked_at_open": bool(lim_w is not None and week_losses >= lim_w)}
     if not sigs:
         return st
@@ -246,8 +248,7 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
     def cancel_armed(ts):
         nonlocal pending
         if pending:
-            st["signals_blocked"] += len(pending)
-            c["cancel_guardrail"] += len(pending)
+            st["signals_cancelled_at_trip"] += len(pending)      # armed triggers cancelled by the trip
             pending = []
 
     def close_pos(sym, p: _Pos, px, kind, ts, cost_kind, ambiguous=False, bar=None):
@@ -287,8 +288,7 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
             g = guard.wrap(inactive[ai])
             ai += 1
             if blocked():                                  # arrives while a limit is active: never armed
-                st["signals_blocked"] += 1
-                c["cancel_guardrail"] += 1
+                st["signals_arrived_blocked"] += 1                   # became available while blocked
             else:
                 pending.append(g)
         here = {}

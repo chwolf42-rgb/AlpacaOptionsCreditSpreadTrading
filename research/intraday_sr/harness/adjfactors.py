@@ -1,5 +1,11 @@
 """Raw/adjusted session factors for as-traded prices (costs, $0.01 tick/min-per-share, option strikes and premium).
 
+THIN ADAPTER (R1 ruling 4). Agreed contract with Developer 2: `Bar.adj_factor` = raw / adjusted, i.e.
+as_traded = adjusted * Bar.adj_factor. Their `research.intraday_sr.data.adjust.load_adj_factors()` will invert
+Trading's file into that direction. `load_adj_factors()` below has the same semantics (Series indexed by
+(symbol, session) of raw/adj) and delegates to Developer 2's function as soon as it is importable (#20 / the d2
+branch); until then the local implementation is used. Everything else in the harness calls only this module.
+
 Trading's files (when present):
     <root>/adj_factors/<SYMBOL>.parquet   (BRK.B stored as BRK-B)   columns: date (NY), raw_close, adj_close, adj_factor
     <root>/adj_factors/adj_factors.parquet or <root>/adj_factors.parquet   (combined; adds a symbol column)
@@ -40,8 +46,92 @@ def _to_harness(df: pd.DataFrame) -> pd.Series:
     return s[~s.index.duplicated(keep="last")]
 
 
+def _dev2_loader():
+    try:
+        from research.intraday_sr.data.adjust import load_adj_factors as f   # Developer 2 (after #20 / d2 lands)
+        return f
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _local_load_all(root: Path) -> pd.Series:
+    parts = []
+    comb = [p for p in (root / "adj_factors" / "adj_factors.parquet", root / "adj_factors.parquet") if p.is_file()]
+    if comb:
+        df = pd.read_parquet(comb[0])
+        for sym, g in df.groupby(df["symbol"].astype(str)):
+            s = _to_harness(g)
+            parts.append(pd.Series(s.to_numpy(), index=pd.MultiIndex.from_arrays(
+                [[sym.replace("-", ".")] * len(s), list(s.index)], names=["symbol", "session"])))
+    else:
+        for p in sorted((root / "adj_factors").glob("*.parquet")):
+            s = _to_harness(pd.read_parquet(p))
+            sym = p.stem.replace("-", ".")
+            parts.append(pd.Series(s.to_numpy(), index=pd.MultiIndex.from_arrays(
+                [[sym] * len(s), list(s.index)], names=["symbol", "session"])))
+    if not parts:
+        return pd.Series(dtype=float, index=pd.MultiIndex.from_arrays([[], []], names=["symbol", "session"]),
+                         name="adj_factor")
+    out = pd.concat(parts)
+    out.name = "adj_factor"
+    return out
+
+
+_CACHE: dict = {}
+SOURCE: dict = {}          # root -> "dev2" | "local"
+
+
+def _normalize(out) -> pd.Series:
+    """Accept Developer 2's return shape: a (symbol, session) Series, or a frame with symbol, date/session and
+    adj_factor columns. Values are taken AS raw/adj (agreed contract); no inversion here."""
+    if isinstance(out, pd.DataFrame):
+        dcol = "session" if "session" in out.columns else "date"
+        out = pd.Series(out["adj_factor"].astype(float).to_numpy(), index=pd.MultiIndex.from_arrays(
+            [out["symbol"].astype(str).str.replace("-", ".").to_numpy(),
+             pd.to_datetime(out[dcol]).dt.date.to_numpy()], names=["symbol", "session"]))
+    if not isinstance(out, pd.Series) or out.index.nlevels != 2:
+        raise TypeError("load_adj_factors must give a (symbol, session) indexed series")
+    out = out.astype(float)
+    out.index = out.index.set_names(["symbol", "session"])
+    out.name = "adj_factor"
+    return out
+
+
+def load_adj_factors(root: Path | str = DEFAULT_ROOT) -> pd.Series:
+    """Series indexed by (symbol, session date) of raw/adj (= Bar.adj_factor). Developer 2's loader if present."""
+    root = Path(root)
+    key = str(root.resolve()) if root.exists() else str(root)
+    if key in _CACHE:
+        return _CACHE[key]
+    dev2 = _dev2_loader()
+    out = None
+    if dev2 is not None:
+        for call in (lambda: dev2(root), lambda: dev2(root / "adj_factors" / "adj_factors.parquet"), dev2):
+            try:
+                out = _normalize(call())
+                break
+            except TypeError:
+                continue
+    SOURCE[key] = "dev2" if out is not None else "local"
+    if out is None:
+        out = _local_load_all(root)
+    _CACHE[key] = out
+    return out
+
+
 def load_factors(symbol: str, root: Path | str = DEFAULT_ROOT) -> Optional[pd.Series]:
-    """Series session -> f (raw/adj) for one symbol, or None if no file covers it."""
+    """Series session -> f (raw/adj) for one symbol, or None if no factor covers it."""
+    allf = load_adj_factors(root)
+    if len(allf):
+        syms = set(allf.index.get_level_values(0))
+        for cand in (symbol, symbol.replace(".", "-"), symbol.replace("-", ".")):
+            if cand in syms:
+                return allf.xs(cand, level=0)
+        return None
+    return _load_factors_files(symbol, root)
+
+
+def _load_factors_files(symbol: str, root: Path | str = DEFAULT_ROOT) -> Optional[pd.Series]:
     root = Path(root)
     p = root / "adj_factors" / f"{_file_symbol(symbol)}.parquet"
     if p.is_file():

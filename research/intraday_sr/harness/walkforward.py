@@ -72,6 +72,9 @@ class VariantRun:
     status: str = "ok"
     error: str = ""
     config: str = PRIMARY_LABEL          # guardrail label of the RiskCfg used; selection accepts only the primary
+    # exact fixed-variant OOS path: each fold test window simulated from its own start (counters 0, $100k)
+    exact_oos_trades: Optional[pd.DataFrame] = None
+    exact_oos_daily: Optional[pd.Series] = None
 
 
 def _win(df: pd.DataFrame, a: date, b: date) -> pd.DataFrame:
@@ -86,20 +89,49 @@ def _swin(s: pd.Series, a: date, b: date) -> pd.Series:
     return s[(idx >= a) & (idx <= b)]
 
 
-def select(runs: Mapping[str, VariantRun], a: date, b: date) -> tuple[Optional[str], dict]:
+R_METRICS = ("mean_r",)          # R1 ruling (a): selection reads R only (mean R, CI, trade counts)
+DOLLAR_PCT_COLUMNS = ("pnl", "ret", "return", "monthly", "equity", "dollar", "pct")
+
+
+class SelectionMetricError(ValueError):
+    """Selection may only use R-based metrics; $ and % returns come from the exact OOS-fold / holdout paths."""
+
+
+def _r_view(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """The only columns selection code ever sees: session and R."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame({"session": pd.Series(dtype=object), "r": pd.Series(dtype=float)})
+    return df[["session", "r"]]
+
+
+def rank_table(runs: Mapping[str, VariantRun], a: date, b: date, metric: str = "mean_r") -> pd.DataFrame:
+    """Selection ranking on [a, b]: eligible = >= 200 trades; ordered by mean R desc, then trades desc, then id."""
+    if metric not in R_METRICS or any(k in metric.lower() for k in DOLLAR_PCT_COLUMNS):
+        raise SelectionMetricError(f"selection metric {metric!r} is not R-based; allowed: {R_METRICS}")
     _assert_primary(runs)
-    cands = []
+    rows = []
     for vid, run in runs.items():
         if run.status != "ok":
             continue
-        t = _win(run.trades, a, b)
+        t = _win(_r_view(run.trades), a, b)
         n = 0 if t is None else len(t)
-        if n >= MIN_TRAIN_TRADES:
-            cands.append((round(float(t["r"].mean()), 10), n, vid))   # rounding: float noise is not a tie-break
-    if not cands:
+        rows.append({"variant_id": vid, "trades": n, "mean_r": round(float(t["r"].mean()), 10) if n else np.nan,
+                     "eligible": n >= MIN_TRAIN_TRADES})     # rounding: float noise is not a tie-break
+    df = pd.DataFrame(rows, columns=["variant_id", "trades", "mean_r", "eligible"])
+    el = df[df["eligible"]].sort_values(["mean_r", "trades", "variant_id"], ascending=[False, False, True],
+                                         kind="stable")
+    df["rank"] = df["variant_id"].map({v: i + 1 for i, v in enumerate(el["variant_id"])})
+    return df.sort_values(["rank", "variant_id"], na_position="last").reset_index(drop=True)
+
+
+def select(runs: Mapping[str, VariantRun], a: date, b: date, metric: str = "mean_r") -> tuple[Optional[str], dict]:
+    rt = rank_table(runs, a, b, metric)
+    el = rt[rt["eligible"]]
+    if not len(el):
         return None, {"eligible": 0}
-    cands.sort(key=lambda x: (-x[0], -x[1], x[2]))
-    return cands[0][2], {"eligible": len(cands), "train_mean_r": cands[0][0], "train_trades": cands[0][1]}
+    top = el.iloc[0]
+    return top["variant_id"], {"eligible": int(len(el)), "train_mean_r": float(top["mean_r"]),
+                               "train_trades": int(top["trades"])}
 
 
 @dataclass
@@ -109,9 +141,18 @@ class WFResult:
     oos_daily: pd.Series
     fold_table: pd.DataFrame          # per (variant, fold): test mean R, trades (for finalist rule + trial log)
     finalists: dict = field(default_factory=dict)
+    oos_exact: bool = False           # True when OOS fold paths were re-simulated exactly from each fold start
 
 
-def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = None) -> WFResult:
+ExactWindow = Callable[[str, date, date], VariantRun]
+
+
+def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = None,
+                 exact_window: Optional[ExactWindow] = None) -> WFResult:
+    """Per-fold selection on train windows (continuous path; guardrail week counters reset at window starts,
+    including internal quarter starts of a train window, accepted by the R1 ruling for R-based selection only).
+    OOS: with `exact_window`, each fold's test path is re-simulated from the fold start (counters 0, equity
+    $100k); $ and % results come only from those exact paths."""
     _assert_primary(runs)
     folds = list(folds or make_folds())
     picks, tparts, dparts, rows = [], [], [], []
@@ -131,7 +172,7 @@ def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = 
                                if f.test_start <= d <= f.test_end})
             dparts.append(pd.Series(0.0, index=pd.Index(sessions)))
             continue
-        run = runs[vid]
+        run = exact_window(vid, f.test_start, f.test_end) if exact_window is not None else runs[vid]
         t = _win(run.trades, f.test_start, f.test_end)
         if len(t):
             tparts.append(t.assign(fold=f.k, variant_id=vid))
@@ -139,22 +180,17 @@ def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = 
     oos_t = pd.concat(tparts, ignore_index=True) if tparts else pd.DataFrame()
     oos_d = pd.concat(dparts) if dparts else pd.Series(dtype=float)
     ft = pd.DataFrame(rows)
-    return WFResult(picks, oos_t, oos_d, ft, finalists(runs, ft))
+    return WFResult(picks, oos_t, oos_d, ft, finalists(runs, ft), oos_exact=exact_window is not None)
 
 
 def finalists(runs: Mapping[str, VariantRun], fold_table: pd.DataFrame) -> dict:
     _assert_primary(runs)
-    proc, info = select(runs, *FINALIST_RESELECT)
+    proc, info = select(runs, *FINALIST_RESELECT, metric="mean_r")
     out = {"procedure": {"variant": proc, "window": [d.isoformat() for d in FINALIST_RESELECT], **info}}
     if len(fold_table):
-        ft = fold_table.copy()
-        ft["rank"] = ft.groupby("fold")["test_mean_r"].rank(ascending=False, method="min")
-        g = ft.groupby("variant_id")
-        share_pos = g["test_mean_r"].apply(lambda s: float((s > 0).sum()) / max(s.notna().sum(), 1))
-        med_rank = g["rank"].median()
-        ok = share_pos[share_pos >= 0.60].index
-        if len(ok):
-            best = med_rank.loc[ok].sort_values(kind="stable")
+        best = stable_order(fold_table)
+        share_pos = _share_pos(fold_table)
+        if len(best):
             v = best.index[0]
             out["stable"] = {"variant": v, "median_fold_rank": float(best.iloc[0]),
                              "share_positive_folds": float(share_pos[v])}
@@ -163,18 +199,86 @@ def finalists(runs: Mapping[str, VariantRun], fold_table: pd.DataFrame) -> dict:
     return out
 
 
+def _share_pos(fold_table: pd.DataFrame) -> pd.Series:
+    return fold_table.groupby("variant_id")["test_mean_r"].apply(
+        lambda s: float((s > 0).sum()) / max(s.notna().sum(), 1))
+
+
+def stable_order(fold_table: pd.DataFrame) -> pd.Series:
+    """Variants positive in >= 60% of folds, ordered by median fold rank of test mean R (R-based)."""
+    if not len(fold_table):
+        return pd.Series(dtype=float)
+    ft = fold_table[["variant_id", "fold", "test_mean_r"]].copy()
+    ft["rank"] = ft.groupby("fold")["test_mean_r"].rank(ascending=False, method="min")
+    med = ft.groupby("variant_id")["rank"].median()
+    sp = _share_pos(fold_table)
+    ok = sp[sp >= 0.60].index
+    return med.loc[ok].sort_values(kind="stable")
+
+
+def exact_finalist_check(runs: Mapping[str, VariantRun], fold_table: pd.DataFrame, fin: dict,
+                         exact_window: ExactWindow, k_next: int = 3, tol_r: float = 0.01) -> tuple[pd.DataFrame, bool]:
+    """R1 ruling (c): each finalist plus the next `k_next` by rank, re-simulated exactly on the finalist train
+    window (FINALIST_RESELECT; counters and equity start at the window start, no internal resets). Reports the
+    change in the selection metric (train mean R) and in rank (the reselect ranking with exact values
+    substituted for the re-simulated variants). CP4 flag: any finalist's rank changes or |delta mean R| > tol_r."""
+    a, b = FINALIST_RESELECT
+    approx = rank_table(runs, a, b)
+    order = list(approx.loc[approx["eligible"], "variant_id"])
+    cands: list[tuple[str, str]] = []
+    proc = (fin.get("procedure") or {}).get("variant")
+    if proc:
+        i = order.index(proc)
+        cands += [("procedure finalist", proc)] + [(f"procedure next {j}", v) for j, v in
+                                                     enumerate(order[i + 1:i + 1 + k_next], 1)]
+    stab = (fin.get("stable") or {}).get("variant")
+    if stab:
+        so = list(stable_order(fold_table).index)
+        i = so.index(stab)
+        cands += [("stable finalist", stab)] + [(f"stable next {j}", v) for j, v in enumerate(so[i + 1:i + 1 + k_next], 1)]
+    exact = {}
+    for _, v in cands:
+        if v not in exact:
+            r = _win(_r_view(exact_window(v, a, b).trades), a, b)
+            exact[v] = (len(r), round(float(r["r"].mean()), 10) if len(r) else np.nan)
+    sub = approx.copy()
+    for v, (n, m) in exact.items():
+        sub.loc[sub["variant_id"] == v, ["trades", "mean_r"]] = [n, m]
+    sub["eligible"] = sub["trades"] >= MIN_TRAIN_TRADES
+    el = sub[sub["eligible"]].sort_values(["mean_r", "trades", "variant_id"], ascending=[False, False, True],
+                                          kind="stable")
+    ex_rank = {v: i + 1 for i, v in enumerate(el["variant_id"])}
+    ap = approx.set_index("variant_id")
+    rows, flag = [], False
+    for role, v in cands:
+        ar, er = ap.loc[v, "rank"], ex_rank.get(v, np.nan)
+        dm = exact[v][1] - ap.loc[v, "mean_r"]
+        rank_changed = not (pd.notna(ar) and pd.notna(er) and int(ar) == int(er))
+        f = "finalist" in role and (rank_changed or not (abs(dm) <= tol_r))
+        flag |= bool(f)
+        rows.append({"role": role, "variant_id": v, "approx_mean_r": ap.loc[v, "mean_r"], "exact_mean_r": exact[v][1],
+                     "delta_mean_r": dm, "approx_trades": int(ap.loc[v, "trades"]), "exact_trades": exact[v][0],
+                     "approx_rank": ar, "exact_rank": er,
+                     "delta_rank": (er - ar) if pd.notna(ar) and pd.notna(er) else np.nan, "cp4_flag": bool(f)})
+    return pd.DataFrame(rows), flag
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def write_freeze(path: Path, finalists_by_test: dict, triallog_path: Path, git_sha: str, grid_sha: str,
+def write_freeze(path: Path, finalists_by_test: dict, ledger, git_sha: str, grid_sha: str,
                  spec_version: str, config: str = PRIMARY_LABEL) -> str:
+    """ledger: the program TrialLog. N = max(450, cumulative program trials at this freeze)."""
     if config != PRIMARY_LABEL:
         raise ComparisonConfigInSelection(f"FREEZE must use the primary configuration {PRIMARY_LABEL}, got {config}")
+    now = datetime.now(CT).isoformat(timespec="microseconds")
+    n_prog = ledger.program_trial_count(ledger.read(), now)
     lines = ["# FREEZE: intraday S/R finalists (written before the holdout)", "",
-             f"- Written: {datetime.now(CT).isoformat(timespec='seconds')}",
+             f"- Written: {now}",
              f"- Spec version: {spec_version}", f"- Configuration: {PRIMARY_LABEL} (primary loss guardrail, G1)", f"- Grid sha256: `{grid_sha}`", f"- Git sha: `{git_sha}`",
-             f"- Trial log: `{triallog_path}` sha256 `{sha256_file(triallog_path)}`", "",
+             f"- Program ledger: `{ledger.path}` ({len(ledger.parts())} parts) sha256 `{ledger.sha256()}`",
+             f"- Program trials at freeze: {n_prog}; DSR N = max(450, {n_prog}) = {max(450, n_prog)}", "",
              "```json", json.dumps(finalists_by_test, indent=1, default=str), "```", ""]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text("\n".join(lines))

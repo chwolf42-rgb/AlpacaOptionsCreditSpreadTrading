@@ -157,14 +157,14 @@ def test_flagged_bar_never_fills_and_fills_stay_inside_bar():
     # long fills 10:05; the 10:10 bar is a flagged bad print through the stop -> ignored; stop never hit
     ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20), idx("10:10"): (100.20, 100.25, 90.00, 90.00)}
     f = flat_day("AAA", D, overrides=ov)
-    f["bad_bar"] = False
-    f.loc[idx("10:10"), "bad_bar"] = True
+    f["bad_print"] = False
+    f.loc[idx("10:10"), "bad_print"] = True
     r = run({"AAA": f}, [sig()])
     assert r.trades[0].exit.reason == "forced_eod" and r.counters["bars_flagged_skipped"] == 1
     # a flagged bar where the trigger trades through: no entry on it
     f2 = flat_day("AAA", D, overrides={idx("10:05"): (100.05, 100.30, 100.00, 100.20)})
-    f2["bad_bar"] = False
-    f2.loc[idx("10:05"), "bad_bar"] = True
+    f2["bad_print"] = False
+    f2.loc[idx("10:05"), "bad_print"] = True
     assert run({"AAA": f2}, [sig()]).trades == []
     with pytest.raises(FillOutsideBar):
         _check_fill(101.0, _Bar(100, 100.5, 99.5, 100, 1.0), "stop", "AAA", None)

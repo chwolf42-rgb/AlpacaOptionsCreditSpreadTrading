@@ -432,7 +432,8 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
     eq = start_equity
     rets, taken, srows = [], [], []
     c = {"skip_concurrency": 0, "skip_symbol_busy": 0, "skip_daily_stop": 0, "skip_daily_entry_cap": 0,
-         "signals_blocked_guardrail": 0, "skip_too_expensive": 0}
+         "signals_cancelled_at_trip": 0, "signals_arrived_blocked": 0,
+         "skip_too_expensive": 0}
     wk, wk_losses, prev = None, 0, None
     for d in sessions:
         starts_window = any((prev is None or w > prev) and w <= d for w in ws)
@@ -440,7 +441,8 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
         if d.isocalendar()[:2] != wk or starts_window:
             wk, wk_losses = d.isocalendar()[:2], 0
         st = {"session": d, "week_losses_start": wk_losses, "day_limit_trip_ts": None, "week_limit_trip_ts": None,
-              "daily_stop_ts": None, "signals_blocked": 0}
+              "daily_stop_ts": None, "signals_cancelled_at_trip": 0,
+              "signals_arrived_blocked": 0}   # options: records are already-filled trades, nothing is armed -> 0
         day_start, day_pnl, open_, entries, day_losses = eq, 0.0, [], 0, 0
 
         def close_until(t):
@@ -466,8 +468,8 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
                 continue
             if (max_losses_day is not None and day_losses >= max_losses_day) or \
                     (max_losses_week is not None and wk_losses >= max_losses_week):
-                c["signals_blocked_guardrail"] += 1
-                st["signals_blocked"] += 1
+                c["signals_arrived_blocked"] += 1
+                st["signals_arrived_blocked"] += 1
                 continue
             if any(o["symbol"] == r["symbol"] for o in open_):
                 c["skip_symbol_busy"] += 1

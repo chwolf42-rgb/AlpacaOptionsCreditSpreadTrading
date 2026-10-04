@@ -165,5 +165,5 @@ def test_options_guardrail_counts_option_losses_own_portfolio():
     # Mon: A loss, B win (wins never reduce a count), C loss -> trip, D blocked. Tue: A, B losses -> 4, trip, C
     # blocked. Wed: A loss = 5th -> week trip; B blocked. Thu: blocked (same week).
     assert got == [(mon, "A"), (mon, "B"), (mon, "C"), (tue, "A"), (tue, "B"), (wed, "A")]
-    assert c["signals_blocked_guardrail"] == 4 and c["days_halted_day_limit"] == 2 and c["weeks_halted_week_limit"] == 1
+    assert c["signals_arrived_blocked"] == 4 and c["signals_cancelled_at_trip"] == 0 and c["days_halted_day_limit"] == 2 and c["weeks_halted_week_limit"] == 1
     assert list(taken["week_losses_before"]) == [0, 1, 1, 2, 3, 4]

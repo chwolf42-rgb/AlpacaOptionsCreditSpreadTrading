@@ -43,9 +43,9 @@ def test_selection_refuses_comparison_runs(fn):
 
 
 def test_freeze_refuses_comparison_config(tmp_path):
-    (tmp_path / "t.parquet").write_bytes(b"x")
+    from research.intraday_sr.harness.triallog import TrialLog
     with pytest.raises(W.ComparisonConfigInSelection):
-        W.write_freeze(tmp_path / "FREEZE.md", {}, tmp_path / "t.parquet", "sha", "grid", "v1.3", config="d2+w6")
+        W.write_freeze(tmp_path / "FREEZE.md", {}, TrialLog(tmp_path / "ledger"), "sha", "grid", "v1.3", config="d2+w6")
 
 
 def test_selection_and_freeze_never_open_the_compare_file(tmp_path, monkeypatch):
@@ -61,6 +61,6 @@ def test_selection_and_freeze_never_open_the_compare_file(tmp_path, monkeypatch)
     monkeypatch.setattr(pd, "read_parquet", spy_rp)
     runs = {"a": _run("a"), "b": _run("b", 250)}
     wf = W.walk_forward(runs)
-    (tmp_path / "triallog.parquet").write_bytes(b"x")
-    W.write_freeze(tmp_path / "FREEZE.md", wf.finalists, tmp_path / "triallog.parquet", "sha", "grid", "v1.3")
+    from research.intraday_sr.harness.triallog import TrialLog
+    W.write_freeze(tmp_path / "FREEZE.md", wf.finalists, TrialLog(tmp_path / "ledger"), "sha", "grid", "v1.3")
     assert not any(CMP.COMPARE_FILENAME in o for o in opened)

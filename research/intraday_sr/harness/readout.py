@@ -209,7 +209,8 @@ def guardrail_stats(name: str, trades: pd.DataFrame, daily: pd.Series, counters:
             "days_halted_day_limit": int(counters.get("days_halted_day_limit", 0)),
             "weeks_halted_week_limit": int(counters.get("weeks_halted_week_limit", 0)),
             "daily_stop_days": int(counters.get("daily_stop_days", 0)),
-            "signals_blocked": int(counters.get("signals_blocked_guardrail", 0)),
+            "signals_cancelled_at_trip": int(counters.get("signals_cancelled_at_trip", 0)),
+            "signals_arrived_blocked": int(counters.get("signals_arrived_blocked", 0)),
             "sessions": int(len(daily)), "weeks": int(weeks)}
 
 
@@ -226,7 +227,8 @@ def guardrail_rows(stats: Sequence[dict]) -> pd.DataFrame:
             "day-limit trigger rate": _pct(g["days_halted_day_limit"] / max(g["sessions"], 1), 1),
             "week-limit trigger rate": _pct(g["weeks_halted_week_limit"] / max(g["weeks"], 1), 1),
             "days halted (day limit)": g["days_halted_day_limit"], "weeks halted (week limit)": g["weeks_halted_week_limit"],
-            "daily-stop days": g["daily_stop_days"], "signals blocked": g["signals_blocked"]})
+            "daily-stop days": g["daily_stop_days"], "armed triggers cancelled at trip": g["signals_cancelled_at_trip"],
+            "signals arriving while blocked": g["signals_arrived_blocked"]})
     return pd.DataFrame(rows)
 
 
@@ -266,6 +268,9 @@ class ReadoutInputs:
     guardrails: Mapping[str, tuple] = field(default_factory=dict)   # scope label -> (guardrail_rows(), words)
     notes: Sequence[str] = ()
     smoke: bool = False
+    n_program: int = 0                                                 # cumulative program-ledger trials
+    n_dsr: int = 450                                                   # max(450, n_program)
+    exact_checks: Mapping[str, tuple] = field(default_factory=dict)    # test -> (exact_finalist_check df, cp4 flag)
 
 
 def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
@@ -278,9 +283,10 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
         else "Full universe, development window (holdout untouched)")
     L += [f"# Intraday S/R readout: {title}", "",
           f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
-          "- Trial count N = 450 declared (Test A 192, Test B 192, formations 48, options 18; SPEC v1.3 G2); logged "
-          "this run: " + (", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items()) or "none")
-          + ". Guardrail configurations add 0 trials. DSR uses N = 450.",
+          f"- Trial count: DSR N = max(450, program ledger) = **{inp.n_dsr}** (program ledger: {inp.n_program} trials "
+          "cumulative across all tests and runs; 450 declared = A 192 + B 192 + formations 48 + options 18). This run "
+          "logged: " + (", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items()) or "none")
+          + ". Guardrail configurations add 0 trials.",
           "- Configuration: **primary loss guardrail d2+w5** (2 losses/session, 5 losses/Mon-Fri week; SPEC v1.3 G1) for "
           "every result, selection, pass-bar item and the DSR. 'none' and 'd2+w6' are comparison rows only.",
           f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
@@ -315,6 +321,14 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
         if png:
             L += ["![frontier](frontier.png)", ""]
         L += [_md(frontier_table(inp.frontier))]
+    for test, (df, flag) in inp.exact_checks.items():
+        L += [f"## Exact finalist check, Test {test} (R1 ruling 2c)", "",
+              "Finalists plus the next 3 by rank, re-simulated on the finalist train window (2025-04-01..2026-03-31) "
+              "with guardrail counters and equity starting at the window start and no internal resets. Selection "
+              "itself used the continuous path (counters also reset at internal quarter starts).", "",
+              ("**No finalist this run (none eligible): nothing to check.**" if not len(df) else
+               f"**{'CP4 FLAG: a finalist changed rank or moved > 0.01R' if flag else 'No CP4 flag (finalist ranks unchanged, |dR| <= 0.01)'}**"),
+              "", _md(df.round(4) if len(df) else df)]
     if inp.options_baseline is not None:
         L += ["## Options overlay, baseline (0.5% premium, frozen finalists only)", "", _md(inp.options_baseline)]
     if inp.options_0dte is not None:
