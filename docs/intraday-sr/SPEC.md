@@ -1,9 +1,37 @@
-# Intraday S/R confluence research: spec v1.0 (frozen before any run)
+# Intraday S/R confluence research: spec v1.1 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
 Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
+
+## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
+
+Source: Christian's asks relayed via Trading after v1.0 was frozen. Committed before any run and before `grids.py` freezes.
+
+**A1. Frequency first (target ~150–250 trades/mo).**
+- New grid axis `k_confirm` = number of the 3 *optional* stack conditions that must hold (OB/OS oscillator, MACD cross or histogram turn, RVOL ≥ `rvol_min`): **{0, 1, 2, 3}**. The level hold (rejection, close-back, or reclaim) and the re-confirmation entry stay **mandatory**, so a signal always has 2–5 of the 5 conditions. `k_confirm = 3` is v1.0's all-conditions stack.
+- `k_cluster` is fixed at **0.25·ATR_d** (removed from the grid) to stay inside the cap.
+- New grid: `K` {3,5} × oscillator (2) × `rvol_min` (2) × entry TF {5m,15m} × target (3) = 48, × `k_confirm` (4) = **192 variants for Test A** and **192 for Test B**. The variant cap per test is raised from 144 to 192. Every trial is logged, and the deflated Sharpe uses the new N.
+- Portfolio caps (fixed, not grid axes): **12 entries/day** portfolio-wide (was 10), **4 concurrent** (was 3), 1 open position per symbol, daily loss stop −1.5% unchanged. All 33 names.
+- **Readout addition:** a trade-off frontier across all logged variants showing trades/mo, win rate, avg R, and net monthly return, each with its OOS 95% CI. Flag settings at 150–250 trades/mo whose OOS mean-R 95% lower bound is > 0. A flag is informational only; flagged settings must still clear the full §8 pass bar, because choosing from the curve is itself selection.
+
+**A2. 0DTE options scenario (second overlay grid, frozen finalists only).**
+- 9 variants: option-price stop {−30%, −40%, −50%} × take-profit {+50%, +65%, +80%}. Time exit fixed at **15:45 ET**.
+- Sizing: **$2,000 premium per trade** on $100k model equity (2%). Reported separately from the 0.5% baseline overlay and labeled *higher-risk, model-based*.
+- Trades only where a same-day expiry actually existed on that date (SPY/QQQ/IWM per their historical expiry calendars; single names only on their expiry days). Report the count of skipped signals.
+- Pricing: Black-Scholes repriced on every 5m bar from the underlying's high, low and close, using the §7 IV and skew model. If the stop and the TP are both reachable within a bar, the stop wins. Buy at the ask, sell at the bid, $0.05/contract.
+- Report per variant: win rate, avg win and avg loss, trades/mo, monthly mean with 95% CI, max DD, worst day, and break-even win rate after costs.
+- Caveat in every readout: VIX9D-based IV understates near-expiry skew and gamma, so these 0DTE numbers are low-confidence.
+- Total options variants = 9 (v1.0 overlay) + 9 (0DTE) = 18, all logged, never used to re-select equity finalists.
+
+**A3. Loss guardrails (reporting overlay, not selection).**
+- Implemented as `RiskCfg` flags: **d2** = no more entries for the day after 2 losing trades; **w5 / w6** = no more entries for the week after 5 / 6 losing trades.
+- Combinations run: none, d2, w5, w6, d2+w5, d2+w6. They are applied to the same selected variants and frozen finalists (stocks and options) **after** selection, so they add no trials to N.
+- Report per combination vs. none: trigger rate, and the change in trades/mo, monthly return, max DD, and worst week. Note that d2 directly limits the ~200 trades/mo goal.
+- Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
+
+**A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
 
 ## 0. Scope and non-goals
 - Question: does a support/resistance confluence entry on 5m/15m, flat by the close, have a positive
@@ -259,9 +287,9 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   entry (widened to that if smaller).
 - Size = 0.5% of equity / stop distance, capped at 1.0× equity notional per position and 3.0× total.
   Positions sized down by the cap are counted and reported.
-- At most 3 concurrent positions and 1 per symbol.
+- At most 3 concurrent positions and 1 per symbol. *(v1.1: 4 concurrent, see A1.)*
 - Daily loss stop: −1.5% equity, realized plus open. When hit, flatten and take no more entries that day.
-- At most 10 entries per day. Ties go to the higher zone score, then symbol A→Z.
+- At most 10 entries per day *(v1.1: 12, see A1)*. Ties go to the higher zone score, then symbol A→Z.
 - No new entries after 15:00 ET. Forced exit at the open of the 15:55 bar.
 - Model equity: $100,000, compounding daily.
 - If the `zone` target is less than 1R away, the trade is skipped.
@@ -275,7 +303,7 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 | `rvol_min` | 1.5, 2.0 | signal |
 | entry TF | 5m, 15m | signal |
 | target | 1R, 2R, next zone | risk |
-- **Test A:** 3·2·2·2·2·3 = **144** variants. **Test B:** the same 144.
+- **Test A:** 3·2·2·2·2·3 = **144** variants. **Test B:** the same 144. *(Superseded by v1.1 A1: 192 each, with `k_confirm` added and `k_cluster` fixed at 0.25.)*
 - **Formations alone:** 4 kinds × TF (2) × target (3) × pivot tolerance {0.15, 0.25 ATR_d} (2) = **48**,
   i.e. 12 per kind.
 - **Options overlay:** 9 variants, applied only to frozen equity finalists, never used to re-select them:
