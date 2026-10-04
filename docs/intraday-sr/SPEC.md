@@ -1,9 +1,11 @@
-# Intraday S/R confluence research: spec v1.2 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
 Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
+v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
+every result; a forward holdout is added. See the v1.3 amendments (G1–G8), which replace A3.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -25,13 +27,169 @@ Source: Christian's asks relayed via Trading after v1.0 was frozen. Committed be
 - Caveat in every readout: VIX9D-based IV understates near-expiry skew and gamma, so these 0DTE numbers are low-confidence.
 - Total options variants = 9 (v1.0 overlay) + 9 (0DTE) = 18, all logged, never used to re-select equity finalists.
 
-**A3. Loss guardrails (reporting overlay, not selection).**
+**A3. Loss guardrails (reporting overlay, not selection).** *[Superseded by v1.3 G1–G8: the guardrail d2+w5 is now
+binding and primary. Text kept for the record only.]*
 - Implemented as `RiskCfg` flags: **d2** = no more entries for the day after 2 losing trades; **w5 / w6** = no more entries for the week after 5 / 6 losing trades.
 - Combinations run: none, d2, w5, w6, d2+w5, d2+w6. They are applied to the same selected variants and frozen finalists (stocks and options) **after** selection, so they add no trials to N.
 - Report per combination vs. none: trigger rate, and the change in trades/mo, monthly return, max DD, and worst week. Note that d2 directly limits the ~200 trades/mo goal.
 - Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
 
 **A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
+
+## v1.3 amendments (Sun 2026-10-04 CT; these supersede v1.2 and earlier wherever they conflict)
+
+Source: Christian's decision, relayed by Trading on Sun 2026-10-04 and now binding: **the loss guardrails are part of
+the strategy, not a report-only overlay.** In the same relay Christian approved the crypto cost gate before any crypto
+grid (`PHASE2_BACKLOG.md` L8) and a fresh forward holdout from 2026-10-05. v1.3 is committed before any run: no trial
+log, FREEZE file or holdout lock exists on the box, and the first interim run (R1) is Mon 2026-10-05 AM. Universe,
+data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace A3.**
+
+**G1. Primary configuration: loss guardrail d2+w5 (replaces A3).**
+- **Primary configuration, used for every reported result:** no new entries for the rest of the session after
+  **2 losing trades in that session**, and no new entries for the rest of the week after **5 losing trades in that
+  week**. Shorthand **d2+w5**.
+- It sits on top of the existing fixed caps, which are unchanged: 12 entries/day, 4 concurrent, 1 open position per
+  symbol, −1.5% daily loss stop, no new entries after 15:00 ET, forced exit at the open of the 15:55 bar.
+- Implementation: `RiskCfg(max_losses_day=2, max_losses_week=5)` held as the constant `PRIMARY_GUARDRAIL` in
+  `grids.py`, so it is inside the grid hash logged with every trial. It is the default `RiskCfg` for `simulate()`. It
+  is not a grid axis.
+- **Comparison configurations (report only):** **none** (the existing caps only) and **d2+w6** (2 losses/day,
+  6 losses/week). The v1.1 combinations d2, w5 and w6 on their own are dropped.
+
+**G2. Multiple testing and selection.**
+- The guardrail is fixed ex ante. It is not a searched parameter, so it adds **0 trials**. N stays 192 (Test A),
+  192 (Test B), 48 (formations alone) and 18 (options overlays): 450 in total.
+- The following are computed **only** on the primary configuration: per-fold variant selection (including the
+  ≥ 200 train-trade minimum), both §6 finalist rules, FREEZE.md, every item of the §8 pass bar, the deflated Sharpe,
+  the ±1-step neighborhood check, the per-year and per-symbol robustness checks, the holdout, the forward holdout
+  (G7), and the A1 frontier flags.
+- Comparison configurations are run **after** selection, on the same per-fold selected variants and the same frozen
+  finalists, with only `RiskCfg` changed. They never feed selection, a freeze, a pass decision or a frontier flag.
+  Their results go to `guardrail_compare.parquet`, which no selection, freeze or holdout code reads. They are not
+  trial-log rows and are not counted in N.
+- **Choosing the best guardrail after seeing results is forbidden.** Changing the primary configuration requires a
+  new spec version, committed before the run that uses it. Its trials are counted in N, and every trial already run
+  under d2+w5 stays in N.
+
+**G3. Guardrail semantics (frozen).**
+1. **Loss:** a closed trade with realized R < 0 after costs (`Trade.r < 0`). R = 0 is not a loss. Wins never reduce
+   a count.
+2. **When a loss counts:** at the trade's exit fill, in its exit bar. Never at entry, and never on open
+   (unrealized) P&L.
+3. **Scope:** losses are counted across the whole portfolio (all 33 symbols), not per symbol. Each simulated
+   portfolio has its own counters: one variant or finalist, in one test, in one simulation window. Test A, Test B,
+   each formation test and each options overlay variant are separate portfolios.
+4. **Day:** one RTH session (09:30–16:00 ET, or to the early close). The day count resets at the start of every
+   session.
+5. **Week:** the Monday–Friday calendar week in ET. The week count resets at the first session of each week
+   (Monday, or Tuesday after a Monday holiday). A holiday-shortened week is still one week.
+6. **What a limit does:** when the day count reaches 2, no new entries for the rest of that session. When the week
+   count reaches 5, no new entries until the first session of the next week. Armed stop-entry triggers that have not
+   filled are cancelled. A limit blocks new entries only.
+7. **Trades already open** when a limit trips run to their normal exit (stop, target, or the 15:55 forced exit). They
+   are not flattened by the guardrail. Their losses still count: a loss after the day limit has tripped is added to
+   the week count (and can trip the week limit), and a loss after the week limit has tripped is still recorded.
+8. **Daily loss stop (−1.5%, unchanged):** when it is hit, flatten everything and take no more entries that session,
+   exactly as in §5. A day that hits the daily stop is over whether or not the day count reached 2. Flattened trades
+   that close with R < 0 count as losses toward the week count (and the day count). G3 does not change when the
+   −1.5% check runs.
+9. **Order of events inside one bar (deterministic):**
+   - (i) First, exits of positions that were open at the start of the bar, in exit order: exit fill time, then
+     symbol A→Z. All fills inside one 5m bar share that bar's timestamp, so in practice the symbol breaks the tie.
+     The counts update after each exit, so the trade log names the exit that tripped a limit.
+   - (ii) Then entries that would fill in this bar, in the existing entry priority (higher zone score, then symbol
+     A→Z). An entry is skipped if a limit has already tripped, including a trip in step (i) of the same bar.
+   - (iii) If an entry from step (ii) is also stopped out in its fill bar (§4.2, the stop wins), its loss counts
+     immediately, before the next entry in step (ii) is considered.
+10. **Window starts:** counters start at 0 on the first session of each simulated window: each fold's train window,
+    each fold's test window, the holdout, and the forward holdout. A week that straddles a window start counts only
+    the trades inside the window.
+11. **Logging:** every trade row carries `day_losses_before` and `week_losses_before`. Every session row carries the
+    time of any day-limit trip, week-limit trip or daily-stop hit, and the number of signals blocked by the guardrail.
+
+**G4. Readouts.**
+- **Per finalist** (equity and each options overlay row), a 3-row table: **primary d2+w5** (first row; this is the
+  result), **none**, and **d2+w6**. Columns: trades/mo; win rate; mean R with its 95% day-block bootstrap CI (§8
+  settings); monthly return at 0.5% risk (mean with its month-block 95% CI); max drawdown; days halted by the day
+  limit; weeks halted by the week limit; daily-stop days; signals blocked by the guardrail.
+- Every readout states the trades/mo each configuration actually achieved, in words, against Christian's ~200/mo
+  target and the 150–250 band.
+- The **A1 trade-off frontier** (150–250 trades/mo) is computed on the primary configuration, and its flags come from
+  the primary configuration only. A no-guardrail frontier may be shown beside it, labeled *comparison*, with no flags.
+- **Plain note, required in every readout:** the expected number of trades until the k-th loss is k / (1 − WR). At a
+  60% win rate the 2/day limit alone allows about 5 trades per session, ≈ 105/mo. The 5/week limit allows about 12.5
+  trades per week, ≈ 54/mo, so it binds first: the primary configuration's expected ceiling is **≈ 54/mo at 60% WR**
+  (≈ 43/mo at 50%, ≈ 36/mo at 40%) **[P, an expectation that ignores signal supply and the other caps]**. Reaching
+  150/mo under the primary configuration would need a win rate of about 86% or more, and 200/mo about 89% **[P]**.
+  **The 150–250 trades/mo target is therefore likely unreachable under the primary configuration.** Readouts say so
+  honestly. Nothing (grids, caps, the guardrail, or the pass bar) is loosened to chase it.
+- The same applies to §8's "5–10 trades a day": ≈ 54/mo is ≈ 2.6 trades per session at 60% WR **[P]**. At ≈ 54
+  trades/mo and 0.5% risk, 3%/mo needs E[R] ≈ 0.11R net and 5%/mo ≈ 0.19R **[P]**. At 1:1 with c = 0.06–0.11R per
+  round trip, that is a win rate of about 59–61% and about 62–65% **[P]**; a 60% win rate at 1:1 gives
+  ≈ 2.4–3.8%/mo **[P]**.
+
+**G5. Pass bar under the primary configuration.**
+- §8 is unchanged and is measured on the primary configuration, including the minimums of **≥ 500 concatenated OOS
+  trades** and **≥ 100 holdout trades**, and the ≥ 200 train-trade selection minimum in §6.
+- Feasibility **[P]**: at ≈ 54/mo, the 25 OOS quarters (75 months) have room for ≈ 4,000 trades and the 126-session
+  holdout for ≈ 320, so the minimums are reachable in principle on Test A. The ≥ 200 train-trade minimum needs
+  ≈ 17 trades/mo over a 12-month train window, and the holdout minimum about the same rate. Lower-frequency tests
+  (Test B, single formation kinds) may fall short.
+- If the guardrail makes a minimum unreachable, the readout reports it as a **finding** (for example "Test B under
+  d2+w5: 61 holdout trades, underpowered"), and that result cannot pass. The bar is not relaxed, and a comparison
+  configuration cannot stand in for the primary one.
+
+**G6. Options overlays under the primary guardrail (amends A2 and the §5 options overlay).**
+- The 0DTE overlay (A2, 9 variants) runs under d2+w5. So does the v1.0 options overlay (9 variants), because every
+  reported result uses the primary configuration.
+- Each overlay variant is its own portfolio. It receives the frozen finalist's signals and applies G3 to its **own**
+  closed option trades: a loss is an option trade with R < 0 after spread and fees (R = premium paid, §7). Signals
+  skipped because no same-day expiry existed are not trades and do not count.
+- Still 18 options variants, 0 added trials, never used to re-select equity finalists. The overlay readout gets the
+  same 3-row table (G4).
+
+**G7. Forward holdout (approved by Christian via Trading, Sun 2026-10-04).**
+- **Purpose:** a confirmation read after the §6 holdout, because 2026-04-01 → 2026-09-30 is shared by every phase-1
+  finalist and every phase-2 candidate (`PHASE2_BACKLOG.md` §6.5).
+- **Window:** bar collection starts Mon 2026-10-05 09:30 ET. For each finalist, only bars with `available_at` after
+  its FREEZE commit are scored, so its window starts at the later of the two. Bars collected before a candidate's
+  freeze are stored but never scored or inspected for that candidate.
+- **No orders,** and no calls to trading or account endpoints. The frozen code and config (FREEZE.md: variant, config
+  hash, git sha) generate signals on the new bars only and simulate fills with the §4 and §7 rules (shadow scoring).
+  Scoring uses the primary configuration; comparison rows may be reported beside it, labeled.
+- **Read once,** when a candidate has **≥ 100 trades and ≥ 3 months** of scored window, both. `run_forward_holdout(
+  candidate_id)` refuses to run before both hold, then writes `forward-<id>.lock`. A second read is a protocol breach.
+  Before the read, the scorer reports only trade and session counts; no R, P&L or win rate is shown to anyone.
+- **Pass:** the §8.5 conditions on the forward trades (mean R > 0 and day-block 95% CI lower bound > 0), with Holm
+  across every candidate read in the forward window (`PHASE2_BACKLOG.md` §6.5). A finalist that passes §8 but not
+  (yet) the forward read is labeled *holdout-screened, not confirmed*.
+- **Time to read [P]:** at ≤ ~54/mo, Test A reaches 100 trades in about 2 months, so the 3-month minimum binds. A
+  finalist trading 10–30/mo needs about 4–10 months.
+- **Data pulls (enforced in code by `TimeOfDayLimiter`, §2.3):**
+  - **≤ 30 requests/min on weekdays 08:15–15:15 CT** (market hours), **≤ 60/min otherwise**. On HTTP 429, a global
+    backoff of 30 s doubling to 600 s.
+  - At most one pull cycle every 5 minutes, started after the latest 5m bar has closed. Symbols are batched: one
+    multi-symbol `/v2/stocks/bars` request covers all 33 (paginated if needed), never one request per symbol.
+    Expected load ≈ 0.2–1 request/min **[P]**, far under the cap.
+  - The scorer takes `<cache_root>/.pull.lock` for each cycle and releases it afterwards, so it never runs alongside
+    another puller.
+  - Same feed and adjustment as the cache (SIP, adjustment=all) **[P, verify the account's data plan]**. If SIP bars
+    are only available after a delay, pull with that lag. This does not change results, because scoring uses
+    `available_at` and no orders are placed.
+  - VIX/VIX9D come from the Cboe daily CSVs (§2.2), once per day after the close.
+  - Forward bars are stored in `/workspace/research2/data/intraday_sr/forward/` **[P]** (gitignored), separate from
+    the development cache, and never merged into it.
+- The scorer is a research process only (§9): not inside any bot, not run from a live checkout, and it never touches
+  a running bot.
+
+**G8. Checkpoints.** From CP4 on, every Architect checkpoint also checks:
+- **Guardrail logic** against a hand-computed synthetic fixture covering: a 2nd loss mid-session; open trades running
+  past a trip; a loss after the day trip that counts toward the week; a week trip carrying to Friday and resetting
+  the next week (including a Monday holiday); several exits in one bar with the symbol tie-break; an entry stopped
+  out in its fill bar; a daily-stop flatten whose losses count; R = 0 not counted as a loss.
+- **No selection used a comparison configuration:** selection, finalist and freeze code read only primary-config
+  rows; no selection, freeze or holdout code reads `guardrail_compare.parquet`; the logged grid hash includes
+  `PRIMARY_GUARDRAIL`; and N is still 450.
 
 ## 0. Scope and non-goals
 - Question: does a support/resistance confluence entry on 5m/15m, flat by the close, have a positive
@@ -107,6 +265,7 @@ No 15m/30m bars were pulled. No VIX data exists on the box.
   - On HTTP 429: global backoff of 30 s, doubling to 600 s.
   - Wraps `alpaca_options_credit.market_data_limit.MarketDataLimiter` semantics (injectable clocks), so it
     can be unit-tested without waiting.
+  - *(v1.3: the forward-holdout scorer uses this limiter too, with ≤ 1 pull cycle per 5 minutes; see G7.)*
 - One puller process at a time, enforced by the lock file `<cache_root>/.pull.lock`.
   - GETs to `/v2/stocks/bars` only.
   - Every request is logged (timestamp, path, status, bytes; never keys).
@@ -301,6 +460,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 - No new entries after 15:00 ET. Forced exit at the open of the 15:55 bar.
 - Model equity: $100,000, compounding daily.
 - If the `zone` target is less than 1R away, the trade is skipped.
+- *(v1.3: loss guardrail d2+w5, no new entries after 2 losses in a session or 5 in a week, is part of the risk
+  rules for every reported result; see G1–G3.)*
 
 **Grids (variant cap ≤ 200 per test; every variant run is logged, including failures):**
 | Param | Values | Owner |
@@ -318,6 +479,7 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   - structure: long ATM, long 1 strike OTM, or a debit vertical (long ATM, short at the strike nearest the
     equity target);
   - DTE bucket: 0–1, 2–4, or 5–7.
+  - *(v1.3: runs under the primary guardrail d2+w5, see G6.)*
 - Everything else is fixed: N per TF, score weights, windows, buffers, and costs.
 - **Trial log:** `triallog.parquet` gets one row per (test, variant, fold) with the grid hash, git sha,
   symbols, and metrics. The trial count N per test feeds the deflated Sharpe in §6.
@@ -333,6 +495,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   - No embargo is needed, because everything is flat by the close and the engine is stateless.
 - **Selection per fold:** the variant with the highest train mean R per trade after costs, among those with
   ≥ 200 train trades. Ties go to more trades. The concatenated OOS test trades form the headline OOS result.
+  *(v1.3: selection, finalists and every metric used for them are computed on the primary guardrail config
+  only, G2.)*
 - **Finalists (≤ 2 per test, frozen before the holdout):**
   - (1) the *procedure*: re-select on 2025-04-01 → 2026-03-31 and trade the holdout with that variant;
   - (2) the single variant with the best median OOS fold rank among those with positive OOS mean R in
@@ -345,6 +509,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
     `holdout.lock`.
   - All finalists are scored in that one run, including the options overlay on them.
   - A second opening is reported as a protocol breach.
+  - *(v1.3: a fresh forward holdout from 2026-10-05 confirms survivors, read once at ≥ 100 trades and ≥ 3 months;
+    see G7.)*
 - **Interim runs (Monday morning, while the pull completes):**
   - Same frozen grids and folds, on the development window only, using the symbols complete at run time
     (listed in the readout).
@@ -400,7 +566,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   equity trade: stop, target, or the 15:55 forced exit.
 
 ## 8. Pass/fail bar and the honest math
-**Pass (per test, per finalist). All of these must hold, after costs:**
+**Pass (per test, per finalist). All of these must hold, after costs** *(v1.3: measured on the primary guardrail
+config d2+w5; minimums are not relaxed if the guardrail makes them unreachable, see G5)*:
 1. Concatenated OOS mean R per trade > 0, with the **95% day-block bootstrap CI lower bound > 0**.
    (5,000 resamples, seed 20260925, blocks = trading days, because trades within a day are correlated.)
 2. Monthly return mean > 0, with the month-block bootstrap 95% CI lower bound > 0.
@@ -413,7 +580,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
    - the result stays positive with any one symbol removed;
    - the median of the ±1-step parameter neighborhood is still positive (a lone spike is a fail).
 
-**Christian's targets:** 5–10 trades a day, a 60% win rate, 3–5% a month. Monthly return ≈ trades/month
+**Christian's targets:** 5–10 trades a day, a 60% win rate, 3–5% a month. *(v1.3: under the primary guardrail the
+expected ceiling is ≈ 54 trades/mo at 60% WR [P]; see the G4 note.)* Monthly return ≈ trades/month
 × E[R] × 0.5% (21 sessions):
 | trades/day | trades/mo | E[R] for 3%/mo | E[R] for 5%/mo | win rate needed at 1:1 | at 2:1 |
 |---|---|---|---|---|---|
@@ -435,6 +603,7 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   - Sensitivity: 1.5× costs, skew ×2, exit IV −10%, $0.65 fees.
   - Every result vs. target is stated in words.
   - The trial count and grid hash appear on top.
+  - *(v1.3: the 3-row guardrail table per finalist, primary d2+w5 / none / d2+w6, with trades/mo achieved; see G4.)*
 
 ## 9. Operational rules
 - Research only:
@@ -461,16 +630,19 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 | D2-2 | Dev 2 | levels (all §5 candidates) + numba indicators | lookahead tests (a)(b)(d) pass; **CP1** |
 | D2-3 | Dev 2 | zones + scoring, signal stack | lookahead tests pass on zones and signals |
 | D2-4 | Dev 2 | formations W/IHS/M/HS, Test B wiring | fixture patterns detected at the expected `confirmed_ts`; **CP2** |
-| D1-1 | Dev 1 | guard, fills (§4.1–2), portfolio/risk, trial log | hand-computed fixture trades match exactly; test (c) passes |
+| D1-1 | Dev 1 | guard, fills (§4.1–2), portfolio/risk incl. the v1.3 guardrail (G3), trial log, `guardrail_compare.parquet` | hand-computed fixture trades match exactly, including the G8 guardrail fixture; test (c) passes |
 | D1-2 | Dev 1 | equity cost model + tiers | unit tests against the §7 tables; **CP3** |
 | D1-3 | Dev 1 | walk-forward, selection, finalists, FREEZE, holdout lock | refuses holdout without FREEZE or with < 33 symbols |
 | D1-4 | Dev 1 | options overlay (IV, skew, expiries, spread, fees) | BS parity checks; expiry calendar verified and cited |
 | D1-5 | Dev 1 | stats (day/month block bootstrap, DSR) + readout generator | reproducible with seed |
-| R1 | Dev 1 | **interim run** (Mon AM, completed symbols) | INTERIM readout; **CP4 Architect review before anything goes to Trading** |
+| R1 | Dev 1 | **interim run** (Mon AM, completed symbols), primary config d2+w5 plus the two comparison rows | INTERIM readout; **CP4 Architect review before anything goes to Trading**, which also checks the guardrail logic against the G8 fixture and that no selection used a comparison config (G8) |
 | R2 | Dev 1 | full development run → FREEZE.md | **CP5 Architect sign-off on the freeze** |
 | R3 | Dev 1 | holdout, once → final READOUT.md | **CP6 Architect review**, then to Trading via the Team Manager |
+| R4 | Dev 1 | forward-holdout scorer (G7): rate-limited pulls, shadow scoring under d2+w5, one read at ≥ 100 trades and ≥ 3 months | **CP7 Architect review** of the limiter settings before the first market-hours pull, and of the single read |
 - Order: S0 first, then D2-1 ∥ D1-1/D1-2. D2-2/D2-3 come before R1. D2-4 and D1-4 can land after R1, and
   Test B, the formations and the options overlay then join the next interim run.
 - Each Dev 2 module merges only with the lookahead tests green.
 - At every checkpoint, the Architect reviews for lookahead (guard coverage, resample, pivots, fills) and
   overfitting (trial counts, grid adherence, untouched holdout).
+- From CP4 on, every checkpoint also checks the G8 items: the guardrail logic against the fixture, and that no
+  selection, freeze, pass decision or frontier flag used a comparison config.

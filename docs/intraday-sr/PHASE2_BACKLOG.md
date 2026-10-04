@@ -1,10 +1,18 @@
-# Intraday research, phase 2: layer backlog on the S/R + formation backbone (pre-declared)
+# Intraday research, phase 2: layer backlog on the S/R + formation backbone (pre-declared), v2
 
 Owner: Architect. Engine/data: Developer 2. Harness, costs, readout: Developer 1.
 Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT), *before* any phase-1
 result exists, so nothing here is fitted to phase-1 output. Values marked **[P]** are provisional and may change
 only through a new version of this file committed before the run that uses them. Anything not marked is frozen.
-Inherits everything in `SPEC.md` v1.1 unless this file says otherwise.
+Inherits everything in `SPEC.md` **v1.3** unless this file says otherwise.
+
+**v2 (Sun 2026-10-04 CT, still before any phase-1 result).** Christian's decision, relayed by Trading on 2026-10-04,
+is binding: the loss guardrail is **not** report-only. **2 losses/day + 5 losses/week (d2+w5) is the primary
+configuration for every layer comparison and every pass rule**, with the semantics of SPEC v1.3 G3. The base and the
+layer always run under the same guardrail. "No guardrail" and d2+w6 are report-only comparison rows. Because
+150 trades/mo can't hold under d2+w5, the §3 frequency path is now relative to the base (§3). The crypto cost
+gate and the forward holdout are **approved by Christian via Trading on 2026-10-04**. The trial budget is unchanged;
+the guardrail adds 0 trials. The v1 text is kept as `PHASE2_BACKLOG_v1.md`.
 
 ## 0. Structure (Christian's ruling) and scope
 - The phase-1 **S/R zones and formations (W, IHS, M, HS) are the backbone of every candidate.** Nothing in
@@ -26,9 +34,13 @@ Inherits everything in `SPEC.md` v1.1 unless this file says otherwise.
   early folds. That is why the **stage gate is the paired difference** (§3), and the absolute bar is the holdout.
 - On base B, a trigger layer fires only at zones carrying a confirmed formation, and its entry replaces the
   neckline-retest entry. Filters on base B only gate.
-- Portfolio caps, risk, stops, costs, folds and dates are SPEC v1.1 unchanged: 12 entries/day, 4 concurrent,
-  1 per symbol, −1.5% daily stop, 0.5% risk, flat by 15:55 ET. **The 12/day cap puts a hard ceiling of ~252
-  trades/mo on every equity candidate.**
+- Portfolio caps, risk, stops, costs, folds and dates are SPEC v1.3 unchanged: 12 entries/day, 4 concurrent,
+  1 per symbol, −1.5% daily stop, 0.5% risk, flat by 15:55 ET, **plus the primary loss guardrail d2+w5** (no new
+  entries after 2 losing trades in a session or 5 in a week; SPEC v1.3 G1–G3). **The 12/day cap puts a hard ceiling
+  of ~252 trades/mo on every equity candidate; the 5/week loss limit gives an expected ceiling of ≈ 54/mo at 60% WR
+  [P], which binds first** (§7).
+- **Base and layer run under the same guardrail.** Each is simulated as its own portfolio with its own day and week
+  loss counters (SPEC v1.3 G3.3). A base's reference numbers are always its d2+w5 numbers.
 
 ## 2. Reuse of phase-1 infrastructure (each layer is mostly one new module)
 ```
@@ -50,40 +62,56 @@ class Layer(Protocol):
 - `Signal` gains `base_id` and `layer_id` (or `combo_id`). Every other contract stays as is.
 - Reused unchanged: `guard.py` (every `LayerFeatures` field is guard-wrapped), fills, costs, portfolio/caps,
   `walk_forward` (25 folds, 12m/3m, same selection rule), `triallog`, `stats` (day/month block bootstrap, DSR),
-  the A3 guardrail overlays d2/w5/w6, and the A1 trade-off frontier readout.
+  the SPEC v1.3 guardrail (`PRIMARY_GUARDRAIL` = d2+w5 is the default `RiskCfg` in every run; the comparison rows
+  "none" and d2+w6 go to `guardrail_compare.parquet`), and the A1 trade-off frontier readout (computed on d2+w5).
 - New in `stats.py`: `paired_day_bootstrap(layer_trades, base_trades)` (§3). New in the readout: one "layer vs
   base" block per layer per base.
 - `tests/test_lookahead.py` (a), (b) and (c) run on every layer's features and on its emitted signals. A layer
   merges only with them green.
-- Walk-forward selection inside a layer's grid follows SPEC §6, with a train minimum of **≥ 100 trades [P]**,
-  because filters shrink samples. A fold with no qualifying variant trades **nothing** for that layer (counted
+- Walk-forward selection inside a layer's grid follows SPEC §6, on the primary configuration only, with a train
+  minimum of **≥ 100 trades [P]** (counted under d2+w5), because filters shrink samples. A fold with no qualifying variant trades **nothing** for that layer (counted
   as zero trades, never as falling back to the base).
 
 ## 3. Layer stage gate (incremental test vs the same base, decided on dev OOS before any holdout)
+- **Primary configuration only.** Base and layer are both run under d2+w5, on the same OOS days. Every quantity in
+  this section (ΔmeanR, trades/mo, CIs, fold counts, neighbours) is computed under d2+w5. The comparison rows
+  ("none", d2+w6) are reported beside the gate table but never decide a pass, a kill, a ranking or a combination.
 - **Paired comparison:** the same OOS days for layer and base. Resample trading days (5,000 resamples, seed
   20260925). Each draw computes `ΔmeanR = meanR(layer) − meanR(base)` and `Δtrades/mo` over the same days.
   Also report Δ win rate and Δ daily R sum.
 - A layer **passes** if either path holds after costs:
-  - **(a) Quality:** ΔmeanR 95% CI lower bound > 0, **and** layered trades/mo ≥ **150 [P]** (bottom of the
-    150–250 band).
-  - **(b) Frequency:** layered trades/mo ≥ 1.2 × base **[P]** **and** ≥ 150 **[P]**, **and** the layered
-    absolute OOS meanR day-block 95% CI lower bound > 0.
+  - **(a) Quality:** ΔmeanR 95% CI lower bound > 0. *(v2: the v1 floor of ≥ 150 trades/mo is removed, because no
+    candidate is expected to reach 150/mo under d2+w5, §7. The sample floor that still bites is SPEC §8's ≥ 500 OOS
+    and ≥ 100 holdout trades for any final candidate.)*
+  - **(b) Frequency:** the layer achieves **≥ 1.2 × its base's trades/mo**, both under d2+w5 over the same full
+    25-fold dev OOS, **and** the layer's own absolute OOS meanR day-block 95% CI lower bound > 0. *(v2: replaces
+    the v1 rule "≥ 1.2 × base and ≥ 150/mo", whose 150 floor can't hold under the guardrail.)*
   - **And both:** the median ΔmeanR over the selected variant's ±1-step grid neighbours is > 0 (a lone spike
     fails), and the layer is positive in ≥ 55% of folds **[P]**.
 - **Kill** = fails both (a) and (b) on the full 25-fold dev OOS. No early peeking: interim runs can label a
   layer INTERIM but cannot kill or promote it.
-- If the base runs below 150/mo, path (a) is unreachable for a pure filter. That is intended: filters survive
-  only on a base with enough frequency, so triggers have to carry frequency.
+- **Trades/mo reporting:** every gate row shows base and layer trades/mo under all three configurations (d2+w5,
+  none, d2+w6), stated in words against Christian's ~200/mo target. Missing the target is reported plainly, not
+  fixed by loosening anything.
+- **How the guardrail changes layer behaviour (mechanism, not data):** under d2+w5 a layer that lifts the win rate
+  also lifts trades/mo, because losses arrive more slowly and halts come later. A filter can therefore pass (b).
+  A trigger that adds lower-quality trades brings the halts forward and can lower trades/mo against its base.
 - Passing the gate is **necessary, not sufficient**. A final candidate (base + layer(s)) must still clear SPEC §8
-  in full, with N = the cumulative program trial count (§6).
+  in full under d2+w5, with N = the cumulative program trial count (§6). If the guardrail makes an §8 minimum
+  unreachable, that is reported as a finding and the candidate cannot pass (SPEC v1.3 G5).
 
 ## 4. Ranked layer backlog
 Ranking rule: (1) uses the phase-1 cache only, (2) can plausibly lift trades toward ~200/mo, (3) build cost.
 Crypto is last. Frequencies are priors **[P]**, based on base A ref ≈ **80–160/mo** and base B ≈ **10–30/mo**,
 and get replaced by phase-1 actuals at CP-P0. "Variants" = per base; the ledger adds both bases.
+- *v2:* the frequency priors below are **without the guardrail** (the "none" comparison row). Under the primary
+  d2+w5, every equity candidate is expected to sit at or below ≈ 54/mo at 60% WR, ≈ 36/mo at 40% WR **[P]** (§7),
+  so the "~200/mo plausible?" column now applies only to the comparison row. The ranking is unchanged: it orders
+  build work and adds no trials. Under d2+w5, the high-WR modes (L2 reversion, L6/L1 failure, L4 exhaustion) are
+  the likeliest to raise trades/mo.
 
 ### Summary
-| Rank | Layer | Kind @ attach point | Variants (A+B) | Data / requests | Expected trades/mo on base A | ~200/mo plausible? | Owner |
+| Rank | Layer | Kind @ attach point | Variants (A+B) | Data / requests | Expected trades/mo on base A (no guardrail, prior) | ~200/mo plausible without guardrail? | Owner |
 |---|---|---|---|---|---|---|---|
 | 1 | L6 prior-day level break / failure | trigger @ step 4–6 | 12+12 = 24 | cache, 0 | base + 50–100 | yes, near the 252 cap | Dev 2 |
 | 2 | L1 opening range / drive | trigger @ 4–6, or filter @ gate | 12+12 = 24 | cache, 0 | filter 0.5–0.7×; trigger base + 40–90 | yes (trigger modes) | Dev 2 |
@@ -196,8 +224,9 @@ and get replaced by phase-1 actuals at CP-P0. "Variants" = per base; the ledger 
 - **Kill:** §3.
 
 ### Note on the remaining filters (L3, L7)
-Both are pure filters. Each can only pass path (a), so each is useful only on a base that already clears
-~150/mo or after a trigger layer has lifted frequency (the combination stage).
+Both are pure filters. Under d2+w5 a filter can pass path (a), or path (b) if it lifts the win rate enough that
+fewer halts raise trades/mo to ≥ 1.2 × base (§3). Otherwise they are most useful after a trigger layer has lifted
+frequency (the combination stage).
 
 ### L3. Gap fill / gap-and-go (rank 6, filter on gap days, optional target)
 - **Hypothesis:** on gap days, zone signals pointing toward the prior close (fill) outperform, or, in the
@@ -229,8 +258,10 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
 - **Session definition:**
   - day = **00:00–24:00 UTC** (the convention most crypto daily candles and levels use).
   - Prior-day H/L/C, ATR_d, VWAP anchor, the 30-min opening range (00:00–00:30 UTC), RVOL slots (288 per day),
-    the daily loss stop and **guardrail d2** all reset at 00:00 UTC.
-  - week = Monday 00:00 UTC for w5/w6.
+    the daily loss stop and the **day loss count (d2)** all reset at 00:00 UTC.
+  - week = Monday 00:00 UTC to the next Monday 00:00 UTC (7 days, because crypto trades on weekends) for the
+    **week loss count (w5; w6 in the comparison row)**. The primary configuration d2+w5 applies to L8 like every
+    other layer.
   - No new entries after 23:00 UTC, forced exit at 23:55 UTC (flat each UTC day).
   - Readouts also show CT times.
 - **Data:** `/v1beta3/crypto/us/bars`, 5m, from the earliest Alpaca history **[P, verify; expected ~2021]**
@@ -245,15 +276,18 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
   - Taker 25 bp per side (stop-entries, stops, forced exits); maker 15 bp (limit targets).
   - Half-spread 2 bp for BTC/ETH, 5 bp for SOL. Stop and forced-exit slippage 2× the half-spread.
   - No borrow: shorts are excluded unless Alpaca supports them for the account (expected: **long-only [P]**).
-- **Cost gate (run first, 0 extra trials):** compute round-trip cost ÷ stop distance on base A ref crypto
-  signals. If the median is > **0.25R**, kill L8 before any grid runs.
+- **Cost gate (run first, 0 extra trials; approved by Christian via Trading on 2026-10-04):** compute round-trip
+  cost ÷ stop distance on base A ref crypto signals. If the median is > **0.25R**, kill L8 before any grid runs.
+  The gate is a cost ratio on signals, so the guardrail does not affect it.
   - Expected: BTC ATR_d ≈ 3% with a ~0.3·ATR_d stop ≈ 90 bp, against ≈ 45–55 bp round trip ≈ 0.5–0.6R.
     **Likely kill.**
 - **Grid:** backbone target {1R, 2R, next zone} × entry TF {5m, 15m} × `k_confirm` {1, 2} × base {A, B} =
   **24**, plus at most the 2 passing equity layers ported once × 2 bases = **≤ 4**.
-- **Frequency:** 3 symbols × ~30 days × 1–2 signals/day ≈ **90–180/mo [P]**.
-- **Kill:** cost gate, then §3 path (b) on the absolute OOS meanR (there is no crypto base to pair against
-  except its own base A).
+- **Frequency:** 3 symbols × ~30 days × 1–2 signals/day ≈ **90–180/mo [P]** without the guardrail. Under d2+w5,
+  the 5/week limit gives the same expected ceiling as equities, ≈ 54/mo at 60% WR **[P]**.
+- **Kill:** cost gate, then §3 under d2+w5. There is no equity base to pair against, so the crypto ports are
+  paired against crypto base A, and the crypto backbone itself must show an absolute OOS meanR day-block 95% CI
+  lower bound > 0.
 
 ## 5. Combination stage (at most one, pre-declared)
 - Per base, take the **top 2 passing layers** by ΔmeanR CI lower bound.
@@ -263,7 +297,7 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
   - trigger + filter: the trigger's signals, gated.
   - trigger + trigger: the union, deduplicated (same symbol and direction within 3 bars: the earliest wins).
 - **1 trial per base (2 total)**, logged. The combination passes only if it beats the better single layer on
-  §3 (paired against that layer, not the base).
+  §3 (paired against that layer, not the base), with both run under d2+w5.
 - No further stacking. A third layer needs a new version of this file, and its trials count.
 - **Final candidates per base ≤ 2:** the best single layer, plus the combination if it passed.
 
@@ -276,9 +310,13 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
 2. **Budget:** phase 2 is capped at **200 trials**: 160 planned (130 equity layers + 2 combinations + 28 crypto)
    plus a reserve of 40 for spec-amended reruns or the L6 premarket reserve.
    - **Program N_max = 650.** Going past it requires a new spec version and a note in every readout.
-   - The guardrail overlays (d2/w5/w6) and sensitivity rows add no trials (they are reporting only, as in A3).
-3. **Deflated Sharpe on cumulative N:** every candidate's DSR (daily returns) uses N = the ledger count at its
-   FREEZE, at least 450 + all phase-2 rows logged so far.
+   - **The guardrail adds 0 trials.** d2+w5 is fixed ex ante and is not a searched parameter (SPEC v1.3 G2). The
+     comparison rows (none, d2+w6) and the sensitivity rows are report-only, are not ledger rows, and never feed
+     selection. The 200-trial phase-2 budget and N_max = 650 are unchanged.
+   - Choosing a guardrail after seeing results is forbidden. Changing the primary configuration needs a new SPEC
+     version, and its trials count.
+3. **Deflated Sharpe on cumulative N:** every candidate's DSR (daily returns under d2+w5) uses N = the ledger
+   count at its FREEZE, at least 450 + all phase-2 rows logged so far.
    - The variance of trial Sharpes comes from the whole ledger.
    - Pass threshold is still ≥ 0.95. At N ≈ 650, the expected maximum null Sharpe is ≈ 3.6 standard
      deviations of the trial-Sharpe distribution, so stacking ideas raises the bar for everyone.
@@ -291,16 +329,24 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
    - **Screen (on the shared window):** Holm–Bonferroni across **all** candidates that read it (phase-1
      finalists + phase-2 candidates, m ≤ 4 + 6). One-sided day-block bootstrap p-value for mean R > 0 at
      family α = 0.05, plus the SPEC §8.5 conditions.
-   - **Confirmation (recommended, decisive):** a **fresh forward holdout**. Signals for the frozen survivors
-     are generated by the same code on bars arriving after 2026-10-05 (shadow scoring, no orders), and read
-     once at ≥ 100 trades **and** ≥ 3 months **[P]**, Holm across the survivors.
+   - **Confirmation (approved by Christian via Trading on 2026-10-04; decisive):** a **fresh forward holdout**,
+     as in SPEC v1.3 G7.
+     - Bar collection starts 2026-10-05 09:30 ET. Each candidate's window starts at the later of that and its
+       `FREEZE-P2-<id>.md` commit; only bars after the freeze are scored for it.
+     - Signals for the frozen survivors are generated by the same code on new bars only (shadow scoring, **no
+       orders**), under d2+w5.
+     - Read once at ≥ 100 trades **and** ≥ 3 months, Holm across the survivors. Before the read, only trade and
+       session counts are visible.
+     - **Forward scorer data pulls:** ≤ **30 requests/min on weekdays 08:15–15:15 CT** and ≤ 60/min otherwise,
+       enforced by `TimeOfDayLimiter`; at most one pull cycle every 5 minutes after the bar close; symbols
+       batched per request; global backoff on HTTP 429 (30 s doubling to 600 s).
    - Only a candidate that passes both goes to Trading as **validated**. A screen-only pass is labeled
      *holdout-screened, not confirmed*. Any paper trading is Trading's decision after that.
 
 ## 7. Honest target math (read before judging any readout)
 - **Break-even WR after costs.** With cost c in R per round trip: 1:1 needs (1 + c)/2, 2:1 needs (1 + c)/3.
   - At c = 0.06–0.11R: **53–55.5% at 1:1** and **35.3–37% at 2:1**.
-  - 60% at 1:1 net is 0.20 − c ≈ +0.09 to +0.14R per trade, ≈ 9–14%/mo at 200 trades and 0.5% risk. That
+  - 60% at 1:1 net is 0.20 − c ≈ +0.09 to +0.14R per trade, ≈ 9–14%/mo at 200 trades and 0.5% risk (no-guardrail comparison only). That
     is far above the 3–5% target and would be exceptional, so expect to trade WR against frequency.
 - **Win-rate profiles:**
   - High WR, small wins: L2 reversion (VWAP target), L3 fade (PDC target), L6/L1 failure modes,
@@ -308,34 +354,41 @@ Both are pure filters. Each can only pass path (a), so each is useful only on a 
     targets are often < 1R.
   - Low WR, big wins: L6/L1 break-retest, L4 continuation, the L2 trend gate. Expect 35–45% WR with ≥ 1.5R
     average wins. They can be profitable while visibly missing the 60% target.
-- **Frequency ceiling:** the 12 entries/day cap gives ≤ ~252/mo. 200/mo is ~80% of the cap, so the backbone
-  plus triggers must fire nearly every day across 33 names.
-- **The guardrails conflict with 200/mo.** Expected trades until the k-th loss = k / (1 − WR). At 60% WR:
-  - **d2** allows ~5 trades/day on average, **≈ 105/mo**.
-  - **w5 / w6** allow ~12.5–15/week, **≈ 54–65/mo**.
-  - Sustaining 200/mo (~46/week) under w6 needs a WR ≥ **87%**; under w5, ≥ **89%**.
-  - The overlays are therefore reported as overlays (A3). Christian has to choose between the guardrails as
-    written and ~200 trades/mo; both together aren't achievable at a realistic win rate.
+- **Frequency ceiling:** the 12 entries/day cap gives ≤ ~252/mo. Without the guardrail, 200/mo is ~80% of the cap,
+  so the backbone plus triggers must fire nearly every day across 33 names. Under the primary d2+w5 the
+  guardrail is the tighter ceiling (next bullet).
+- **The guardrail is binding and conflicts with 200/mo.** Christian chose the guardrail (2026-10-04), so d2+w5 is the
+  primary configuration and ~200/mo is reported against it, not chased. Expected trades until the k-th loss =
+  k / (1 − WR). At 60% WR **[P]**:
+  - **d2** alone allows ~5 trades/day on average, **≈ 105/mo**.
+  - **w5 / w6** alone allow ~12.5–15/week, **≈ 54–65/mo**.
+  - **d2+w5 (primary):** w5 binds first, so **≈ 54/mo** (≈ 43/mo at 50% WR, ≈ 36/mo at 40% WR) **[P]**.
+  - 150/mo under w5 needs WR ≥ ~**86%**; 200/mo (~46/week) needs ≥ **89%** under w5 and ≥ **87%** under w6.
+  - At ≈ 54 trades/mo and 0.5% risk, a 60% win rate at 1:1 nets ≈ 2.4–3.8%/mo after c = 0.06–0.11R **[P]**. 3%/mo
+    needs E[R] ≈ 0.11R net per trade and 5%/mo ≈ 0.19R **[P]**.
+  - These are expectations that ignore signal supply and the other caps. Phase-1 actuals replace them at CP-P0.
 - Every readout states each target (WR, trades/mo, net return) in words, met or not.
 
 ## 8. Start order, owners, and checkpoints (after phase-1 CP6, or CP5 with no finalists)
 | # | Owner | Task | Done when |
 |---|---|---|---|
-| P0 | Dev 1 + Dev 2 | `layers/base.py`, `grids_p2.py` (hashes), program-wide triallog migration (450 phase-1 rows), base resolution from FREEZE.md or §1 reference, `paired_day_bootstrap`, phase-1 base frequencies replacing the §4 priors | **CP-P0 Architect review** (ledger count, base ids, gate math on a fixture) |
+| P0 | Dev 1 + Dev 2 | `layers/base.py`, `grids_p2.py` (hashes), program-wide triallog migration (450 phase-1 rows), base resolution from FREEZE.md or §1 reference, `paired_day_bootstrap`, phase-1 base frequencies (under d2+w5 and the two comparison rows) replacing the §4 priors | **CP-P0 Architect review** (ledger count, base ids, gate math on a fixture, base and layer both on d2+w5) |
 | P1 | Dev 2 | L6 trigger (+ lookahead tests) | tests (a)(b)(c) green on L6 features and signals |
 | P1' | Dev 1 | L2 filter + "layer vs base" readout block | paired readout reproducible with the seed; **CP-P1** reviews L6 + L2 together |
 | P2 | Dev 2 | L1, then L4 triggers | lookahead green |
 | P2' | Dev 1 | L5 (multi-symbol alignment), L3, L7 filters | lookahead green, IWM exclusion tested |
-| P3 | Dev 1 | full dev-OOS run of all 7 layers × 2 bases → gate table | **CP-P2 Architect review**, then an INTERIM note to Trading (holdout untouched) |
+| P3 | Dev 1 | full dev-OOS run of all 7 layers × 2 bases under d2+w5 → gate table, plus the comparison rows | **CP-P2 Architect review**, then an INTERIM note to Trading (holdout untouched) |
 | P4 | Dev 1 | combination stage → `FREEZE-P2-<id>.md` | **CP-P3 sign-off on the freezes and the ledger N** |
 | P5 | Dev 1 | holdout screen, once per candidate, Holm | **CP-P4 review**, then to Trading via the Team Manager, labeled screened |
-| P6 | Dev 2 | crypto: limiter allow-list, UTC calendar, off-hours pull, cost gate | **CP-P5** reviews the gate; kill or continue |
+| P6 | Dev 2 | crypto: limiter allow-list, UTC calendar, off-hours pull, cost gate (approved 2026-10-04; runs before any crypto grid) | **CP-P5** reviews the gate; kill or continue |
 | P7 | Dev 2 + Dev 1 | crypto grid (+ ported layers) → freeze → holdout screen | **CP-P6 review** |
-| P8 | Dev 1 | forward holdout harness (shadow scoring, §6.5) | read at ≥ 100 trades and ≥ 3 months; **CP-P7 final review** |
+| P8 | Dev 1 | forward holdout harness (approved 2026-10-04; shadow scoring under d2+w5, §6.5), pulls ≤ 30 req/min weekdays 08:15–15:15 CT and ≤ 60/min otherwise | limiter settings reviewed before the first market-hours pull; read at ≥ 100 trades and ≥ 3 months; **CP-P7 final review** |
 - Order: P0, then P1 ∥ P1', then P2 ∥ P2', then P3. Dev 2 starts P6 once P2 lands, so crypto data is ready by
   CP-P2 without delaying equity.
 - At every CP the Architect checks: guard coverage of the new features, OR/VWAP/gap availability times,
-  cross-symbol alignment (L5), grid-hash adherence, ledger N, and that no holdout lock exists early.
+  cross-symbol alignment (L5), grid-hash adherence, ledger N, and that no holdout lock exists early. From v2 on,
+  also: the guardrail logic (SPEC v1.3 G8 fixture), base and layer on the same d2+w5, and that no selection, gate
+  decision, combination or freeze used a comparison configuration.
 - Operational rules are SPEC §9 unchanged: research only, no running bots, no pytest in live checkouts, keys in
   memory only, ≤ 30 req/min weekdays 08:15–15:15 CT and ≤ 60/min otherwise, gitignored data, draft PRs titled
   `[research, do not merge]`.
