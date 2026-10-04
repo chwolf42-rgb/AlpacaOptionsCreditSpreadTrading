@@ -64,14 +64,15 @@ def test_spike_clamps_at_t_plus_2_and_pivots_at_t_plus_1_stay_raw():
     closes = np.full(78, 100.0)
     raw = _session(day, closes, spike_at=10)
     peak = 8
-    raw.loc[peak, "high"] = 101.0
+    peak_high = 100.15
+    raw.loc[peak, "high"] = peak_high
     raw_high = float(raw["high"].iloc[10])
     repaired, count = repair_bad_prints(raw, {("SPY", day): 2.0})
     assert count == 1
     assert bool(repaired["bad_print"].iloc[10])
     assert float(repaired["high_unclamped"].iloc[10]) == pytest.approx(raw_high)
     assert float(repaired["high"].iloc[10]) < raw_high
-    assert float(repaired["high"].iloc[peak]) == pytest.approx(101.0)
+    assert float(repaired["high"].iloc[peak]) == pytest.approx(peak_high)
     visible_at = pd.Timestamp(repaired["bad_print_visible_at"].iloc[10])
     t1 = pd.Timestamp(raw["available_at"].iloc[11])
     seen = prices_as_of(repaired, t1.to_pydatetime())
@@ -91,25 +92,28 @@ def test_spike_clamps_at_t_plus_2_and_pivots_at_t_plus_1_stay_raw():
     tape = pd.concat(history + [repaired], ignore_index=True).sort_values("ts").reset_index(drop=True)
     bars = BarSet(tape)
     cfg = EngineCfg()
+    # Zones recompute on 15m closes. 10:30 is t+1 (raw). The clamp is visible
+    # at 10:35, so the next zone set that can see it is the 10:45 close.
+    zone_late = pd.Timestamp(raw["available_at"].iloc[14])
     early = levels_at(bars, t1.to_pydatetime(), cfg)
     late = levels_at(bars, visible_at.to_pydatetime(), cfg)
     early_zones = zones_at(bars, t1.to_pydatetime(), cfg)
-    late_zones = zones_at(bars, visible_at.to_pydatetime(), cfg)
+    late_zones = zones_at(bars, zone_late.to_pydatetime(), cfg)
 
     def _near(prices, target: float) -> bool:
         return any(abs(price - target) < 1e-3 for price in prices)
 
     early_prices = [level.price for level in early]
     late_prices = [level.price for level in late]
-    assert not _near(early_prices, 101.0)
+    assert not _near(early_prices, peak_high)
     assert not _near(early_prices, raw_high)
-    assert _near(late_prices, 101.0)
+    assert _near(late_prices, peak_high)
     assert not _near(late_prices, raw_high)
     early_centers = [0.5 * (zone.low + zone.high) for zone in early_zones]
     late_centers = [0.5 * (zone.low + zone.high) for zone in late_zones]
-    assert not _near(early_centers, 101.0)
+    assert not _near(early_centers, peak_high)
     assert not _near(early_centers, raw_high)
-    assert _near(late_centers, 101.0)
+    assert _near(late_centers, peak_high)
     assert not _near(late_centers, raw_high)
 
 

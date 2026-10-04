@@ -48,6 +48,7 @@ def _frame_from_closes(
     early_close: bool = False,
     wick: float = 0.05,
     extra_low_at: tuple[int, ...] = (),
+    extra_high_at: tuple[int, ...] = (),
 ) -> pd.DataFrame:
     closes = np.asarray(closes, dtype=np.float64)
     opens_ts = session_opens(session, early_close=early_close)
@@ -68,6 +69,8 @@ def _frame_from_closes(
             high[index] += 0.25
     for index in extra_low_at:
         low[index] -= 0.5
+    for index in extra_high_at:
+        high[index] += 0.5
     if volumes is None:
         volume_col = np.full(len(closes), volume, dtype=np.float64)
     else:
@@ -120,12 +123,26 @@ def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def trend_bars(symbol: str = "TREND") -> pd.DataFrame:
-    """Rising sessions. Drift dominates a small oscillation."""
+    """Rising sessions, then one gapped session with a separated high.
+
+    The sine path fills ±2·ATR_d with pivots closer together than
+    ``k_cluster``, so single-linkage would be one cluster containing the
+    close and no zone would survive. The last session gaps up by more than
+    ``k_cluster·ATR_d`` and leaves one strict high above that gap, which is
+    what gives the lookahead gate a support zone and a resistance zone.
+    """
     frames = []
-    for i, day in enumerate(_weekdays(date(2024, 6, 3), _SESSIONS)):
-        t = np.arange(_FULL, dtype=np.float64)
+    days = _weekdays(date(2024, 6, 3), _SESSIONS)
+    t = np.arange(_FULL, dtype=np.float64)
+    for i, day in enumerate(days):
         closes = 100.0 + i * 2.0 + 0.03 * t + 0.4 * np.sin(t / 4.0)
+        if i == len(days) - 1:
+            previous = 100.0 + (i - 1) * 2.0 + 0.03 * t + 0.4 * np.sin(t / 4.0)
+            base = float(previous[-1]) + 3.2
+            closes = base + 0.05 * np.sin(t / 3.0)
         frames.append(_frame_from_closes(day, closes, symbol=symbol, volumes=_volumes(_FULL, i)))
+    last = frames[-1]
+    last.loc[last.index[12], "high"] = float(last["close"].iloc[12]) + 1.8
     return _concat(frames)
 
 

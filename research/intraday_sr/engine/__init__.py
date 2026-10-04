@@ -1,8 +1,6 @@
 """Engine entry points.
 
-S0 returns causal 5m pivots, a padded zone, and a k_confirm=0 signal so
-the lookahead gate is not an empty comparison. D2-2 and D2-3 replace the
-bodies with the full spec stack.
+Levels, zones, and the Test A stack. Formations stay empty until D2-4.
 """
 
 from research.intraday_sr.engine.formations import formations_at
