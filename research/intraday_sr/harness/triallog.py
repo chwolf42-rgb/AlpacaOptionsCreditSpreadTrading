@@ -66,7 +66,7 @@ def git_sha(repo: Path | str = ".") -> str:
 
 
 DEFAULT_LEDGER = Path("/workspace/research4/runs/PROGRAM_LEDGER")    # box-wide program ledger (all runs)
-N_FLOOR = 450                                                          # SPEC v1.3 G2 declared trials
+from research.intraday_sr.harness.config import N_TOTAL as N_FLOOR   # grids.N_TRIALS (450), SPEC v1.3 G2 declared trials
 
 
 class LedgerError(RuntimeError):

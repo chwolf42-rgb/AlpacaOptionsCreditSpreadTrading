@@ -44,34 +44,34 @@ from research.intraday_sr.harness.guard import Guard, Guarded
 BAR_5M = timedelta(minutes=5)
 
 
-FLAG_COLS = ("bad_print",)   # agreed with Developer 2: bool column `bad_print` on bar frames (optional)
+# Bad prints (SPEC v1.3.1 C1, CP0 lookahead fix): `bad_print` and the clamp for bar t depend on bars t+1 and t+2, so
+# they are known only at the close of t+2. The simulator therefore NEVER reads `bad_print` (nor any clamped column)
+# when simulating bar t: fills, stops, targets, marks and cancels all use the UNCLAMPED open/high/low/close.
+# If a frame carries the unclamped extremes in separate columns, those win over `high`/`low`.
+UNCLAMPED_COLS = {"high": ("high_unclamped", "high_raw"), "low": ("low_unclamped", "low_raw")}
 
 
 class FillOutsideBar(AssertionError):
-    """Defensive check: a fill price must lie inside its bar's [low, high] and never on a flagged bar."""
+    """Defensive check: a fill price must lie inside its bar's UNCLAMPED [low, high]."""
 
 
 class _Bar:
-    __slots__ = ("open", "high", "low", "close", "adj_factor", "flag")
+    __slots__ = ("open", "high", "low", "close", "adj_factor")
 
-    def __init__(self, o, h, l, c, a, flag=False):
+    def __init__(self, o, h, l, c, a):
         self.open, self.high, self.low, self.close, self.adj_factor = float(o), float(h), float(l), float(c), float(a)
-        self.flag = bool(flag)
 
 
 def _check_fill(px: float, b: _Bar, what: str, sym, ts) -> None:
-    if b.flag:
-        raise FillOutsideBar(f"{what} fill on a flagged bar: {sym} {ts}")
     if not (b.low - 1e-9 <= px <= b.high + 1e-9):
         raise FillOutsideBar(f"{what} fill {px} outside bar [{b.low}, {b.high}]: {sym} {ts}")
 
 
-def _flags(f: pd.DataFrame) -> np.ndarray:
-    out = np.zeros(len(f), dtype=bool)
-    for col in FLAG_COLS:
-        if col in f:
-            out |= f[col].fillna(False).to_numpy(bool)
-    return out
+def _extreme(f: pd.DataFrame, col: str) -> np.ndarray:
+    for alt in UNCLAMPED_COLS[col]:
+        if alt in f:
+            return f[alt].to_numpy(float)
+    return f[col].to_numpy(float)
 
 
 class FrameBarSource:
@@ -144,12 +144,11 @@ def _sig_name(sig) -> str:
 
 
 def _atr_d(sig) -> float:
-    z = sig.zone
-    for src in (getattr(z, "atr_d", None), (sig.components or {}).get("atr_d"), (z.components or {}).get("atr_d")):
-        if src is not None and np.isfinite(src) and src > 0:
-            return float(src)
-    raise SignalContractError(f"signal has no finite ATR_d (Zone.atr_d defaults to NaN in S0) for the 0.10 ATR_d "
-                              f"stop floor: {_sig_name(sig)}")
+    v = getattr(sig.zone, "atr_d", None)           # CP0 R1: Zone.atr_d is the ONLY source (required, finite, > 0)
+    if v is not None and np.isfinite(v) and v > 0:
+        return float(v)
+    raise SignalContractError(f"Zone.atr_d must be finite and > 0 (got {v!r}) for the 0.10 ATR_d stop floor: "
+                              f"{_sig_name(sig)}")
 
 
 def _zone_target(sig) -> float:
@@ -251,10 +250,10 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
     forced_t = risk.forced_exit_early if early else risk.forced_exit
     tss = {s: f["ts"].tolist() for s, f in frames.items()}
     rows = {s: {ts: i for i, ts in enumerate(v)} for s, v in tss.items()}
-    arr = {s: [_Bar(*r) for r in zip(f["open"].to_numpy(float), f["high"].to_numpy(float), f["low"].to_numpy(float),
-                                      f["close"].to_numpy(float), f["adj_factor"].to_numpy(float), _flags(f))]
+    arr = {s: [_Bar(*r) for r in zip(f["open"].to_numpy(float), _extreme(f, "high"), _extreme(f, "low"),
+                                      f["close"].to_numpy(float), f["adj_factor"].to_numpy(float))]
            for s, f in frames.items()}
-    last_good: dict = {}       # symbol -> (bar ts, close) of the latest UNflagged bar (marks, end-of-day fallback)
+    last_good: dict = {}       # symbol -> (bar ts, close) of the latest bar seen (marks, end-of-day fallback)
     timeline = sorted({ts for v in tss.values() for ts in v})
     inactive = sorted(sigs, key=lambda s: (s.available_at, s.symbol))
     c["signals"] += len(sigs)
@@ -321,10 +320,7 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
             j = rows[s_].get(ts)
             if j is None:
                 continue
-            if arr[s_][j].flag:                            # flagged bar: no fills, no marks, no cancels on it
-                c["bars_flagged_skipped"] += 1
-                continue
-            here[s_] = arr[s_][j]
+            here[s_] = arr[s_][j]                           # unclamped; bad_print is not visible at bar t
         occupied = len(pos)
         # ---- (i) exits of positions open at the bar start, symbol A-Z (all fills in a bar share its ts)
         for sym in sorted(pos):

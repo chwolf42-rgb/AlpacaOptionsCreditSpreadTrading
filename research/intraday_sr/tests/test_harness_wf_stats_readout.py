@@ -1,5 +1,7 @@
 from datetime import date
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -35,14 +37,34 @@ def test_select_min_trades_and_ties():
 def test_holdout_refusals(tmp_path):
     fz, lk = tmp_path / "FREEZE.md", tmp_path / "holdout.lock"
     syms = [f"S{i}" for i in range(33)]
+
+    class Tok:                                        # stand-in for Developer 2's HoldoutToken (D2-1)
+        def __init__(self, freeze_path):
+            assert Path(freeze_path).exists()
+            self.freeze_path = freeze_path
     with pytest.raises(W.HoldoutRefused):
-        W.run_holdout(fz, lk, syms, lambda x: {}, {})
+        W.run_holdout(fz, lk, syms, lambda x, t: {}, {}, token_cls=Tok)
     fz.write_text("x")
     with pytest.raises(W.HoldoutRefused):
-        W.run_holdout(fz, lk, syms[:32], lambda x: {}, {})
-    assert W.run_holdout(fz, lk, syms, lambda x: {"ok": 1}, {}) == {"ok": 1}
+        W.run_holdout(fz, lk, syms[:32], lambda x, t: {}, {}, token_cls=Tok)
+    try:                                              # token type not merged yet -> refuse BEFORE burning the lock
+        W.holdout_token_cls()
+    except W.HoldoutRefused:
+        with pytest.raises(W.HoldoutRefused):
+            W.run_holdout(fz, lk, syms, lambda x, t: {}, {})
+        assert not lk.exists()
+    got = W.run_holdout(fz, lk, syms, lambda x, t: {"ok": 1, "token": t}, {}, token_cls=Tok)
+    assert got["ok"] == 1 and isinstance(got["token"], Tok) and lk.exists()
     with pytest.raises(W.HoldoutRefused):
-        W.run_holdout(fz, lk, syms, lambda x: {}, {})
+        W.run_holdout(fz, lk, syms, lambda x, t: {}, {}, token_cls=Tok)
+
+
+def test_only_walkforward_constructs_holdout_tokens():
+    import re
+    root = Path(W.__file__).resolve().parent
+    hits = [p.name for p in root.glob("*.py") if p.name != "walkforward.py"
+            and re.search(r"HoldoutToken\s*\(|token_cls\s*\(", p.read_text())]
+    assert hits == []
 
 
 def test_bootstrap_reproducible_and_dsr_sane():

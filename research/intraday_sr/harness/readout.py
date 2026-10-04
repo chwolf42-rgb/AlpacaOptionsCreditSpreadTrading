@@ -284,7 +284,8 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
     L += [f"# Intraday S/R readout: {title}", "",
           f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
           f"- Trial count: DSR N = max(450, program ledger) = **{inp.n_dsr}** (program ledger: {inp.n_program} trials "
-          "cumulative across all tests and runs; 450 declared = A 192 + B 192 + formations 48 + options 18). This run "
+          "cumulative across all tests and runs; 450 declared = A 192 + B 192 + formations 48 + options 18). "
+          f"Grid hash (grids.GRID_SHA256): `{inp.grid_sha}`. This run "
           "logged: " + (", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items()) or "none")
           + ". Guardrail configurations add 0 trials.",
           "- Configuration: **primary loss guardrail d2+w5** (2 losses/session, 5 losses/Mon-Fri week; SPEC v1.3 G1) for "

@@ -33,14 +33,15 @@ from research.intraday_sr.harness import adjfactors as AF
 from research.intraday_sr.harness import readout as RO
 from research.intraday_sr.harness import stats as S
 from research.intraday_sr.harness.compare import write_compare
-from research.intraday_sr.harness.config import COMPARISON, EXTRA_COMPARISON, PRIMARY, CostCfg, RiskCfg
-from research.intraday_sr.harness.grid_check import check_test_grid, grid_hash
+from research.intraday_sr.harness import s0grids
+from research.intraday_sr.harness.config import COMPARISON, PENDING_R5, PRIMARY, CostCfg, RiskCfg
+from research.intraday_sr.harness.grid_check import check_grids_module, grid_hash
 from research.intraday_sr.harness.portfolio import SignalContractError, simulate
 from research.intraday_sr.harness.triallog import DEFAULT_LEDGER, TrialLog, TrialRow, git_sha
 from research.intraday_sr.harness.walkforward import (DEV_END, VariantRun, exact_finalist_check, make_folds,
                                                       walk_forward)
 
-SPEC_VERSION = "v1.3"
+SPEC_VERSION = "v1.3.1"
 _G: dict = {}          # fork-shared state for workers
 
 
@@ -198,6 +199,9 @@ def main(argv=None):
     _G.update(adapter=ad, symbols=syms, src=ad.bar_source(syms),
               sessions=[d for d in ad.sessions() if d <= DEV_END], all_sessions=list(ad.sessions()))
     src = _G["src"]
+    if not ad.smoke and _G["all_sessions"] and max(_G["all_sessions"]) > DEV_END:
+        raise SystemExit("bar source reaches into the holdout (> 2026-03-31); dev runs load through DEV_END only "
+                         "(SPEC v1.3.1 C2); the holdout is opened only by walkforward.run_holdout()")
     adj_note = getattr(getattr(src, "adj_info", None), "note", lambda: "adj factor provenance unknown")()
     if not ad.smoke:
         # Real runs: Trading's raw/adj factor is REQUIRED for every run symbol and session; no 1.0 fallback.
@@ -213,22 +217,34 @@ def main(argv=None):
     inp = RO.ReadoutInputs(SPEC_VERSION, sha, "", {}, syms, smoke=ad.smoke)
     manifest = {"run_id": a.tag, "run_kind": kind, "spec_version": SPEC_VERSION, "git_sha": sha,
                 "config": PRIMARY.name, "symbols": syms, "ledger": str(log.path), "grids": {},
+                "grid_sha256": s0grids.grid_sha256(), "grids_source": s0grids.source(),
+                "guardrails": {"primary": PRIMARY.name, "comparison": [g.name for g in COMPARISON]},
+                "frozen_constants_pending_r5": list(PENDING_R5),
                 "approximations": [
                     "guardrail counters reset at internal quarter starts in train windows (continuous selection "
                     "path; accepted by the R1 ruling for R-based selection only; finalists re-checked exactly)",
                     "OOS-fold and holdout paths are exact: counters and equity ($100k) start at each window start"],
                 "adj_factors": adj_note, "started_at_ct": pd.Timestamp.now(tz="America/Chicago").isoformat()}
     frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers}", adj_note]
+    if not ad.smoke:
+        # R5/R6: the whole grids module must pass the conformance check; the logged hash is grids.GRID_SHA256 (full).
+        errs = check_grids_module(s0grids.grids())
+        if errs:
+            raise SystemExit("grids.py does not match SPEC v1.3.1: " + "; ".join(errs))
     for test in a.tests.split(","):
         variants = ad.variants(test)
         if a.max_variants:
             variants = variants[:a.max_variants]
-        gsha = grid_hash(variants)
+        if ad.smoke:
+            gsha = "smoke-variants:" + grid_hash(variants)       # fake smoke axes; never in the program ledger
+        else:
+            rows = {"A": s0grids.grids().TEST_A, "B": s0grids.grids().TEST_B}[test]
+            strip = lambda v: {k: x for k, x in v.items() if k != "test"}
+            if sorted(map(strip, variants), key=lambda v: v["variant_id"]) != \
+                    sorted(map(strip, rows), key=lambda v: v["variant_id"]):
+                raise SystemExit(f"Test {test} variants differ from grids.TEST_{test}; GRID_SHA256 would not cover them")
+            gsha = s0grids.grid_sha256()
         inp.grid_sha = gsha
-        errs = check_test_grid(f"Test {test}", variants) if test in ("A", "B") else []
-        if errs and not ad.smoke:
-            raise SystemExit("grid does not match SPEC v1.1: " + "; ".join(errs))
-        notes += [f"Test {test} grid check: {e}" for e in errs]
         results = _par(run_variant, variants, a.workers)
         runs = {vr.variant_id: vr for vr, _, _ in results}
         manifest["grids"][test] = gsha
@@ -287,7 +303,7 @@ def main(argv=None):
         tp_, dp_, prim_cnt = selected_path(wf.picks, vmap, PRIMARY)
         gstats = [RO.guardrail_stats(PRIMARY.name, tp_, dp_, prim_cnt)]
         crow = []
-        for gcfg in COMPARISON + EXTRA_COMPARISON:
+        for gcfg in COMPARISON:
             tg, dg, cnt = selected_path(wf.picks, vmap, gcfg)
             gs = RO.guardrail_stats(gcfg.name, tg, dg, cnt)
             crow.append({"run_id": a.tag, "test": test, "scope": "selected_path", "config": gcfg.name,
@@ -299,8 +315,7 @@ def main(argv=None):
                          "daily_stop_days": gs["daily_stop_days"],
                          "signals_cancelled_at_trip": gs["signals_cancelled_at_trip"],
                          "signals_arrived_blocked": gs["signals_arrived_blocked"]})
-            if gcfg in COMPARISON:
-                gstats.append(gs)
+            gstats.append(gs)
         write_compare(out, crow)
         inp.guardrails = {**inp.guardrails, f"Test {test} selected path":
                           (RO.guardrail_rows(gstats), RO.trades_per_month_words(gstats))}

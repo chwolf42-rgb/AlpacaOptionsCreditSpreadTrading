@@ -1,7 +1,8 @@
-"""Harness-side configuration dataclasses (proposed for types.py at CP0; kept here to avoid S0 collisions).
+"""Harness-side configuration dataclasses (RiskCfg, CostCfg, Fold, GuardrailCfg; Developer 1).
 
-Values are SPEC v1.0 section 5/7 plus the v1.1 rulings (12 entries/day, 4 concurrent). Changing any default
-requires a new spec version before the run that uses it.
+Frozen values are read from grids.py via harness/s0grids.py (SPEC v1.3.1 C3: single source): PRIMARY_GUARDRAIL,
+COMPARISON_GUARDRAILS, FIXED (daily stop, entries/day, concurrency, ...), N. Changing any of them requires a new spec
+version before the run that uses it.
 """
 
 from __future__ import annotations
@@ -27,58 +28,41 @@ def canonical_target(label: str) -> str:
     return t
 
 
-# SPEC v1.3 G1 primary guardrail. Read from grids.PRIMARY_GUARDRAIL (Developer 2: dict
-# {max_losses_day: 2, max_losses_week: 5}; a (2, 5) tuple is accepted too) when grids.py is importable, and
-# asserted equal to the spec value. The daily stop is SIGNED like grids.DAILY_LOSS_STOP (-0.015).
-SPEC_PRIMARY_GUARDRAIL = {"max_losses_day": 2, "max_losses_week": 5}
-SPEC_DAILY_LOSS_STOP = -0.015
+# Frozen constants come from grids.py through the s0grids shim (SPEC v1.3.1 C3 / CP0 R5); nothing is redefined here.
+from research.intraday_sr.harness import s0grids as _G  # noqa: E402
+
+_PG_DAY, _PG_WEEK = _G.primary_guardrail()                 # grids.PRIMARY_GUARDRAIL {daily_losses, weekly_losses}
+_DLS = float(_G.fixed("daily_loss_stop"))                  # signed, -0.015
+_ENTRIES = int(_G.fixed("entries_per_day"))
+_CONC = int(_G.fixed("max_concurrent"))
+
+# Frozen harness constants that grids.FIXED does not carry YET (CP0 R5 asks Developer 2 to add them). Each is taken
+# from grids.FIXED as soon as the key exists; until then the SPEC value is used and listed in PENDING_R5 (manifest).
+_PENDING_SPEC = {"risk_pct": 0.005, "max_pos_notional_x": 1.0, "max_gross_notional_x": 3.0, "last_entry": "15:00",
+                 "forced_exit": "15:55", "forced_exit_early": "12:55", "min_stop_atr_d": 0.10,
+                 "zone_target_min_r": 1.0}
+PENDING_R5 = tuple(k for k in _PENDING_SPEC if k not in _G.grids().FIXED)
 
 
-def guardrail_from(g: Any) -> dict:
-    if isinstance(g, dict):
-        return {"max_losses_day": g["max_losses_day"], "max_losses_week": g["max_losses_week"]}
-    if isinstance(g, (tuple, list)) and len(g) == 2:
-        return {"max_losses_day": g[0], "max_losses_week": g[1]}
-    raise ValueError(f"PRIMARY_GUARDRAIL must be a dict with max_losses_day/max_losses_week, got {g!r}")
-
-
-def primary_from_grids(mod=None) -> tuple[dict, float, str]:
-    """(guardrail dict, daily loss stop, source). Asserts grids.py agrees with SPEC v1.3."""
-    if mod is None:
-        try:
-            import importlib
-            mod = importlib.import_module("research.intraday_sr.grids")
-        except Exception:  # noqa: BLE001  (S0 not merged yet)
-            return dict(SPEC_PRIMARY_GUARDRAIL), SPEC_DAILY_LOSS_STOP, "spec (grids.py not importable)"
-    src = "spec"
-    g = dict(SPEC_PRIMARY_GUARDRAIL)
-    if hasattr(mod, "PRIMARY_GUARDRAIL"):
-        g, src = guardrail_from(mod.PRIMARY_GUARDRAIL), "grids.PRIMARY_GUARDRAIL"
-        if g != SPEC_PRIMARY_GUARDRAIL:
-            raise AssertionError(f"grids.PRIMARY_GUARDRAIL {g} != SPEC v1.3 G1 {SPEC_PRIMARY_GUARDRAIL}")
-    stop = float(getattr(mod, "DAILY_LOSS_STOP", SPEC_DAILY_LOSS_STOP))
-    if stop != SPEC_DAILY_LOSS_STOP:
-        raise AssertionError(f"grids.DAILY_LOSS_STOP {stop} != {SPEC_DAILY_LOSS_STOP} (signed, of day-start equity)")
-    return g, stop, src
-
-
-_PG, _DLS, PRIMARY_SOURCE = primary_from_grids()
+def _fx(key):
+    v = _G.grids().FIXED.get(key, _PENDING_SPEC[key])
+    return time.fromisoformat(v) if isinstance(v, str) and ":" in v else v
 
 
 @dataclass(frozen=True)
 class RiskCfg:
     target: Literal["1R", "2R", "zone", "next_zone"] = "1R"   # canonical "zone"; "next_zone" = temporary alias
-    risk_pct: float = 0.005                 # of day-start equity, per trade
-    max_pos_notional_x: float = 1.0          # x equity per position
-    max_gross_notional_x: float = 3.0        # x equity total
-    max_concurrent: int = 4                  # v1.1 (v1.0: 3)
-    max_entries_per_day: int = 12            # v1.1 (v1.0: 10)
+    risk_pct: float = _fx("risk_pct")                    # of day-start equity, per trade
+    max_pos_notional_x: float = _fx("max_pos_notional_x")  # x equity per position
+    max_gross_notional_x: float = _fx("max_gross_notional_x")  # x equity total
+    max_concurrent: int = _CONC              # grids.FIXED["max_concurrent"] (4)
+    max_entries_per_day: int = _ENTRIES      # grids.FIXED["entries_per_day"] (12)
     daily_loss_stop: float = _DLS            # SIGNED (-0.015): realized + open <= this x day-start equity -> flatten
-    last_entry: time = time(15, 0)           # entry fills only on bars that OPEN before 15:00 ET
-    forced_exit: time = time(15, 55)         # forced exit at the OPEN of the 15:55 5m bar
-    forced_exit_early: time = time(12, 55)   # half days (13:00 close)
-    min_stop_atr_d: float = 0.10             # stop widened to >= 0.10 ATR_d from the actual fill
-    zone_target_min_r: float = 1.0           # zone target < 1R from the fill -> skip
+    last_entry: time = _fx("last_entry")     # entry fills only on bars that OPEN before 15:00 ET
+    forced_exit: time = _fx("forced_exit")   # forced exit at the OPEN of the 15:55 5m bar
+    forced_exit_early: time = _fx("forced_exit_early")   # half days (13:00 close)
+    min_stop_atr_d: float = _fx("min_stop_atr_d")        # stop widened to >= 0.10 ATR_d from the actual fill
+    zone_target_min_r: float = _fx("zone_target_min_r")  # zone target < 1R from the fill -> skip
     start_equity: float = 100_000.0
     capacity_release: Literal["next_bar"] = "next_bar"   # capacity freed by an exit on bar t is usable from t+1
     fill_bar_target: Literal["not_credited"] = "not_credited"  # on the entry bar only the stop is checked
@@ -86,8 +70,8 @@ class RiskCfg:
     # None = no limit. A loss (R < 0 after costs) counts at its exit fill, INSIDE the bar: exits run before
     # entries in every bar, so a loss that reaches the limit blocks entries in that same bar (and a fill-bar stop
     # counts before the next entry candidate of that bar).
-    max_losses_day: Optional[int] = _PG["max_losses_day"]    # 2: no new entries for the rest of the session
-    max_losses_week: Optional[int] = _PG["max_losses_week"]  # 5: ... and for the rest of the Mon-Fri ET week
+    max_losses_day: Optional[int] = _PG_DAY    # grids.PRIMARY_GUARDRAIL["daily_losses"] (2)
+    max_losses_week: Optional[int] = _PG_WEEK  # grids.PRIMARY_GUARDRAIL["weekly_losses"] (5)
 
     def __post_init__(self):
         canonical_target(self.target)
@@ -107,16 +91,15 @@ class GuardrailCfg:
         return replace(risk, max_losses_day=self.max_losses_day, max_losses_week=self.max_losses_week)
 
 
-PRIMARY = GuardrailCfg("d2+w5", _PG["max_losses_day"], _PG["max_losses_week"])
-assert (PRIMARY.max_losses_day, PRIMARY.max_losses_week) == (2, 5)
+# Built from grids.PRIMARY_GUARDRAIL and grids.COMPARISON_GUARDRAILS (one source). v1.3 dropped d2/w5/w6.
+PRIMARY = GuardrailCfg(f"d{_PG_DAY}+w{_PG_WEEK}", _PG_DAY, _PG_WEEK)
 PRIMARY_LABEL = PRIMARY.name
-COMPARISON = (GuardrailCfg("none", None, None), GuardrailCfg("d2+w6", 2, 6))
-EXTRA_COMPARISON = (GuardrailCfg("d2", 2, None), GuardrailCfg("w5", None, 5), GuardrailCfg("w6", None, 6))  # cheap, table only
+COMPARISON = tuple(GuardrailCfg(n, d, w) for n, d, w in _G.comparison_guardrails())
 GUARDRAILS = (PRIMARY,) + COMPARISON
 
 
 def guardrail_label(risk: "RiskCfg") -> str:
-    for g in GUARDRAILS + EXTRA_COMPARISON:
+    for g in GUARDRAILS:
         if (g.max_losses_day, g.max_losses_week) == (risk.max_losses_day, risk.max_losses_week):
             return g.name
     return f"d{risk.max_losses_day}+w{risk.max_losses_week}"
@@ -153,6 +136,9 @@ def cfg_dict(obj) -> dict:
     return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in d.items()}
 
 
-# SPEC v1.3 G2: declared trial counts (guardrail configs add 0). DSR uses N_TOTAL (see readout notes).
-N_DECLARED = {"A": 192, "B": 192, "F": 48, "options": 18}
-N_TOTAL = sum(N_DECLARED.values())          # 450
+# SPEC v1.3 G2: declared trial counts from grids.py (guardrail configs add 0). DSR N = max(N_TOTAL, program ledger).
+_g = _G.grids()
+N_DECLARED = {"A": len(_g.TEST_A), "B": len(_g.TEST_B), "F": len(_g.FORMATIONS),
+              "options": len(_g.OPTIONS) + len(_g.OPTIONS_0DTE)}
+N_TOTAL = int(_g.N_TRIALS)
+assert sum(N_DECLARED.values()) == N_TOTAL == 450

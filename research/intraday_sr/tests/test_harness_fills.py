@@ -152,21 +152,28 @@ def test_bar_rules_pure():
 
 
 
-def test_flagged_bar_never_fills_and_fills_stay_inside_bar():
+def test_bad_print_not_used_at_bar_t_stops_on_unclamped_extremes():
+    """SPEC v1.3.1 C1 + CP0 lookahead fix: bad_print on bar t is known only at the close of t+2, so the simulator
+    must not use it on bar t. Stops/targets trigger on the UNCLAMPED high/low; fills stay inside the unclamped bar."""
     from research.intraday_sr.harness.portfolio import FillOutsideBar, _Bar, _check_fill
-    # long fills 10:05; the 10:10 bar is a flagged bad print through the stop -> ignored; stop never hit
-    ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20), idx("10:10"): (100.20, 100.25, 90.00, 90.00)}
+    ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20), idx("10:10"): (100.20, 100.25, 90.00, 100.15)}
+    plain = run({"AAA": flat_day("AAA", D, overrides=ov)}, [sig()])
     f = flat_day("AAA", D, overrides=ov)
     f["bad_print"] = False
-    f.loc[idx("10:10"), "bad_print"] = True
-    r = run({"AAA": f}, [sig()])
-    assert r.trades[0].exit.reason == "forced_eod" and r.counters["bars_flagged_skipped"] == 1
-    # a flagged bar where the trigger trades through: no entry on it
+    f.loc[idx("10:10"), "bad_print"] = True                    # an isolated reverting spike through the stop
+    flagged = run({"AAA": f}, [sig()])
+    assert flagged.trades[0].exit.reason == "stop" and flagged.trades[0].exit.price == pytest.approx(99.50)
+    assert [t.r for t in flagged.trades] == [t.r for t in plain.trades]          # flag changes nothing
+    assert "bars_flagged_skipped" not in flagged.counters
+    # entry on a (later-)flagged bar still fills: the flag is not visible at bar t
     f2 = flat_day("AAA", D, overrides={idx("10:05"): (100.05, 100.30, 100.00, 100.20)})
     f2["bad_print"] = False
     f2.loc[idx("10:05"), "bad_print"] = True
-    assert run({"AAA": f2}, [sig()]).trades == []
+    assert len(run({"AAA": f2}, [sig()]).trades) == 1
+    # a frame carrying clamped high/low plus the unclamped extremes: the unclamped ones are used
+    f3 = flat_day("AAA", D, overrides=ov)
+    f3["low_unclamped"] = f3["low"]
+    f3.loc[idx("10:10"), "low"] = 100.10                       # clamped low would hide the stop
+    assert run({"AAA": f3}, [sig()]).trades[0].exit.reason == "stop"
     with pytest.raises(FillOutsideBar):
         _check_fill(101.0, _Bar(100, 100.5, 99.5, 100, 1.0), "stop", "AAA", None)
-    with pytest.raises(FillOutsideBar):
-        _check_fill(100.0, _Bar(100, 100.5, 99.5, 100, 1.0, True), "entry", "AAA", None)

@@ -23,16 +23,51 @@ def test_grid_hash_stable():
     assert G.grid_hash({"b": 1, "a": [1, 2]}) == G.grid_hash({"a": [1, 2], "b": 1})
 
 
-def test_grids_module_check_requires_primary_guardrail_in_hash():
+def _mod(**over):
+    """A copy of the grids module (real grids.py once #20 lands, else the test stand-in) with overrides; the hash
+    is NOT recomputed for mutated rows, exactly like a grid edited after its hash was logged."""
+    import copy
     from types import SimpleNamespace
-    a, b = G.reference_v11("A"), G.reference_v11("B")
-    f = [{"variant_id": f"F{i}"} for i in range(48)]
-    o = [{"variant_id": f"O{i}"} for i in range(9)]
-    z = [{"variant_id": f"Z{i}"} for i in range(9)]
-    pg = {"max_losses_day": 2, "max_losses_week": 5}
-    good = SimpleNamespace(TEST_A=a, TEST_B=b, FORMATIONS=f, OPTIONS=o, OPTIONS_0DTE=z, PRIMARY_GUARDRAIL=pg,
-                           grid_document=lambda: {"test_a": a, "primary_guardrail": pg})
-    assert G.check_grids_module(good) == [] and G.N_TOTAL == 450
-    bad = SimpleNamespace(TEST_A=a, TEST_B=b, FORMATIONS=f, OPTIONS=o, OPTIONS_0DTE=z, grid_document=lambda: {"test_a": a})
-    errs = G.check_grids_module(bad)
-    assert any("PRIMARY_GUARDRAIL" in e for e in errs) and any("hashed" in e for e in errs)
+    from research.intraday_sr.harness import s0grids
+    g = s0grids.grids()
+    m = SimpleNamespace(**{k: copy.deepcopy(getattr(g, k)) for k in s0grids.REQUIRED})
+    m.grid_document, m.grid_sha256 = g.grid_document, g.grid_sha256
+    for k, v in over.items():
+        setattr(m, k, v)
+    return m
+
+
+def test_grids_module_passes_unmutated():
+    assert G.check_grids_module(_mod()) == []
+
+
+def _reject(m, needle):
+    errs = G.check_grids_module(m)
+    assert errs and any(needle in e for e in errs), errs
+
+
+def test_grids_module_rejects_mutations():
+    import copy
+    base = _mod()
+    a = [dict(r) for r in base.TEST_A]
+    a[0]["rvol_min"] = 2.5                                             # mutate a value
+    _reject(_mod(TEST_A=tuple(a)), "rvol_min")
+    _reject(_mod(TEST_B=tuple(base.TEST_B) + (dict(base.TEST_B[0], variant_id="B-extra"),)), "193 rows")   # add a row
+    f = [dict(r) for r in base.FORMATIONS]
+    f[0]["pivot_tol_atr"] = 0.35                                       # CP0 mutation list
+    _reject(_mod(FORMATIONS=tuple(f)), "pivot_tol_atr")
+    o = [dict(r) for r in base.OPTIONS]
+    o[0]["dte_bucket"] = "8-30"
+    _reject(_mod(OPTIONS=tuple(o)), "dte_bucket")
+    relabel = tuple(dict(r, test="A") for r in base.TEST_B)            # Test B rows relabelled as Test A
+    _reject(_mod(TEST_B=relabel), "labelled test")
+    a3 = [dict(r, target="3R") if r["target"] == "zone" else dict(r) for r in base.TEST_A]
+    _reject(_mod(TEST_A=tuple(a3)), "target")
+    fx = copy.deepcopy(base.FIXED)
+    fx["max_concurrent"] = 5                                           # change a FIXED constant
+    _reject(_mod(FIXED=fx), "max_concurrent")
+    _reject(_mod(PRIMARY_GUARDRAIL={"daily_losses": 2, "weekly_losses": 6}), "PRIMARY_GUARDRAIL")   # guardrail
+    _reject(_mod(PRIMARY_GUARDRAIL=(2, 5)), "PRIMARY_GUARDRAIL")       # old tuple / key form
+    _reject(_mod(COMPARISON_GUARDRAILS=({"name": "none"},)), "COMPARISON_GUARDRAILS")
+    _reject(_mod(N_TRIALS=451), "N:")
+    _reject(_mod(GRID_SHA256="0" * 64), "GRID_SHA256")

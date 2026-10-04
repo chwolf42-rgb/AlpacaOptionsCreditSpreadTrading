@@ -69,22 +69,25 @@ class OptionsCfg:
     label: str = "MODEL-BASED, NO OPRA DATA"
 
 
-STRUCTURES = ("long_atm", "long_otm1", "debit_vertical")
-DTE_BUCKETS = {"0-1": (0, 1), "2-4": (2, 4), "5-7": (5, 7)}
-BASELINE_GRID = [(s, b) for s in STRUCTURES for b in DTE_BUCKETS]                 # 9
+# Grid cells come from grids.OPTIONS / grids.OPTIONS_0DTE (single source, SPEC v1.3.1 C3); not redefined here.
+from research.intraday_sr.harness import s0grids as _S0  # noqa: E402
+
+BASELINE_GRID = [(r["structure"], r["dte_bucket"]) for r in _S0.grids().OPTIONS]                       # 9
+STRUCTURES = tuple(dict.fromkeys(s for s, _ in BASELINE_GRID))
+DTE_BUCKETS = {b: tuple(int(x) for x in b.split("-")) for b in dict.fromkeys(b for _, b in BASELINE_GRID)}
 
 
 @dataclass(frozen=True)
 class ZeroDteCfg:
     premium_usd_pct: float = 0.02           # $2,000 on $100k day-start equity
-    stops: tuple = (-0.30, -0.40, -0.50)
-    tps: tuple = (0.50, 0.65, 0.80)
+    stops: tuple = tuple(dict.fromkeys(r["stop_pct"] / 100 for r in _S0.grids().OPTIONS_0DTE))          # -0.30..
+    tps: tuple = tuple(dict.fromkeys(r["take_profit_pct"] / 100 for r in _S0.grids().OPTIONS_0DTE))    # 0.50..
     time_exit: time = time(15, 45)
     time_exit_early: time = time(12, 45)
     label: str = "HIGHER-RISK SCENARIO, MODEL-BASED, NO OPRA DATA, LOW CONFIDENCE (VIX9D IV understates 0DTE skew/gamma)"
 
 
-ZERO_DTE_GRID = [(s, t) for s in ZeroDteCfg().stops for t in ZeroDteCfg().tps]   # 9
+ZERO_DTE_GRID = [(r["stop_pct"] / 100, r["take_profit_pct"] / 100) for r in _S0.grids().OPTIONS_0DTE]   # 9
 
 
 # --------------------------------------------------------------------- Black-Scholes (mirrors replay.credit.bs_price)
@@ -247,7 +250,7 @@ def legs_for(structure: str, symbol: str, direction: int, spot_raw: float, targe
     atm = atm_strike(symbol, spot_raw)
     if structure == "long_atm":
         return [Leg(atm, right, 1, False)]
-    if structure == "long_otm1":
+    if structure == "long_otm_1":
         return [Leg(atm + direction * inc, right, 1, True)]
     k2 = round(target_raw / inc) * inc
     k2 = max(k2, atm + inc) if direction > 0 else min(k2, atm - inc)
