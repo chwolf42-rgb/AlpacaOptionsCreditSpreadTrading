@@ -19,6 +19,7 @@ from research.intraday_sr.grids import (
     MAX_PER_SYMBOL,
     N_TRIALS,
     OPTIONS,
+    PRIMARY_GUARDRAIL,
     OPTIONS_0DTE,
     TEST_A,
     TEST_B,
@@ -63,12 +64,13 @@ def test_formation_and_options_caps():
     assert all(row["premium_dollars"] == 2000 for row in OPTIONS_0DTE)
 
 
-def test_fixed_constants_and_no_guardrails():
+def test_fixed_constants_and_primary_guardrail():
     assert K_CLUSTER == 0.25
     assert MAX_ENTRIES_PER_DAY == 12
     assert MAX_CONCURRENT == 4
     assert MAX_PER_SYMBOL == 1
     assert DAILY_LOSS_STOP == -0.015
+    assert PRIMARY_GUARDRAIL == (2, 5)
     raw = canonical_json()
     document = json.loads(raw)
     assert set(document) == {
@@ -76,14 +78,17 @@ def test_fixed_constants_and_no_guardrails():
         "formations",
         "options",
         "options_0dte",
+        "primary_guardrail",
         "test_a",
         "test_b",
         "universe",
     }
+    assert document["primary_guardrail"] == [2, 5]
+    assert N_TRIALS == 450
+    # The primary pair is hashed. It is not an axis, so N does not grow.
     assert "d2" not in document
     assert "w5" not in document
     assert "w6" not in document
-    assert "guardrail" not in raw
 
 
 def test_hash_is_stable_and_in_the_summary():
@@ -94,6 +99,7 @@ def test_hash_is_stable_and_in_the_summary():
     assert "192" in summary
     assert "options_0dte 9" in summary
     assert "N 450" in summary
+    assert "primary_guardrail max_losses_day=2 max_losses_week=5" in summary
     assert universe_sha256() in summary
 
 

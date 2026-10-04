@@ -1,8 +1,9 @@
 """Frozen §5 grids (spec v1.1 A1–A2, unchanged in v1.3).
 
 Caps are enforced at import. The sha256 is of the canonical JSON of the
-equity grids, both options grids, the fixed constants, and the locked
-universe. Trial count N is 450. The universe is read only from
+equity grids, both options grids, the fixed constants, the locked
+universe, and ``PRIMARY_GUARDRAIL``. Trial count N is 450. v1.3 adds the
+guardrail to the hash and adds no trials. The universe is read only from
 ``universe_fixed33.json`` in this package.
 
 ``k_confirm`` is how many of the three optional stack conditions a variant
@@ -17,6 +18,9 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 # Fixed engine / portfolio constants. Not axes.
+# v1.3 primary loss guardrail: max losing trades per day, then per week.
+# Not a grid axis. Comparison configs stay on the harness side.
+PRIMARY_GUARDRAIL = (2, 5)
 K_CLUSTER = 0.25
 MAX_ENTRIES_PER_DAY = 12
 MAX_CONCURRENT = 4
@@ -206,6 +210,8 @@ def _enforce_caps() -> None:
         raise RuntimeError("universe must be 33 distinct symbols")
     if K_CLUSTER != 0.25:
         raise RuntimeError("k_cluster is fixed at 0.25")
+    if PRIMARY_GUARDRAIL != (2, 5):
+        raise RuntimeError("PRIMARY_GUARDRAIL must be (2, 5)")
     for row in TEST_A + TEST_B:
         if "k_cluster" in row:
             raise RuntimeError("k_cluster must not be a grid axis")
@@ -223,6 +229,7 @@ def grid_document() -> dict:
         "test_a": list(TEST_A),
         "test_b": list(TEST_B),
         "universe": list(UNIVERSE),
+        "primary_guardrail": [int(PRIMARY_GUARDRAIL[0]), int(PRIMARY_GUARDRAIL[1])],
     }
 
 
@@ -250,6 +257,7 @@ def format_grid_summary() -> str:
         f"sha256 {GRID_SHA256}",
         f"universe_sha256 {universe_sha256()}",
         f"N {N_TRIALS}",
+        f"primary_guardrail max_losses_day={PRIMARY_GUARDRAIL[0]} max_losses_week={PRIMARY_GUARDRAIL[1]}",
         f"test_a {len(TEST_A)}  (cap {CAP_TEST_A})",
         f"test_b {len(TEST_B)}  (cap {CAP_TEST_B})",
         (
