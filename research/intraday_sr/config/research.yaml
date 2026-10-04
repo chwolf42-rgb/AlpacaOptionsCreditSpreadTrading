@@ -1,0 +1,54 @@
+# Research-only knobs for the intraday S/R study.
+# The live options bot does not read this file.
+# Trading may edit the universe. Do not point this at production credentials.
+
+timezone: America/New_York
+
+# Weekday peak is 08:15-15:15 America/Chicago, half-open [start, end).
+# This package does not call Alpaca. A later puller on another machine
+# must stay inside these caps. Off-peak includes nights, weekends, and
+# the clock at exactly 15:15 CT.
+data_budget:
+  peak_requests_per_min: 30
+  offhours_requests_per_min: 60
+  peak_start_ct: "08:15"
+  peak_end_ct: "15:15"
+  peak_tz: America/Chicago
+
+# SPY, QQQ, IWM plus liquid optionable large caps. Adjust freely.
+universe:
+  - SPY
+  - QQQ
+  - IWM
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - META
+  - GOOGL
+  - TSLA
+  - AVGO
+  - AMD
+  - NFLX
+  - ORCL
+  - CRM
+  - ADBE
+  - NOW
+  - AMAT
+  - QCOM
+  - JPM
+  - BAC
+  - WFC
+  - C
+  - UNH
+  - XOM
+  - CVX
+  - WMT
+  - PG
+  - KO
+  - PEP
+  - BA
+  - NKE
+  - MCD
+  - CSCO
+  - PANW
