@@ -1,4 +1,4 @@
-# Intraday S/R confluence research: spec v1.3 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3.1 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
 Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT). Values marked
@@ -6,6 +6,8 @@ Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT
 that uses them. Anything not marked is frozen.
 v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
 every result; a forward holdout is added. See the v1.3 amendments (G1–G8), which replace A3.
+v1.3.1 (Sun 2026-10-04 CT, before any run): clarifications C1–C3 (bad prints, holdout lock, guardrail constant),
+from the CP0 review of PR #20. No new trials; N stays 450.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -191,6 +193,41 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
   rows; no selection, freeze or holdout code reads `guardrail_compare.parquet`; the logged grid hash includes
   `PRIMARY_GUARDRAIL`; and N is still 450.
 
+## v1.3.1 clarifications (no new trials)
+
+Source: Architect rulings in the CP0 review of PR #20 (Sun 2026-10-04 CT), committed before any run. They tighten
+definitions only. Grids, folds, costs, the universe, the guardrail values and the §8 pass bar are unchanged, and N
+stays 450.
+
+**C1. Bad prints (replaces the 8×ATR_5m spike rule in §2.2).**
+- Flag-and-clamp applies only to an **isolated spike that reverts**. Both conditions must hold:
+  - the bar's high or low is more than **0.5·ATR_d** from the median close of its ±2 neighbouring 5m bars;
+  - the next bar's close returns to within **0.25·ATR_d** of that median.
+- Bars are **never dropped** for being spikes, and the reference is never a stale close (a stale reference caused the
+  cascade found at CP0). A move that does not revert is real and is left untouched.
+- A flagged bar keeps `bad_print=True`. Pivot and zone detection use the **clamped** high/low, clamped to the max/min
+  of the bar's open, its close and the neighbour median. Stop and target evaluation (§4.1–4.2) use the **unclamped**
+  high/low, so the cleaning can never make results look better.
+- Timing (follows from §4.1): the flag and clamp for bar t depend on bars t+1 and t+2, so they become usable only at
+  the close of bar t+2. Before that, the engine sees bar t unclamped. The lookahead tests (§4.12) cover this.
+- Flagged counts are logged per symbol. A symbol with more than 0.1% of its bars flagged goes to checkpoint review.
+- Regression test on real-cache cases: SPY 2019-01-30 (FOMC), SPY 2019-08-01 and NVDA 2021-09-13 keep all their bars
+  and are not flagged.
+
+**C2. Holdout lock in the data layer (adds to §6 Holdout).**
+- Every bar loader's default end date is **2026-03-31**.
+- Loading any bar dated on or after **2026-04-01** requires a `HoldoutToken`. Only the harness's
+  `walkforward.run_holdout()` (D1-3) can construct one, and constructing it checks that the FREEZE file exists.
+  Without a token, the loader raises.
+- A test asserts that the default loaders raise on holdout dates.
+
+**C3. Guardrail constant and single source of frozen constants (clarifies G1).**
+- `grids.py` holds `PRIMARY_GUARDRAIL = {daily_losses: 2, weekly_losses: 5}` as a fixed constant inside the
+  canonical grid hash. The harness builds `RiskCfg(max_losses_day=2, max_losses_week=5)` from it. It is not a grid
+  axis, and N stays 450.
+- `grids.py` is the single source for every frozen constant. The engine and the harness import them from it, so the
+  logged grid hash covers them.
+
 ## 0. Scope and non-goals
 - Question: does a support/resistance confluence entry on 5m/15m, flat by the close, have a positive
   after-cost edge out of sample on a fixed liquid universe, as equities and as a 0–7 DTE long-options overlay?
@@ -252,8 +289,12 @@ No 15m/30m bars were pulled. No VIX data exists on the box.
   `https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv` (from 1990-01-02) and
   `.../VIX9D_History.csv` (from 2011-01-04), both through 2026-10-02 with columns DATE, OPEN, HIGH, LOW, CLOSE.
   These are daily, so a decision on day d uses the **close of day d−1** only.
-- Bad bars: drop bars with high < low, non-positive prices, or a close more than 8×ATR_5m from the prior
-  close (count them in the readout). A missing 5m bar is left missing, never forward-filled for signals.
+- Bad bars: drop bars with high < low or non-positive prices (count them in the readout). Spikes are never
+  dropped (v1.3.1 C1): only an isolated spike that reverts is flagged (`bad_print=True`) and clamped. Its high or
+  low is more than 0.5·ATR_d from the median close of its ±2 neighbours, and the next close returns within
+  0.25·ATR_d of that median. Pivots and zones use the clamped high/low; stops and targets use the unclamped
+  extremes. A move that does not revert is left untouched. A missing 5m bar is left missing, never
+  forward-filled for signals.
 
 ### 2.3 Rate limits (enforced in code, not by convention)
 - `research/intraday_sr/data/ratelimit.py: TimeOfDayLimiter` is the only path to `data.alpaca.markets`.
