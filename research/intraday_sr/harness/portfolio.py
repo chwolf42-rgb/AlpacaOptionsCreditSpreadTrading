@@ -17,6 +17,11 @@ counted at its exit fill, portfolio-wide, updated after every exit (also inside 
 out in its fill bar). Reaching the day/week limit blocks new entries for the rest of the session/week and cancels
 armed triggers; open positions run to their normal exit; their losses keep counting.
 Equity compounds daily.
+
+Price units: Signal.trigger / stop / targets and the bar frame OHLC are ADJUSTED prices; as-traded = adjusted x
+Bar.adj_factor (raw/adj) is used only for costs and the $0.01 tick (tick = 0.01 / adj_factor in adjusted units).
+Signal.expires_at is the first bar OPEN at which the trigger is dead: a bar opening at or after expires_at can
+never fill it. Target labels: "1R", "2R", "zone" (canonical; "next_zone" alias); anything else raises.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 from research.intraday_sr.harness import costs as K
-from research.intraday_sr.harness.config import CostCfg, RiskCfg
+from research.intraday_sr.harness.config import CostCfg, RiskCfg, canonical_target
 from research.intraday_sr.harness.contracts import Fill, Trade
 from research.intraday_sr.harness.fills import STOP, TARGET, exit_on_bar, stop_entry_fill, widen_stop
 from research.intraday_sr.harness.guard import Guard, Guarded
@@ -128,12 +133,31 @@ class SimResult:
     sessions: Optional[pd.DataFrame] = None      # one row per session (G3.11): trips, daily stop, blocked signals
 
 
+class SignalContractError(ValueError):
+    """A signal violates the harness input contract (e.g. Zone.atr_d NaN). Raised per signal, never swallowed."""
+
+
+def _sig_name(sig) -> str:
+    z = getattr(sig, "zone", None)
+    return (f"{getattr(sig, 'variant_id', '?')} {getattr(sig, 'symbol', '?')} available_at="
+            f"{getattr(sig, 'available_at', '?')} zone_id={getattr(z, 'zone_id', '?')}")
+
+
 def _atr_d(sig) -> float:
     z = sig.zone
     for src in (getattr(z, "atr_d", None), (sig.components or {}).get("atr_d"), (z.components or {}).get("atr_d")):
         if src is not None and np.isfinite(src) and src > 0:
             return float(src)
-    raise ValueError("signal needs ATR_d (zone.atr_d or components['atr_d']) for the 0.10 ATR_d stop floor")
+    raise SignalContractError(f"signal has no finite ATR_d (Zone.atr_d defaults to NaN in S0) for the 0.10 ATR_d "
+                              f"stop floor: {_sig_name(sig)}")
+
+
+def _zone_target(sig) -> float:
+    tg = sig.targets or {}
+    for k in ("zone", "next_zone"):
+        if k in tg and tg[k] is not None and np.isfinite(float(tg[k])):
+            return float(tg[k])
+    raise SignalContractError(f"zone-target variant but signal has no finite targets['zone']: {_sig_name(sig)}")
 
 
 def _default_tier_fn(bars, cfg: CostCfg) -> Callable[[str, date], str]:
@@ -210,6 +234,7 @@ SESSION_COLS = ["session", "pnl", "entries", "day_losses", "week_losses_start", 
 
 def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_losses, trades, meta, c):
     lim_d, lim_w = risk.max_losses_day, risk.max_losses_week
+    target = canonical_target(risk.target)
     st = {"session": d, "pnl": 0.0, "entries": 0, "day_losses": 0, "week_losses_start": week_losses,
           "week_losses_end": week_losses, "day_limit_trip_ts": None, "week_limit_trip_ts": None,
           "daily_stop_ts": None, "signals_cancelled_at_trip": 0, "signals_arrived_blocked": 0,
@@ -361,13 +386,12 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
                 rps = abs(px - stop)
                 if dirn > 0 and float(g.stop) > stop or dirn < 0 and float(g.stop) < stop:
                     c["stop_widened"] += 1
-                if risk.target == "1R":
+                if target == "1R":
                     tgt = px + dirn * rps
-                elif risk.target == "2R":
+                elif target == "2R":
                     tgt = px + dirn * 2 * rps
-                else:
-                    tg = g.targets
-                    tgt = float(tg["next_zone"] if "next_zone" in tg else tg["zone"])
+                elif target == "zone":
+                    tgt = _zone_target(g)
                     if dirn * (tgt - px) < risk.zone_target_min_r * rps:
                         c["skip_zone_target_lt_1R"] += 1
                         continue
@@ -412,7 +436,7 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
         for sym, p in pos.items():
             last = last_good.get(sym, (None, float(p.entry.price)))[1]
             open_pnl += p.direction * p.qty * (last - p.entry.price) - p.entry.cost
-        if not halted and realized + open_pnl <= -risk.daily_loss_stop * day_start:
+        if not halted and realized + open_pnl <= risk.daily_loss_stop * day_start:     # signed (-0.015)
             halted = True
             flatten = True
             st["daily_stop_ts"] = close_ts

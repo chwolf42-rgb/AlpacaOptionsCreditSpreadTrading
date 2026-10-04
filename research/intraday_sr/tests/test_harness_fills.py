@@ -126,7 +126,7 @@ def test_daily_loss_stop_flattens_and_halts():
         sigs.append(sig(symbol=s, stop=99.0))   # 1.10 risk -> 454 sh; open loss ~-0.52*454*3 + costs > 1.5%? no
     sigs.append(sig(symbol="B1", at="11:00", expires="11:30"))
     frames["B1"] = flat_day("B1", D, overrides={idx("11:05"): (100.05, 100.30, 100.00, 100.20)})
-    r = run(frames, sigs, risk=RiskCfg(daily_loss_stop=0.002))   # tight stop so the fixture trips it
+    r = run(frames, sigs, risk=RiskCfg(daily_loss_stop=-0.002))   # tight stop so the fixture trips it
     assert r.counters.get("halt_daily_loss_stop") == 1
     assert {t.exit.reason for t in r.trades} == {"daily_stop"}
     assert all(t.exit.ts.strftime("%H:%M") == "10:15" for t in r.trades)   # flattened at the next open

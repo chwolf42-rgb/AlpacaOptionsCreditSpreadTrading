@@ -15,7 +15,7 @@ V11_AXES = {                       # SPEC v1.1 A1: Test A and Test B each 2*2*2*
     "oscillator": 2,               # RSI14 30/70, Stoch(14,3,3) 20/80 (labels are Developer 2's)
     "rvol_min": {1.5, 2.0},
     "tf": {"5m", "15m"},
-    "target": 3,                   # 1R, 2R, next zone
+    "target": 3,                   # 1R, 2R, zone (canonical; "next_zone" accepted as a temporary alias)
     "k_confirm": {0, 1, 2, 3},
 }
 K_CLUSTER_FIXED = 0.25
@@ -55,6 +55,13 @@ def check_test_grid(name: str, variants: Sequence[Mapping]) -> list[str]:
             errs.append(f"{name}: axis '{axis}' values {sorted(vals, key=str)} != {sorted(want, key=str)}")
         if isinstance(want, int) and len(vals) != want:
             errs.append(f"{name}: axis '{axis}' has {len(vals)} values, expected {want}")
+        if axis == "target":
+            from research.intraday_sr.harness.config import UnknownTarget, canonical_target
+            for t in vals:
+                try:
+                    canonical_target(t)
+                except UnknownTarget as e:
+                    errs.append(f"{name}: {e}")
     try:
         kc = {float(_get(v, "k_cluster")) for v in variants}
         if kc != {K_CLUSTER_FIXED}:

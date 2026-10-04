@@ -35,7 +35,7 @@ from research.intraday_sr.harness import stats as S
 from research.intraday_sr.harness.compare import write_compare
 from research.intraday_sr.harness.config import COMPARISON, EXTRA_COMPARISON, PRIMARY, CostCfg, RiskCfg
 from research.intraday_sr.harness.grid_check import check_test_grid, grid_hash
-from research.intraday_sr.harness.portfolio import simulate
+from research.intraday_sr.harness.portfolio import SignalContractError, simulate
 from research.intraday_sr.harness.triallog import DEFAULT_LEDGER, TrialLog, TrialRow, git_sha
 from research.intraday_sr.harness.walkforward import (DEV_END, VariantRun, exact_finalist_check, make_folds,
                                                       walk_forward)
@@ -112,7 +112,9 @@ def run_variant(variant: dict, guardrail=PRIMARY, cost_mult: float = 1.0, keep_r
         vr.exact_oos_trades = pd.concat(tparts, ignore_index=True) if tparts else pd.DataFrame()
         vr.exact_oos_daily = pd.concat(dparts) if dparts else pd.Series(dtype=float)
         return (vr, cnt, res if keep_raw else None)       # counters: from the exact OOS windows
-    except Exception as e:                                   # failures are logged trials too
+    except SignalContractError:                              # input contract violations stop the run, loudly
+        raise
+    except Exception as e:                                   # other failures are logged trials too
         return (VariantRun(variant["variant_id"], pd.DataFrame(), pd.Series(dtype=float), "error", repr(e),
                            config=guardrail.name), {}, None)
 

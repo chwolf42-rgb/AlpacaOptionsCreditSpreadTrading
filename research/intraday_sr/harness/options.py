@@ -314,8 +314,9 @@ def baseline_records(trades, ctx: IVContext, structure: str, bucket: str, cfg: O
         direction = int(tr.entry.side)
         tgt = getattr(tr.signal, "targets", {}) or {}
         target_raw = (tr.entry.price + direction * abs(tr.entry.price - tr.signal.stop)) * f
-        if "zone" in tgt and np.isfinite(tgt.get("zone", np.nan)):
-            target_raw = float(tgt["zone"]) * f
+        zk = "zone" if "zone" in tgt else ("next_zone" if "next_zone" in tgt else None)   # "next_zone" = alias
+        if zk and np.isfinite(tgt.get(zk, np.nan)):
+            target_raw = float(tgt[zk]) * f
         t_in_clock = tr.entry.ts + HALF_BAR
         t_out_clock = _fill_time(tr.exit, tr.exit.reason)
         sa = ctx.s_atm(sym, d, (exp - d).days, cfg)
@@ -414,7 +415,7 @@ def zero_dte_records(trades, bars, ctx: IVContext, zcfg: ZeroDteCfg = ZeroDteCfg
 
 
 def options_account(records: list, sessions: Sequence[date], premium_pct: float, *, max_concurrent: int = 4,
-                    max_entries_per_day: int = 12, daily_loss_stop: float = 0.015,
+                    max_entries_per_day: int = 12, daily_loss_stop: float = -0.015,
                     max_losses_day: Optional[int] = 2, max_losses_week: Optional[int] = 5,
                     window_starts: Optional[Iterable[date]] = None, start_equity: float = 100_000.0):
     """Premium-sized options portfolio fed by overlay records (one per equity signal that produced an option trade).
@@ -423,7 +424,7 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
     exit order (exit time, then symbol), before any entry at or after that time; reaching a limit blocks new entries
     for the rest of the session / Mon-Fri week. Signals skipped for lack of an expiry never reach here (not trades).
     Caps: 1 per symbol, max concurrent, entries/day, realized daily loss stop (option marks between records are not
-    modelled). Returns (daily Series, trades DataFrame, counters, sessions DataFrame)."""
+    modelled). Returns (daily Series, trades DataFrame, counters, sessions DataFrame). daily_loss_stop is signed (-0.015)."""
     from research.intraday_sr.harness.walkforward import WINDOW_STARTS
     ws = sorted(set(WINDOW_STARTS if window_starts is None else window_starts))
     by = {}
@@ -457,7 +458,7 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
                         st["day_limit_trip_ts"] = o["exit_ts"]
                     if max_losses_week is not None and wk_losses == max_losses_week:
                         st["week_limit_trip_ts"] = o["exit_ts"]
-                if st["daily_stop_ts"] is None and day_pnl <= -daily_loss_stop * day_start:
+                if st["daily_stop_ts"] is None and day_pnl <= daily_loss_stop * day_start:
                     st["daily_stop_ts"] = o["exit_ts"]
             open_ = [o for o in open_ if o not in done]
 
