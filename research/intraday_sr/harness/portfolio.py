@@ -36,6 +36,13 @@ from research.intraday_sr.harness.guard import Guard, Guarded
 BAR_5M = timedelta(minutes=5)
 
 
+class _Bar:
+    __slots__ = ("open", "high", "low", "close", "adj_factor")
+
+    def __init__(self, o, h, l, c, a):
+        self.open, self.high, self.low, self.close, self.adj_factor = float(o), float(h), float(l), float(c), float(a)
+
+
 class FrameBarSource:
     """5m bars per symbol: DataFrame with tz-aware `ts` (bar OPEN), open/high/low/close, `session` (date) and
     `adj_factor` (raw/adj, constant within a session). `available_at` = ts + 5 min if absent."""
@@ -146,8 +153,12 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         return 0.0, 0, 0
     early = max(f["ts"].max().time() for f in frames.values()) <= risk.forced_exit_early
     forced_t = risk.forced_exit_early if early else risk.forced_exit
-    rows = {s: {ts: i for i, ts in enumerate(f["ts"])} for s, f in frames.items()}
-    timeline = sorted({ts for f in frames.values() for ts in f["ts"]})
+    tss = {s: f["ts"].tolist() for s, f in frames.items()}
+    rows = {s: {ts: i for i, ts in enumerate(v)} for s, v in tss.items()}
+    arr = {s: [_Bar(*r) for r in zip(f["open"].to_numpy(float), f["high"].to_numpy(float), f["low"].to_numpy(float),
+                                      f["close"].to_numpy(float), f["adj_factor"].to_numpy(float))]
+           for s, f in frames.items()}
+    timeline = sorted({ts for v in tss.values() for ts in v})
     inactive = sorted(sigs, key=lambda s: (s.available_at, s.symbol))
     c["signals"] += len(sigs)
     pending: list[Guarded] = []
@@ -183,7 +194,7 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         while ai < len(inactive) and inactive[ai].available_at <= ts:
             pending.append(guard.wrap(inactive[ai]))
             ai += 1
-        here = {s: frames[s].iloc[rows[s][ts]] for s in frames if ts in rows[s]}
+        here = {s: arr[s][rows[s][ts]] for s in frames if ts in rows[s]}
         occupied = len(pos)
         # ---- exits
         for sym in list(pos):
@@ -295,9 +306,8 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         pending = keep
         open_pnl = 0.0
         for sym, p in pos.items():
-            f = frames[sym]
             j = rows[sym].get(ts)
-            last = float(f["close"].iloc[j]) if j is not None else float(p.entry.price)
+            last = arr[sym][j].close if j is not None else float(p.entry.price)
             open_pnl += p.direction * p.qty * (last - p.entry.price) - p.entry.cost
         dd = realized + open_pnl
         if not halted:
@@ -311,8 +321,7 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
                 c["halt_days"] += 1
     # positions still open after the last bar (missing 15:55 bar): exit at the last close, forced
     for sym in list(pos):
-        f = frames[sym]
-        close_pos(sym, pos[sym], float(f["close"].iloc[-1]), "forced_eod_lastclose", f["ts"].iloc[-1] + BAR_5M, K.FORCED)
+        close_pos(sym, pos[sym], arr[sym][-1].close, "forced_eod_lastclose", tss[sym][-1] + BAR_5M, K.FORCED)
         del pos[sym]
     c["pending_unfilled_eod"] += len(pending) + (len(inactive) - ai)
     return realized, entries, nonlocal_losers[0]

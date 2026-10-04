@@ -251,8 +251,8 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
               f"{_num(h['trades_per_month'], 1)} | win {_pct(h['win_rate'], 1)} | mean R {_ci(h['mean_r_ci'])} | "
               f"PF {_num(h['profit_factor'], 2)}",
               f"- Monthly {_ci(h['monthly_ci'], _pct)} | max DD {_pct(h['max_drawdown'])} | worst day "
-              f"{_pct(h['worst_day'])} | Sharpe(daily) {_num(h['sharpe_daily'])} | DSR {_num(h['dsr']['dsr'])} "
-              f"(N {h['dsr']['n_trials']}, var source: {h['dsr']['var_sr_source']})", "",
+              f"{_pct(h['worst_day'])} | Sharpe(daily) {_num(h['sharpe_daily'])} | DSR {_num(h['dsr'].get('dsr'))} "
+              f"(N {h['dsr'].get('n_trials')}, var source: {h['dsr'].get('var_sr_source', 'n/a')})", "",
               "Pass bar (SPEC section 8)" + (" — informational only in an interim run:" if interim else ":"), ""]
         L += [f"- {x}" for x in pass_bar_words(h)] + [""]
         if h.get("years_positive"):
