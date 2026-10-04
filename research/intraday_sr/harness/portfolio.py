@@ -12,7 +12,7 @@ Per session, in bar-open order across symbols:
      and 3x gross (cap-limited trades counted); zone target < 1R from the fill -> skipped
   4. at the bar close (guard clock advances): cancel orders whose zone closed through, mark open P&L, and if
      realized + open <= -1.5% of day-start equity (or a guardrail overlay trips) flatten at the next open and
-     take no more entries that day (week for weekly guardrails).
+     take no more entries that day. Guardrail overlays (v1.1 A3) only block new entries after N losing trades.
 Equity compounds daily.
 """
 
@@ -114,19 +114,20 @@ def simulate(signals: Iterable, bars, risk: RiskCfg = RiskCfg(), costs: CostCfg 
         by_day[s.available_at.astimezone(pd.Timestamp(s.available_at).tz).date()].append(s)
     days = sorted(set(sessions) if sessions is not None else set(by_day))
     equity = risk.start_equity
-    week_key, week_start_eq, week_pnl, week_halt = None, equity, 0.0, False
+    week_key, week_losers = None, 0
     trades, meta, rets = [], [], []
     c = defaultdict(int)
     for d in days:
         wk = d.isocalendar()[:2]
         if wk != week_key:
-            week_key, week_start_eq, week_pnl, week_halt = wk, equity, 0.0, False
+            week_key, week_losers, week_trig = wk, 0, False
         day_start = equity
-        day_pnl, n = _run_day(d, by_day.get(d, []), bars, risk, costs, guardrail, tier_fn, guard, fold, day_start,
-                              week_start_eq, week_pnl, week_halt, trades, meta, c)
-        week_pnl += day_pnl
-        if guardrail.weekly_loss is not None and week_pnl <= -guardrail.weekly_loss * week_start_eq:
-            week_halt = True
+        day_pnl, n, losers = _run_day(d, by_day.get(d, []), bars, risk, costs, guardrail, tier_fn, guard, fold,
+                                      day_start, week_losers, trades, meta, c)
+        week_losers += losers
+        if guardrail.week_losers is not None and week_losers >= guardrail.week_losers and not week_trig:
+            week_trig = True
+            c["guardrail_week_triggers"] += 1
         equity = day_start + day_pnl
         rets.append(day_pnl / day_start)
     daily = pd.Series(rets, index=pd.Index(days, name="session"), dtype=float)
@@ -134,16 +135,15 @@ def simulate(signals: Iterable, bars, risk: RiskCfg = RiskCfg(), costs: CostCfg 
     return SimResult(trades, meta, daily, dict(c))
 
 
-def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, week_start_eq, week_pnl, week_halt,
-             trades, meta, c):
+def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, week_losers, trades, meta, c):
     if not sigs:
-        return 0.0, 0
+        return 0.0, 0, 0
     syms = sorted({s.symbol for s in sigs})
     frames = {s: bars.session_frame(s, d) for s in syms}
     frames = {s: f for s, f in frames.items() if f is not None and len(f)}
     if not frames:
         c["signals_no_bars"] += len(sigs)
-        return 0.0, 0
+        return 0.0, 0, 0
     early = max(f["ts"].max().time() for f in frames.values()) <= risk.forced_exit_early
     forced_t = risk.forced_exit_early if early else risk.forced_exit
     rows = {s: {ts: i for i, ts in enumerate(f["ts"])} for s, f in frames.items()}
@@ -154,9 +154,13 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
     pos: dict[str, _Pos] = {}
     realized = 0.0
     entries = 0
-    halted = week_halt
+    halted = False
     flatten = False
+    losers_known = 0    # ... as known at the last bar close (guardrail input)
+    gr_trip_logged = False
     ai = 0
+
+    nonlocal_losers = [0]
 
     def close_pos(sym, p: _Pos, px, kind, ts, cost_kind, ambiguous=False):
         nonlocal realized
@@ -165,6 +169,8 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         ex = Fill(sym, ts, float(px), float(p.qty), side, kind, float(cost))
         pnl = p.direction * p.qty * (px - p.entry.price) - p.entry.cost - cost
         realized += pnl
+        if pnl < 0:
+            nonlocal_losers[0] += 1
         trades.append(Trade(p.raw_sig, p.entry, ex, float(pnl / p.risk_usd), float(pnl), fold,
                             str(getattr(p.raw_sig, "variant_id", ""))))
         meta.append({"symbol": sym, "session": d, "exit_kind": kind, "capped": p.capped, "tier": p.tier,
@@ -209,7 +215,14 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
                 continue
             live.append(g)
         pending = live
-        if not halted and ts.time() < risk.last_entry:
+        gr_block = gr.blocks(losers_known, week_losers + losers_known)
+        if gr_block and not halted and ts.time() < risk.last_entry:
+            for g in [g for g in pending if g.symbol in here and g.symbol not in pos]:
+                if stop_entry_fill(int(g.direction), float(g.trigger), float(here[g.symbol].open),
+                                   float(here[g.symbol].high), float(here[g.symbol].low)) is not None:
+                    pending.remove(g)
+                    c[f"skip_guardrail_{gr_block}"] += 1
+        if not halted and not gr_block and ts.time() < risk.last_entry:
             cands = sorted((g for g in pending if g.symbol in here and g.symbol not in pos),
                            key=lambda g: (-float(g.zone.score), g.symbol))
             for g in cands:
@@ -266,6 +279,10 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         # ---- bar close
         close_ts = ts + BAR_5M
         guard.advance(close_ts)
+        losers_known = nonlocal_losers[0]
+        if not gr_trip_logged and gr.day_losers is not None and losers_known >= gr.day_losers:
+            gr_trip_logged = True
+            c["guardrail_day_triggers"] += 1
         keep = []
         for g in pending:
             if g.symbol in here and g.available_at <= close_ts:
@@ -287,10 +304,6 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
             trip = None
             if dd <= -risk.daily_loss_stop * day_start:
                 trip = "daily_loss_stop"
-            elif gr.daily_loss is not None and dd <= -gr.daily_loss * day_start:
-                trip = "guardrail_daily"
-            elif gr.weekly_loss is not None and week_pnl + dd <= -gr.weekly_loss * week_start_eq:
-                trip = "guardrail_weekly"
             if trip:
                 halted = True
                 flatten = True
@@ -302,4 +315,4 @@ def _run_day(d, sigs, bars, risk, costs, gr, tier_fn, guard, fold, day_start, we
         close_pos(sym, pos[sym], float(f["close"].iloc[-1]), "forced_eod_lastclose", f["ts"].iloc[-1] + BAR_5M, K.FORCED)
         del pos[sym]
     c["pending_unfilled_eod"] += len(pending) + (len(inactive) - ai)
-    return realized, entries
+    return realized, entries, nonlocal_losers[0]

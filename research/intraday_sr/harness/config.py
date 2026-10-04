@@ -32,19 +32,29 @@ class RiskCfg:
 
 @dataclass(frozen=True)
 class GuardrailCfg:
-    """Reporting overlays only (Architect): none, d2, w5, w6, d2+w5, d2+w6. They add no trials to N."""
+    """SPEC v1.1 A3 reporting overlays (none, d2, w5, w6, d2+w5, d2+w6), applied after selection; no trials added to N.
+    d2: no more entries that day after 2 losing trades. w5/w6: no more entries that ISO week after 5/6 losing trades.
+    A losing trade = closed with net P&L < 0 (after costs). Open positions are not flattened. The count becomes
+    known at the close of the bar in which the losing exit happened (entries on that same bar are not blocked)."""
     name: str = "none"
-    daily_loss: Optional[float] = None       # realized + open day P&L <= -x of day-start equity -> flatten, stop the day
-    weekly_loss: Optional[float] = None      # week-to-date P&L <= -x of week-start equity -> flatten, stop the week
+    day_losers: Optional[int] = None
+    week_losers: Optional[int] = None
+
+    def blocks(self, day_l: int, week_l: int) -> Optional[str]:
+        if self.day_losers is not None and day_l >= self.day_losers:
+            return "day"
+        if self.week_losers is not None and week_l >= self.week_losers:
+            return "week"
+        return None
 
 
 GUARDRAILS = (
     GuardrailCfg("none"),
-    GuardrailCfg("d2", daily_loss=0.02),
-    GuardrailCfg("w5", weekly_loss=0.05),
-    GuardrailCfg("w6", weekly_loss=0.06),
-    GuardrailCfg("d2+w5", daily_loss=0.02, weekly_loss=0.05),
-    GuardrailCfg("d2+w6", daily_loss=0.02, weekly_loss=0.06),
+    GuardrailCfg("d2", day_losers=2),
+    GuardrailCfg("w5", week_losers=5),
+    GuardrailCfg("w6", week_losers=6),
+    GuardrailCfg("d2+w5", day_losers=2, week_losers=5),
+    GuardrailCfg("d2+w6", day_losers=2, week_losers=6),
 )
 
 

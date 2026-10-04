@@ -149,3 +149,52 @@ def test_bar_rules_pure():
     assert stop_entry_fill(1, 10.0, 9.8, 9.99, 9.7) is None
     h = exit_on_bar(1, 9.0, 11.0, 11.5, 11.6, 11.4, 0.01, False)
     assert h.kind == "target" and h.gap and h.price == 11.5
+
+
+def _loser_day(day, syms_times):
+    """Each (sym, hhmm) gets a long that fills on the next bar and stops out on the bar after."""
+    frames, sigs = {}, []
+    for sym, at in syms_times:
+        i = idx(at)
+        ov = {i: (100.05, 100.30, 100.00, 100.20), i + 1: (100.20, 100.25, 99.40, 99.45)}
+        frames[sym] = flat_day(sym, day, overrides=ov)
+        h, m = divmod(570 + 5 * i, 60)
+        sigs.append(sig(sym, day, f"{h:02d}:{m:02d}", expires="15:00"))
+    return frames, sigs
+
+
+def test_guardrail_d2_blocks_entries_after_two_losers():
+    from research.intraday_sr.harness.config import GUARDRAILS
+    g = {x.name: x for x in GUARDRAILS}
+    frames, sigs = _loser_day(D, [("AAA", "10:00"), ("BBB", "10:30"), ("CCC", "11:00")])
+    src = FrameBarSource(frames)
+    tf = lambda s, d: "T2"
+    base = simulate(sigs, src, tier_fn=tf, guardrail=g["none"])
+    d2 = simulate(sigs, src, tier_fn=tf, guardrail=g["d2"])
+    assert len(base.trades) == 3 and all(t.pnl < 0 for t in base.trades)
+    assert len(d2.trades) == 2 and d2.counters["skip_guardrail_day"] == 1
+    assert d2.counters["guardrail_day_triggers"] == 1
+
+
+def test_guardrail_w5_carries_across_days_and_resets_weekly():
+    from research.intraday_sr.harness.config import GUARDRAILS
+    g = {x.name: x for x in GUARDRAILS}
+    frames_by_day, sigs = {}, []
+    days = ["2024-03-04", "2024-03-05", "2024-03-06", "2024-03-11"]     # Mon, Tue, Wed, next Mon
+    allframes = {}
+    for day in days:
+        f, s = _loser_day(day, [("AAA", "10:00"), ("BBB", "10:30"), ("CCC", "11:00")] if day == "2024-03-06"
+                          else [("AAA", "10:00"), ("BBB", "10:30")])
+        for k, v in f.items():
+            allframes.setdefault(k, []).append(v)
+        sigs += s
+    import pandas as pd
+    src = FrameBarSource({k: pd.concat(v, ignore_index=True) for k, v in allframes.items()})
+    tf = lambda s, d: "T2"
+    w5 = simulate(sigs, src, tier_fn=tf, guardrail=g["w5"])
+    base = simulate(sigs, src, tier_fn=tf, guardrail=g["none"])
+    assert len(base.trades) == 9
+    # Mon 2 + Tue 2 losers; Wed AAA is the 5th -> Wed BBB and CCC blocked; next Monday resets (2 trades)
+    assert len(w5.trades) == 7
+    assert w5.counters["skip_guardrail_week"] == 2 and w5.counters["guardrail_week_triggers"] == 1
+    assert sum(t.entry.ts.date().isoformat() == "2024-03-11" for t in w5.trades) == 2
