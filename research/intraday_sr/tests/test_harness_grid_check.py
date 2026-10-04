@@ -21,3 +21,18 @@ def test_v10_grid_is_rejected():
 
 def test_grid_hash_stable():
     assert G.grid_hash({"b": 1, "a": [1, 2]}) == G.grid_hash({"a": [1, 2], "b": 1})
+
+
+def test_grids_module_check_requires_primary_guardrail_in_hash():
+    from types import SimpleNamespace
+    a, b = G.reference_v11("A"), G.reference_v11("B")
+    f = [{"variant_id": f"F{i}"} for i in range(48)]
+    o = [{"variant_id": f"O{i}"} for i in range(9)]
+    z = [{"variant_id": f"Z{i}"} for i in range(9)]
+    pg = {"max_losses_day": 2, "max_losses_week": 5}
+    good = SimpleNamespace(TEST_A=a, TEST_B=b, FORMATIONS=f, OPTIONS=o, OPTIONS_0DTE=z, PRIMARY_GUARDRAIL=pg,
+                           grid_document=lambda: {"test_a": a, "primary_guardrail": pg})
+    assert G.check_grids_module(good) == [] and G.N_TOTAL == 450
+    bad = SimpleNamespace(TEST_A=a, TEST_B=b, FORMATIONS=f, OPTIONS=o, OPTIONS_0DTE=z, grid_document=lambda: {"test_a": a})
+    errs = G.check_grids_module(bad)
+    assert any("PRIMARY_GUARDRAIL" in e for e in errs) and any("hashed" in e for e in errs)

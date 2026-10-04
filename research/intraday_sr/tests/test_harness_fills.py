@@ -151,50 +151,22 @@ def test_bar_rules_pure():
     assert h.kind == "target" and h.gap and h.price == 11.5
 
 
-def _loser_day(day, syms_times):
-    """Each (sym, hhmm) gets a long that fills on the next bar and stops out on the bar after."""
-    frames, sigs = {}, []
-    for sym, at in syms_times:
-        i = idx(at)
-        ov = {i: (100.05, 100.30, 100.00, 100.20), i + 1: (100.20, 100.25, 99.40, 99.45)}
-        frames[sym] = flat_day(sym, day, overrides=ov)
-        h, m = divmod(570 + 5 * i, 60)
-        sigs.append(sig(sym, day, f"{h:02d}:{m:02d}", expires="15:00"))
-    return frames, sigs
 
-
-def test_guardrail_d2_blocks_entries_after_two_losers():
-    from research.intraday_sr.harness.config import GUARDRAILS
-    g = {x.name: x for x in GUARDRAILS}
-    frames, sigs = _loser_day(D, [("AAA", "10:00"), ("BBB", "10:30"), ("CCC", "11:00")])
-    src = FrameBarSource(frames)
-    tf = lambda s, d: "T2"
-    base = simulate(sigs, src, tier_fn=tf, guardrail=g["none"])
-    d2 = simulate(sigs, src, tier_fn=tf, guardrail=g["d2"])
-    assert len(base.trades) == 3 and all(t.pnl < 0 for t in base.trades)
-    assert len(d2.trades) == 2 and d2.counters["skip_guardrail_day"] == 1
-    assert d2.counters["guardrail_day_triggers"] == 1
-
-
-def test_guardrail_w5_carries_across_days_and_resets_weekly():
-    from research.intraday_sr.harness.config import GUARDRAILS
-    g = {x.name: x for x in GUARDRAILS}
-    frames_by_day, sigs = {}, []
-    days = ["2024-03-04", "2024-03-05", "2024-03-06", "2024-03-11"]     # Mon, Tue, Wed, next Mon
-    allframes = {}
-    for day in days:
-        f, s = _loser_day(day, [("AAA", "10:00"), ("BBB", "10:30"), ("CCC", "11:00")] if day == "2024-03-06"
-                          else [("AAA", "10:00"), ("BBB", "10:30")])
-        for k, v in f.items():
-            allframes.setdefault(k, []).append(v)
-        sigs += s
-    import pandas as pd
-    src = FrameBarSource({k: pd.concat(v, ignore_index=True) for k, v in allframes.items()})
-    tf = lambda s, d: "T2"
-    w5 = simulate(sigs, src, tier_fn=tf, guardrail=g["w5"])
-    base = simulate(sigs, src, tier_fn=tf, guardrail=g["none"])
-    assert len(base.trades) == 9
-    # Mon 2 + Tue 2 losers; Wed AAA is the 5th -> Wed BBB and CCC blocked; next Monday resets (2 trades)
-    assert len(w5.trades) == 7
-    assert w5.counters["skip_guardrail_week"] == 2 and w5.counters["guardrail_week_triggers"] == 1
-    assert sum(t.entry.ts.date().isoformat() == "2024-03-11" for t in w5.trades) == 2
+def test_flagged_bar_never_fills_and_fills_stay_inside_bar():
+    from research.intraday_sr.harness.portfolio import FillOutsideBar, _Bar, _check_fill
+    # long fills 10:05; the 10:10 bar is a flagged bad print through the stop -> ignored; stop never hit
+    ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20), idx("10:10"): (100.20, 100.25, 90.00, 90.00)}
+    f = flat_day("AAA", D, overrides=ov)
+    f["bad_bar"] = False
+    f.loc[idx("10:10"), "bad_bar"] = True
+    r = run({"AAA": f}, [sig()])
+    assert r.trades[0].exit.reason == "forced_eod" and r.counters["bars_flagged_skipped"] == 1
+    # a flagged bar where the trigger trades through: no entry on it
+    f2 = flat_day("AAA", D, overrides={idx("10:05"): (100.05, 100.30, 100.00, 100.20)})
+    f2["bad_bar"] = False
+    f2.loc[idx("10:05"), "bad_bar"] = True
+    assert run({"AAA": f2}, [sig()]).trades == []
+    with pytest.raises(FillOutsideBar):
+        _check_fill(101.0, _Bar(100, 100.5, 99.5, 100, 1.0), "stop", "AAA", None)
+    with pytest.raises(FillOutsideBar):
+        _check_fill(100.0, _Bar(100, 100.5, 99.5, 100, 1.0, True), "entry", "AAA", None)

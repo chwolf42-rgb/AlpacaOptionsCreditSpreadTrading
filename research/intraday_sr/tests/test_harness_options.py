@@ -135,18 +135,35 @@ def test_zero_dte_take_profit_and_stop_priority():
         assert r["credit_pc"] == pytest.approx((r["debit_pc"] - 0.05) / 100 * (1 + sl) * 100 - 0.05)
 
 
-def test_options_account_caps_and_guardrail():
+def test_options_account_caps_and_daily_stop():
     d = date(2024, 4, 23)
     t = lambda h, m: datetime.combine(d, time(h, m), tzinfo=ET)
     recs = [dict(symbol=f"S{i}", session=d, entry_ts=t(10, i), exit_ts=t(15, 0), debit_pc=100.0, credit_pc=0.0)
             for i in range(6)]
-    daily, taken, c = O.options_account(recs, [d], 0.02)
+    daily, taken, c, _ = O.options_account(recs, [d], 0.02, max_losses_day=None, max_losses_week=None)
     assert len(taken) == 4 and c["skip_concurrency"] == 2
     assert daily.iloc[0] == pytest.approx(-0.08)
-    # realized daily stop blocks later entries
     recs2 = [dict(symbol="A", session=d, entry_ts=t(10, 0), exit_ts=t(10, 30), debit_pc=100.0, credit_pc=0.0),
              dict(symbol="B", session=d, entry_ts=t(11, 0), exit_ts=t(12, 0), debit_pc=100.0, credit_pc=200.0)]
-    daily, taken, c = O.options_account(recs2, [d], 0.02)
-    assert len(taken) == 1 and c["skip_daily_stop"] == 1
-    g = dict((x.name, x) for x in GUARDRAILS) if hasattr(GUARDRAILS[0], "name") else None
-    assert len(GUARDRAILS) == 6
+    daily, taken, c, s = O.options_account(recs2, [d], 0.02)
+    assert len(taken) == 1 and c["skip_daily_stop"] == 1 and s.iloc[0].daily_stop_ts == t(10, 30)
+
+
+def test_options_guardrail_counts_option_losses_own_portfolio():
+    """G6: losses are the option trades' own R < 0 (after spread/fees), d2 per session, w5 per week."""
+    t = lambda d, h, m: datetime.combine(d, time(h, m), tzinfo=ET)
+    mon, tue, wed, thu = (date(2024, 4, 22 + i) for i in range(4))
+    def rec(d, sym, h, win):
+        return dict(symbol=sym, session=d, entry_ts=t(d, h, 0), exit_ts=t(d, h, 30), debit_pc=100.0,
+                    credit_pc=180.0 if win else 50.0)
+    recs = [rec(mon, "A", 10, False), rec(mon, "B", 11, True), rec(mon, "C", 12, False), rec(mon, "D", 13, True),
+            rec(tue, "A", 10, False), rec(tue, "B", 11, False), rec(tue, "C", 12, True),
+            rec(wed, "A", 10, False), rec(wed, "B", 11, True),
+            rec(thu, "A", 10, True)]
+    daily, taken, c, s = O.options_account(recs, [mon, tue, wed, thu], 0.002)
+    got = [(r["session"], r["symbol"]) for _, r in taken.iterrows()]
+    # Mon: A loss, B win (wins never reduce a count), C loss -> trip, D blocked. Tue: A, B losses -> 4, trip, C
+    # blocked. Wed: A loss = 5th -> week trip; B blocked. Thu: blocked (same week).
+    assert got == [(mon, "A"), (mon, "B"), (mon, "C"), (tue, "A"), (tue, "B"), (wed, "A")]
+    assert c["signals_blocked_guardrail"] == 4 and c["days_halted_day_limit"] == 2 and c["weeks_halted_week_limit"] == 1
+    assert list(taken["week_losses_before"]) == [0, 1, 1, 2, 3, 4]

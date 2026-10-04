@@ -29,15 +29,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from research.intraday_sr.harness import adjfactors as AF
 from research.intraday_sr.harness import readout as RO
 from research.intraday_sr.harness import stats as S
-from research.intraday_sr.harness.config import GUARDRAILS, CostCfg, RiskCfg
+from research.intraday_sr.harness.compare import write_compare
+from research.intraday_sr.harness.config import COMPARISON, EXTRA_COMPARISON, PRIMARY, CostCfg, RiskCfg
 from research.intraday_sr.harness.grid_check import check_test_grid, grid_hash
 from research.intraday_sr.harness.portfolio import simulate
 from research.intraday_sr.harness.triallog import TrialLog, TrialRow, git_sha
 from research.intraday_sr.harness.walkforward import DEV_END, VariantRun, make_folds, walk_forward
 
-SPEC_VERSION = "v1.2"
+SPEC_VERSION = "v1.3"
 _G: dict = {}          # fork-shared state for workers
 
 
@@ -71,19 +73,21 @@ def _trades_df(res) -> pd.DataFrame:
     m = pd.DataFrame(res.meta)
     return pd.DataFrame({"session": m["session"], "symbol": m["symbol"], "r": [t.r for t in res.trades],
                          "pnl": [t.pnl for t in res.trades], "exit_kind": m["exit_kind"], "capped": m["capped"],
-                         "entry_ts": m["entry_ts"], "exit_ts": m["exit_ts"]})
+                         "entry_ts": m["entry_ts"], "exit_ts": m["exit_ts"],
+                         "day_losses_before": m["day_losses_before"], "week_losses_before": m["week_losses_before"]})
 
 
-def run_variant(variant: dict, guardrail=GUARDRAILS[0], cost_mult: float = 1.0, keep_raw: bool = False):
+def run_variant(variant: dict, guardrail=PRIMARY, cost_mult: float = 1.0, keep_raw: bool = False):
     ad, symbols, src, sessions = _G["adapter"], _G["symbols"], _G["src"], _G["sessions"]
     try:
         sigs = [s for sym in symbols for s in ad.signals(sym, variant)]
-        res = simulate(sigs, src, RiskCfg(target=variant["target"]), CostCfg(mult=cost_mult), sessions=sessions,
-                       guardrail=guardrail)
-        vr = VariantRun(variant["variant_id"], _trades_df(res), res.daily)
+        risk = guardrail.apply(RiskCfg(target=variant["target"]))
+        res = simulate(sigs, src, risk, CostCfg(mult=cost_mult), sessions=sessions)
+        vr = VariantRun(variant["variant_id"], _trades_df(res), res.daily, config=guardrail.name)
         return (vr, res.counters, res if keep_raw else None)
     except Exception as e:                                   # failures are logged trials too
-        return (VariantRun(variant["variant_id"], pd.DataFrame(), pd.Series(dtype=float), "error", repr(e)), {}, None)
+        return (VariantRun(variant["variant_id"], pd.DataFrame(), pd.Series(dtype=float), "error", repr(e),
+                           config=guardrail.name), {}, None)
 
 
 def _par(fn, items, workers):
@@ -133,11 +137,20 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     _G.update(adapter=ad, symbols=syms, src=ad.bar_source(syms),
               sessions=[d for d in ad.sessions() if d <= DEV_END])
+    src = _G["src"]
+    adj_note = getattr(getattr(src, "adj_info", None), "note", lambda: "adj factor provenance unknown")()
+    if not ad.smoke:
+        # Real runs: Trading's raw/adj factor is REQUIRED for every run symbol and session; no 1.0 fallback.
+        sess_by_sym = {s_: [d for d in _G["sessions"] if src.session_frame(s_, d) is not None] for s_ in syms}
+        AF.require_coverage(sess_by_sym, getattr(ad, "adj_root", AF.DEFAULT_ROOT))
+        info = getattr(src, "adj_info", None)
+        if info is None or info.approximate:
+            raise SystemExit("bar source carries approximate (1.0) adj factors; real runs need Trading's factors")
     sha = git_sha(Path(__file__).resolve().parents[3])
     kind = "smoke" if ad.smoke else ("interim" if len(syms) < 33 else "full")
     log = TrialLog(out / "triallog.parquet")
     inp = RO.ReadoutInputs(SPEC_VERSION, sha, "", {}, syms, smoke=ad.smoke)
-    frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers}"]
+    frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers}", adj_note]
     for test in a.tests.split(","):
         variants = ad.variants(test)
         if a.max_variants:
@@ -178,24 +191,41 @@ def main(argv=None):
         frontier += [RO.frontier_row(test, vid, vr.trades, vr.daily) for vid, vr in runs.items() if vr.status == "ok"]
         picked = sorted({p["variant"] for p in wf.picks if p["variant"]})
         vmap = {v["variant_id"]: v for v in variants}
-        # sensitivity: 2x costs on the selected path (same picks)
-        r2 = dict(zip(picked, [x[0] for x in _par(lambda v: run_variant(vmap[v], cost_mult=2.0), picked, 1)]))
-        t2, d2 = oos_from_picks(wf.picks, r2)
+        # sensitivity (SPEC section 8): 1.5x costs on the selected path (same picks, primary config)
+        r15 = dict(zip(picked, [x[0] for x in _par(lambda v: run_variant(vmap[v], cost_mult=1.5), picked, 1)]))
+        t2, d2 = oos_from_picks(wf.picks, r15)
         inp.sensitivities = {**inp.sensitivities, test: pd.DataFrame([
             {"case": "base costs", "mean R": RO._num(h["mean_r_ci"]["mean"]), "monthly": RO._pct(h["monthly_ci"]["mean"])},
-            {"case": "2x costs", "mean R": RO._num(float(t2["r"].mean()) if len(t2) else None),
+            {"case": "1.5x costs", "mean R": RO._num(float(t2["r"].mean()) if len(t2) else None),
              "monthly": RO._pct(float(S.monthly_returns(d2).mean()) if len(d2) else None)}])}
-        # guardrail overlays on the selected path (after selection; no trials)
-        gres = {}
-        for gcfg in GUARDRAILS:
+        # G2: comparison configurations AFTER selection, same picks, only RiskCfg changed -> guardrail_compare.parquet
+        prim_cnt = {}
+        for v in picked:
+            for k, val in run_variant(vmap[v])[1].items():
+                prim_cnt[k] = prim_cnt.get(k, 0) + val
+        gstats = [RO.guardrail_stats(PRIMARY.name, wf.oos_trades if len(wf.oos_trades) else
+                                     pd.DataFrame(columns=["session", "r", "pnl"]), wf.oos_daily, prim_cnt)]
+        crow = []
+        for gcfg in COMPARISON + EXTRA_COMPARISON:
             outs = {v: run_variant(vmap[v], guardrail=gcfg) for v in picked}
             tg, dg = oos_from_picks(wf.picks, {v: o[0] for v, o in outs.items()})
             cnt = {}
             for o in outs.values():
                 for k, val in o[1].items():
                     cnt[k] = cnt.get(k, 0) + val
-            gres[gcfg.name] = (dg, len(tg), cnt)
-        inp.guardrails = {**inp.guardrails, f"Test {test} selected path": RO.guardrail_rows(gres)}
+            gs = RO.guardrail_stats(gcfg.name, tg, dg, cnt)
+            crow.append({"run_id": a.tag, "test": test, "scope": "selected_path", "config": gcfg.name,
+                         "trades": gs["trades"], "trades_per_mo": gs["trades_per_mo"], "win_rate": gs["win_rate"],
+                         "mean_r": gs["mean_r"].get("mean"), "monthly_mean": gs["monthly"].get("mean"),
+                         "max_dd": gs["max_dd"], "worst_week": gs["worst_week"],
+                         "days_halted_day_limit": gs["days_halted_day_limit"],
+                         "weeks_halted_week_limit": gs["weeks_halted_week_limit"],
+                         "daily_stop_days": gs["daily_stop_days"], "signals_blocked": gs["signals_blocked"]})
+            if gcfg in COMPARISON:
+                gstats.append(gs)
+        write_compare(out, crow)
+        inp.guardrails = {**inp.guardrails, f"Test {test} selected path":
+                          (RO.guardrail_rows(gstats), RO.trades_per_month_words(gstats))}
         (out / f"wf_{test}.json").write_text(json.dumps({"picks": wf.picks, "finalists": wf.finalists}, default=str, indent=1))
     inp.frontier = frontier
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024

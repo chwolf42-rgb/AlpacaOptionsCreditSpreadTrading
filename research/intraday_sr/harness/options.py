@@ -414,47 +414,60 @@ def zero_dte_records(trades, bars, ctx: IVContext, zcfg: ZeroDteCfg = ZeroDteCfg
 
 
 def options_account(records: list, sessions: Sequence[date], premium_pct: float, *, max_concurrent: int = 4,
-                    max_entries_per_day: int = 12, daily_loss_stop: float = 0.015, guardrail=None,
-                    start_equity: float = 100_000.0):
-    """Premium-sized options account fed by overlay records. Caps: 1 per symbol, max concurrent (time overlap),
-    entries/day, daily loss stop on realized P&L (option marks between records are not modelled), optional v1.1 A3
-    guardrail (block entries after N losing trades in the day / ISO week). Returns (daily Series, trades DataFrame,
-    counters)."""
+                    max_entries_per_day: int = 12, daily_loss_stop: float = 0.015,
+                    max_losses_day: Optional[int] = 2, max_losses_week: Optional[int] = 5,
+                    window_starts: Optional[Iterable[date]] = None, start_equity: float = 100_000.0):
+    """Premium-sized options portfolio fed by overlay records (one per equity signal that produced an option trade).
+    SPEC v1.3 G6: the d2+w5 guardrail (default) applies to this portfolio's OWN closed option trades: a loss is an
+    option trade with R < 0 after spread and fees (R = P&L / premium paid). Counts update at each option exit, in
+    exit order (exit time, then symbol), before any entry at or after that time; reaching a limit blocks new entries
+    for the rest of the session / Mon-Fri week. Signals skipped for lack of an expiry never reach here (not trades).
+    Caps: 1 per symbol, max concurrent, entries/day, realized daily loss stop (option marks between records are not
+    modelled). Returns (daily Series, trades DataFrame, counters, sessions DataFrame)."""
+    from research.intraday_sr.harness.walkforward import WINDOW_STARTS
+    ws = sorted(set(WINDOW_STARTS if window_starts is None else window_starts))
     by = {}
     for r in sorted(records, key=lambda r: (r["entry_ts"], r["symbol"])):
         by.setdefault(r["session"], []).append(r)
     eq = start_equity
-    rets, taken = [], []
+    rets, taken, srows = [], [], []
     c = {"skip_concurrency": 0, "skip_symbol_busy": 0, "skip_daily_stop": 0, "skip_daily_entry_cap": 0,
-         "skip_guardrail_day": 0, "skip_guardrail_week": 0, "skip_too_expensive": 0,
-         "guardrail_day_triggers": 0, "guardrail_week_triggers": 0}
-    wk, wk_losers, wk_trig = None, 0, False
+         "signals_blocked_guardrail": 0, "skip_too_expensive": 0}
+    wk, wk_losses, prev = None, 0, None
     for d in sessions:
-        if d.isocalendar()[:2] != wk:
-            wk, wk_losers, wk_trig = d.isocalendar()[:2], 0, False
-        day_start, day_pnl, open_, entries, day_losers, d_trig = eq, 0.0, [], 0, 0, False
+        starts_window = any((prev is None or w > prev) and w <= d for w in ws)
+        prev = d
+        if d.isocalendar()[:2] != wk or starts_window:
+            wk, wk_losses = d.isocalendar()[:2], 0
+        st = {"session": d, "week_losses_start": wk_losses, "day_limit_trip_ts": None, "week_limit_trip_ts": None,
+              "daily_stop_ts": None, "signals_blocked": 0}
+        day_start, day_pnl, open_, entries, day_losses = eq, 0.0, [], 0, 0
+
+        def close_until(t):
+            nonlocal day_pnl, day_losses, wk_losses, open_
+            done = sorted((o for o in open_ if t is None or o["exit_ts"] <= t), key=lambda o: (o["exit_ts"], o["symbol"]))
+            for o in done:
+                day_pnl += o["pnl"]
+                if o["R"] < 0:
+                    day_losses += 1
+                    wk_losses += 1
+                    if max_losses_day is not None and day_losses == max_losses_day:
+                        st["day_limit_trip_ts"] = o["exit_ts"]
+                    if max_losses_week is not None and wk_losses == max_losses_week:
+                        st["week_limit_trip_ts"] = o["exit_ts"]
+                if st["daily_stop_ts"] is None and day_pnl <= -daily_loss_stop * day_start:
+                    st["daily_stop_ts"] = o["exit_ts"]
+            open_ = [o for o in open_ if o not in done]
+
         for r in by.get(d, []):
-            still = []
-            for o in open_:
-                if o["exit_ts"] <= r["entry_ts"]:
-                    day_pnl += o["pnl"]
-                    day_losers += int(o["pnl"] < 0)
-                else:
-                    still.append(o)
-            open_ = still
-            if guardrail is not None:
-                if guardrail.day_losers is not None and day_losers >= guardrail.day_losers and not d_trig:
-                    d_trig = True
-                    c["guardrail_day_triggers"] += 1
-                if guardrail.week_losers is not None and wk_losers + day_losers >= guardrail.week_losers and not wk_trig:
-                    wk_trig = True
-                    c["guardrail_week_triggers"] += 1
-            if day_pnl <= -daily_loss_stop * day_start:
+            close_until(r["entry_ts"])
+            if st["daily_stop_ts"] is not None:
                 c["skip_daily_stop"] += 1
                 continue
-            blk = guardrail.blocks(day_losers, wk_losers + day_losers) if guardrail is not None else None
-            if blk:
-                c[f"skip_guardrail_{blk}"] += 1
+            if (max_losses_day is not None and day_losses >= max_losses_day) or \
+                    (max_losses_week is not None and wk_losses >= max_losses_week):
+                c["signals_blocked_guardrail"] += 1
+                st["signals_blocked"] += 1
                 continue
             if any(o["symbol"] == r["symbol"] for o in open_):
                 c["skip_symbol_busy"] += 1
@@ -470,13 +483,18 @@ def options_account(records: list, sessions: Sequence[date], premium_pct: float,
                 c["skip_too_expensive"] += 1
                 continue
             pnl = n * (r["credit_pc"] - r["debit_pc"])
-            rec = dict(r, contracts=n, premium=n * r["debit_pc"], pnl=pnl, R=pnl / (n * r["debit_pc"]))
+            rec = dict(r, contracts=n, premium=n * r["debit_pc"], pnl=pnl, R=pnl / (n * r["debit_pc"]),
+                       day_losses_before=day_losses, week_losses_before=wk_losses)
             open_.append(rec)
             taken.append(rec)
             entries += 1
-        day_pnl += sum(o["pnl"] for o in open_)
-        day_losers += sum(int(o["pnl"] < 0) for o in open_)
-        wk_losers += day_losers
+        close_until(None)
+        st.update(pnl=day_pnl, day_losses=day_losses, week_losses_end=wk_losses, entries=entries)
+        srows.append(st)
         eq = day_start + day_pnl
         rets.append(day_pnl / day_start)
-    return pd.Series(rets, index=pd.Index(list(sessions), name="session"), dtype=float), pd.DataFrame(taken), c
+    sess = pd.DataFrame(srows)
+    for k, col in (("days_halted_day_limit", "day_limit_trip_ts"), ("weeks_halted_week_limit", "week_limit_trip_ts"),
+                   ("daily_stop_days", "daily_stop_ts")):
+        c[k] = int(sess[col].notna().sum()) if len(sess) else 0
+    return (pd.Series(rets, index=pd.Index(list(sessions), name="session"), dtype=float), pd.DataFrame(taken), c, sess)

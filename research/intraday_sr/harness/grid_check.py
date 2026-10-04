@@ -1,4 +1,4 @@
-"""Harness-side conformance check for Developer 2's `grids.py` against SPEC v1.2 (v1.1 A1/A2 grids).
+"""Harness-side conformance check for Developer 2's `grids.py` against SPEC v1.3 (v1.1 A1/A2 grids, G1/G2).
 
 `grids.py` is owned by Developer 2 (S0). This module only *checks* it, so the harness refuses to start a run on a
 grid that drifted from the frozen spec. Adapt `extract()` once the S0 layout is known; the checks are layout-free.
@@ -22,6 +22,8 @@ K_CLUSTER_FIXED = 0.25
 PER_TEST = 192
 FORMATIONS = 48                    # 4 kinds x TF 2 x target 3 x pivot tol {0.15, 0.25} 2
 OPTIONS_BASELINE, OPTIONS_0DTE = 9, 9
+N_TOTAL = 2 * PER_TEST + FORMATIONS + OPTIONS_BASELINE + OPTIONS_0DTE      # 450 (SPEC v1.3 G2)
+PRIMARY_GUARDRAIL = (2, 5)          # G1: RiskCfg(max_losses_day=2, max_losses_week=5) as grids.PRIMARY_GUARDRAIL
 ALIASES = {"K": ("K", "k", "zones_per_side", "n_zones"), "oscillator": ("oscillator", "osc"),
            "rvol_min": ("rvol_min",), "tf": ("tf", "entry_tf", "timeframe"), "target": ("target",),
            "k_confirm": ("k_confirm",), "k_cluster": ("k_cluster", "k_cluster_atr")}
@@ -93,3 +95,30 @@ def reference_v11(test: str) -> list[dict]:
         out.append(dict(test=test, K=K, oscillator=osc, rvol_min=rv, tf=tf, target=tgt, k_confirm=kc,
                         k_cluster=K_CLUSTER_FIXED, variant_id=f"{test}-K{K}-{osc}-rv{rv}-{tf}-{tgt}-kc{kc}"))
     return out
+
+
+def _guardrail_tuple(g) -> tuple | None:
+    if g is None:
+        return None
+    if isinstance(g, Mapping):
+        return (g.get("max_losses_day"), g.get("max_losses_week"))
+    if isinstance(g, (tuple, list)):
+        return tuple(g)
+    return (getattr(g, "max_losses_day", None), getattr(g, "max_losses_week", None))
+
+
+def check_grids_module(mod) -> list[str]:
+    """Check Developer 2's grids module (TEST_A, TEST_B, FORMATIONS, OPTIONS, OPTIONS_0DTE, PRIMARY_GUARDRAIL)."""
+    errs = check_all(mod.TEST_A, mod.TEST_B, getattr(mod, "FORMATIONS", None), getattr(mod, "OPTIONS", None),
+                     getattr(mod, "OPTIONS_0DTE", None))
+    n = sum(len(getattr(mod, k, ())) for k in ("TEST_A", "TEST_B", "FORMATIONS", "OPTIONS", "OPTIONS_0DTE"))
+    if n != N_TOTAL:
+        errs.append(f"total variants {n} != N = {N_TOTAL}")
+    g = _guardrail_tuple(getattr(mod, "PRIMARY_GUARDRAIL", None))
+    if g != PRIMARY_GUARDRAIL:
+        errs.append(f"PRIMARY_GUARDRAIL {g} != {PRIMARY_GUARDRAIL} (SPEC v1.3 G1: must be a grids.py constant)")
+    doc = mod.grid_document() if hasattr(mod, "grid_document") else {}
+    if not any("guardrail" in str(k).lower() for k in doc) and \
+            "max_losses_day" not in json.dumps(doc, default=str):
+        errs.append("PRIMARY_GUARDRAIL is not inside the hashed grid document (G1/G8: grid hash must include it)")
+    return errs

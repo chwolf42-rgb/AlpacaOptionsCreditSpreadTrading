@@ -6,14 +6,14 @@ requires a new spec version before the run that uses it.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, time
 from typing import Literal, Optional
 
 
 @dataclass(frozen=True)
 class RiskCfg:
-    target: Literal["1R", "2R", "zone"] = "1R"
+    target: Literal["1R", "2R", "next_zone", "zone"] = "1R"   # S0 grids use "next_zone"; "zone" kept as alias
     risk_pct: float = 0.005                 # of day-start equity, per trade
     max_pos_notional_x: float = 1.0          # x equity per position
     max_gross_notional_x: float = 3.0        # x equity total
@@ -28,34 +28,36 @@ class RiskCfg:
     start_equity: float = 100_000.0
     capacity_release: Literal["next_bar"] = "next_bar"   # capacity freed by an exit on bar t is usable from t+1
     fill_bar_target: Literal["not_credited"] = "not_credited"  # on the entry bar only the stop is checked
+    # SPEC v1.3 G1/G3: loss guardrail d2+w5 is the PRIMARY configuration and the default. None = no limit.
+    max_losses_day: Optional[int] = 2        # no new entries for the rest of the session after 2 losses (R < 0)
+    max_losses_week: Optional[int] = 5       # ... and for the rest of the Mon-Fri ET week after 5 losses
 
 
 @dataclass(frozen=True)
 class GuardrailCfg:
-    """SPEC v1.1 A3 reporting overlays (none, d2, w5, w6, d2+w5, d2+w6), applied after selection; no trials added to N.
-    d2: no more entries that day after 2 losing trades. w5/w6: no more entries that ISO week after 5/6 losing trades.
-    A losing trade = closed with net P&L < 0 (after costs). Open positions are not flattened. The count becomes
-    known at the close of the bar in which the losing exit happened (entries on that same bar are not blocked)."""
-    name: str = "none"
-    day_losers: Optional[int] = None
-    week_losers: Optional[int] = None
+    """A named loss-guardrail setting (SPEC v1.3 G1-G3). Applied by copying into RiskCfg via `apply()`; the
+    simulator reads RiskCfg only. PRIMARY (d2+w5) feeds every result, selection, freeze, pass bar and DSR.
+    COMPARISON configs run after selection on the same picks and go to guardrail_compare.parquet only."""
+    name: str
+    max_losses_day: Optional[int]
+    max_losses_week: Optional[int]
 
-    def blocks(self, day_l: int, week_l: int) -> Optional[str]:
-        if self.day_losers is not None and day_l >= self.day_losers:
-            return "day"
-        if self.week_losers is not None and week_l >= self.week_losers:
-            return "week"
-        return None
+    def apply(self, risk: "RiskCfg") -> "RiskCfg":
+        return replace(risk, max_losses_day=self.max_losses_day, max_losses_week=self.max_losses_week)
 
 
-GUARDRAILS = (
-    GuardrailCfg("none"),
-    GuardrailCfg("d2", day_losers=2),
-    GuardrailCfg("w5", week_losers=5),
-    GuardrailCfg("w6", week_losers=6),
-    GuardrailCfg("d2+w5", day_losers=2, week_losers=5),
-    GuardrailCfg("d2+w6", day_losers=2, week_losers=6),
-)
+PRIMARY = GuardrailCfg("d2+w5", 2, 5)
+PRIMARY_LABEL = PRIMARY.name
+COMPARISON = (GuardrailCfg("none", None, None), GuardrailCfg("d2+w6", 2, 6))
+EXTRA_COMPARISON = (GuardrailCfg("d2", 2, None), GuardrailCfg("w5", None, 5), GuardrailCfg("w6", None, 6))  # cheap, table only
+GUARDRAILS = (PRIMARY,) + COMPARISON
+
+
+def guardrail_label(risk: "RiskCfg") -> str:
+    for g in GUARDRAILS + EXTRA_COMPARISON:
+        if (g.max_losses_day, g.max_losses_week) == (risk.max_losses_day, risk.max_losses_week):
+            return g.name
+    return f"d{risk.max_losses_day}+w{risk.max_losses_week}"
 
 
 @dataclass(frozen=True)
@@ -87,3 +89,8 @@ class Fold:
 def cfg_dict(obj) -> dict:
     d = asdict(obj)
     return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in d.items()}
+
+
+# SPEC v1.3 G2: declared trial counts (guardrail configs add 0). DSR uses N_TOTAL (see readout notes).
+N_DECLARED = {"A": 192, "B": 192, "F": 48, "options": 18}
+N_TOTAL = sum(N_DECLARED.values())          # 450

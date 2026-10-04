@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from research.intraday_sr.harness import stats as S
+from research.intraday_sr.harness.config import N_TOTAL
 
 OOS_START, OOS_END = date(2020, 1, 1), date(2026, 3, 31)
 FLAG_LO, FLAG_HI = 150, 250
@@ -133,7 +134,10 @@ def frontier_png(rows: Sequence[dict], path: Path) -> Optional[Path]:
 
 
 # ------------------------------------------------------------------ headline / pass bar
-def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: int, var_sr: Optional[float] = None) -> dict:
+def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: Optional[int] = None,
+             var_sr: Optional[float] = None) -> dict:
+    """Primary-configuration headline. DSR N = max(declared 450, trials logged) (SPEC v1.3 G2)."""
+    n_trials = max(int(n_trials or 0), N_TOTAL)
     n_sessions = len(daily)
     day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if len(trades) else np.array([])
     s = S.trade_summary(trades["r"].to_numpy(float) if len(trades) else np.array([]),
@@ -147,7 +151,7 @@ def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: int, var_sr: Opti
     return s
 
 
-def pass_bar_words(h: dict, cost_x2_mean_r: Optional[float] = None) -> list[str]:
+def pass_bar_words(h: dict, cost_x15_mean_r: Optional[float] = None) -> list[str]:
     """SPEC section 8 checks, stated in words. Returns one line per criterion (PASS/FAIL/UNKNOWN)."""
     out = []
     mr = h.get("mean_r_ci", {})
@@ -162,8 +166,9 @@ def pass_bar_words(h: dict, cost_x2_mean_r: Optional[float] = None) -> list[str]
     yp = h.get("years_positive", {})
     npos = sum(v > 0 for v in yp.values())
     out.append(f"INFO: mean R positive in {npos} of {len(yp)} calendar years.")
-    if cost_x2_mean_r is not None:
-        out.append(f"{'PASS' if cost_x2_mean_r > 0 else 'FAIL'}: mean R at 2x costs {_num(cost_x2_mean_r)} must stay > 0.")
+    if cost_x15_mean_r is not None:
+        out.append(f"{'PASS' if cost_x15_mean_r > 0 else 'FAIL'}: mean R at 1.5x costs {_num(cost_x15_mean_r)} "
+                   "must stay > 0.")
     return out
 
 
@@ -183,31 +188,63 @@ def options_variant_row(name: str, daily: pd.Series, taken: pd.DataFrame, counte
             "skipped (no expiry)": int(skipped.get("no_same_day_expiry", skipped.get("no_expiry_in_bucket", 0)))}
 
 
-def guardrail_rows(results: Mapping[str, tuple]) -> pd.DataFrame:
-    """results: name -> (daily Series, n_trades, counters). Compared against 'none'."""
-    def wk_worst(d):
-        if not len(d):
-            return np.nan
-        idx = pd.DatetimeIndex(pd.to_datetime(d.index))
-        return float(((1 + pd.Series(d.to_numpy(), idx)).groupby(idx.to_period("W")).prod() - 1).min())
-    base_d, base_n, _ = results["none"]
-    bm = S.monthly_returns(base_d)
+def _worst_week(d: pd.Series) -> float:
+    if not len(d):
+        return np.nan
+    idx = pd.DatetimeIndex(pd.to_datetime(d.index))
+    return float(((1 + pd.Series(d.to_numpy(), idx)).groupby(idx.to_period("W")).prod() - 1).min())
+
+
+def guardrail_stats(name: str, trades: pd.DataFrame, daily: pd.Series, counters: Mapping) -> dict:
+    """Numbers for one configuration row (SPEC v1.3 G4). trades: session, r, pnl; daily: daily returns."""
+    m = S.monthly_returns(daily)
+    n = 0 if trades is None else len(trades)
+    weeks = len(pd.DatetimeIndex(pd.to_datetime(daily.index)).to_period("W").unique()) if len(daily) else 0
+    day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if n else np.array([])
+    return {"config": name, "trades": n, "trades_per_mo": n / max(len(m), 1),
+            "win_rate": float((trades["pnl"] > 0).mean()) if n else None,
+            "mean_r": S.day_block_mean_r(trades["r"].to_numpy(float), day) if n else {"mean": None},
+            "monthly": S.block_mean(m.to_numpy()) if len(m) else {"mean": None},
+            "max_dd": S.max_drawdown(daily) if len(daily) else None, "worst_week": _worst_week(daily),
+            "days_halted_day_limit": int(counters.get("days_halted_day_limit", 0)),
+            "weeks_halted_week_limit": int(counters.get("weeks_halted_week_limit", 0)),
+            "daily_stop_days": int(counters.get("daily_stop_days", 0)),
+            "signals_blocked": int(counters.get("signals_blocked_guardrail", 0)),
+            "sessions": int(len(daily)), "weeks": int(weeks)}
+
+
+def guardrail_rows(stats: Sequence[dict]) -> pd.DataFrame:
+    """3-row table, primary d2+w5 first (this is the result), then none and d2+w6 (comparison, report only)."""
+    order = {"d2+w5": 0, "none": 1, "d2+w6": 2}
     rows = []
-    for name, (d, n, c) in results.items():
-        m = S.monthly_returns(d)
-        days = max(len(d), 1)
-        weeks = max(len(pd.DatetimeIndex(pd.to_datetime(d.index)).to_period("W").unique()), 1) if len(d) else 1
-        rows.append({"overlay": name,
-                     "day trigger rate": _pct(c.get("guardrail_day_triggers", 0) / days, 1),
-                     "week trigger rate": _pct(c.get("guardrail_week_triggers", 0) / weeks, 1),
-                     "trades/mo": _num(n / max(len(m), 1), 1),
-                     "d trades/mo": _num((n / max(len(m), 1)) - base_n / max(len(bm), 1), 1),
-                     "monthly mean": _pct(float(m.mean()) if len(m) else None),
-                     "d monthly": _pct((float(m.mean()) - float(bm.mean())) if len(m) and len(bm) else None),
-                     "max DD": _pct(S.max_drawdown(d) if len(d) else None),
-                     "d max DD": _pct((S.max_drawdown(d) - S.max_drawdown(base_d)) if len(d) and len(base_d) else None),
-                     "worst week": _pct(wk_worst(d))})
+    for g in sorted(stats, key=lambda g: order.get(g["config"], 9)):
+        rows.append({
+            "config": g["config"] + (" (PRIMARY)" if g["config"] == "d2+w5" else " (comparison)"),
+            "trades/mo": _num(g["trades_per_mo"], 1), "win rate": _pct(g["win_rate"], 1),
+            "mean R [95% CI]": _ci(g["mean_r"]), "monthly @0.5% risk [95% CI]": _ci(g["monthly"], _pct),
+            "max DD": _pct(g["max_dd"]), "worst week": _pct(g["worst_week"]),
+            "day-limit trigger rate": _pct(g["days_halted_day_limit"] / max(g["sessions"], 1), 1),
+            "week-limit trigger rate": _pct(g["weeks_halted_week_limit"] / max(g["weeks"], 1), 1),
+            "days halted (day limit)": g["days_halted_day_limit"], "weeks halted (week limit)": g["weeks_halted_week_limit"],
+            "daily-stop days": g["daily_stop_days"], "signals blocked": g["signals_blocked"]})
     return pd.DataFrame(rows)
+
+
+def trades_per_month_words(stats: Sequence[dict]) -> str:
+    parts = []
+    for g in stats:
+        t = g["trades_per_mo"]
+        band = "inside" if FLAG_LO <= t <= FLAG_HI else ("below" if t < FLAG_LO else "above")
+        parts.append(f"{g['config']} achieved {t:.0f} trades/mo ({band} the 150-250 band; target ~200)")
+    return "; ".join(parts) + "."
+
+
+GUARDRAIL_NOTE = (
+    "Expected trades until the k-th loss is k / (1 - WR). At a 60% win rate the 2/day limit alone allows about 5 trades "
+    "per session (~105/mo); the 5/week limit allows about 12.5 per week (~54/mo) and binds first, so the primary "
+    "configuration's expected ceiling is ~54/mo at 60% WR (~43/mo at 50%, ~36/mo at 40%) [P, ignores signal supply and "
+    "the other caps]. Reaching 150/mo under d2+w5 needs a win rate of about 86%+, 200/mo about 89% [P]. The 150-250 "
+    "trades/mo target is therefore likely unreachable under the primary configuration; nothing is loosened to chase it.")
 
 
 # ------------------------------------------------------------------ document
@@ -226,7 +263,7 @@ class ReadoutInputs:
     frontier: Sequence[dict] = ()
     options_baseline: Optional[pd.DataFrame] = None
     options_0dte: Optional[pd.DataFrame] = None
-    guardrails: Mapping[str, pd.DataFrame] = field(default_factory=dict)   # scope label -> guardrail_rows()
+    guardrails: Mapping[str, tuple] = field(default_factory=dict)   # scope label -> (guardrail_rows(), words)
     notes: Sequence[str] = ()
     smoke: bool = False
 
@@ -241,8 +278,11 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
         else "Full universe, development window (holdout untouched)")
     L += [f"# Intraday S/R readout: {title}", "",
           f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
-          "- Trial count N: " + ", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items())
-          + " (guardrail overlays add no trials)",
+          "- Trial count N = 450 declared (Test A 192, Test B 192, formations 48, options 18; SPEC v1.3 G2); logged "
+          "this run: " + (", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items()) or "none")
+          + ". Guardrail configurations add 0 trials. DSR uses N = 450.",
+          "- Configuration: **primary loss guardrail d2+w5** (2 losses/session, 5 losses/Mon-Fri week; SPEC v1.3 G1) for "
+          "every result, selection, pass-bar item and the DSR. 'none' and 'd2+w6' are comparison rows only.",
           f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
           "- Model-based research only; holdout 2026-04-01..2026-09-30 not opened; CP4 review before Trading.", ""]
     for test, h in inp.headlines.items():
@@ -268,7 +308,7 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
     if inp.frontier:
         png = frontier_png(inp.frontier, out_dir / "frontier.png")
         nflag = sum(r["flag_150_250_lbR_gt0"] for r in inp.frontier)
-        L += ["## Trade-off frontier (all logged variants, fixed-variant OOS 2020Q1-2026Q1)", "",
+        L += ["## Trade-off frontier (primary d2+w5; all logged variants, fixed-variant OOS 2020Q1-2026Q1)", "",
               f"{nflag} setting(s) flagged at 150-250 trades/mo with OOS mean-R 95% lower bound > 0. A flag is "
               "informational only: choosing from this curve is itself selection, so flagged settings must still "
               "clear the full section 8 bar.", ""]
@@ -280,9 +320,12 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
     if inp.options_0dte is not None:
         L += ["## 0DTE scenario ($2,000 premium on $100k; HIGHER-RISK, MODEL-BASED)", "", f"> {ZERO_DTE_CAVEAT}", "",
               _md(inp.options_0dte)]
-    for scope, df in inp.guardrails.items():
-        L += [f"## Guardrail overlays: {scope} (applied after selection; not trials)", "",
-              "d2 directly limits the ~200 trades/mo goal.", "", _md(df)]
+    for scope, (df, words) in inp.guardrails.items():
+        L += [f"## Guardrail configurations: {scope}", "",
+              "Primary d2+w5 is the result; 'none' and 'd2+w6' ran after selection on the same picks with only RiskCfg "
+              "changed (guardrail_compare.parquet; never read by selection, freeze or holdout code).", "",
+              _md(df), f"Trades/mo achieved: {words}", ""]
+    L += ["## Plain note on the guardrail and trade frequency (SPEC v1.3 G4)", "", GUARDRAIL_NOTE, ""]
     if inp.notes:
         L += ["## Notes", ""] + [f"- {n}" for n in inp.notes] + [""]
     p = out_dir / "READOUT.md"

@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from research.intraday_sr.harness.config import Fold
+from research.intraday_sr.harness.config import PRIMARY_LABEL, Fold
 
 CT = ZoneInfo("America/Chicago")
 DEV_START, DEV_END = date(2019, 1, 2), date(2026, 3, 31)
@@ -34,6 +34,14 @@ class HoldoutRefused(RuntimeError):
     pass
 
 
+def _window_starts() -> frozenset:
+    out = {TRADE_FROM, HOLDOUT_START}
+    for k, q in enumerate(pd.period_range("2020Q1", "2026Q1", freq="Q"), start=1):
+        out.add(q.start_time.date())
+        out.add(max((q.start_time - pd.DateOffset(months=12)).date(), DEV_START))
+    return frozenset(out)
+
+
 def make_folds() -> list[Fold]:
     """25 folds: test quarters 2020Q1 .. 2026Q1, train = the 12 months before."""
     out = []
@@ -42,6 +50,16 @@ def make_folds() -> list[Fold]:
         tr0 = (q.start_time - pd.DateOffset(months=12)).date()
         out.append(Fold(k, max(tr0, DEV_START), (q.start_time - pd.Timedelta(days=1)).date(), ts, te, TRADE_FROM))
     return out
+
+
+class ComparisonConfigInSelection(RuntimeError):
+    """SPEC v1.3 G2/G8: selection, finalists, freeze and the holdout read only the primary configuration."""
+
+
+def _assert_primary(runs: Mapping[str, "VariantRun"]) -> None:
+    bad = sorted({r.config for r in runs.values() if r.config != PRIMARY_LABEL})
+    if bad:
+        raise ComparisonConfigInSelection(f"selection received non-primary runs {bad}; only {PRIMARY_LABEL} allowed")
 
 
 @dataclass
@@ -53,6 +71,7 @@ class VariantRun:
     daily: pd.Series
     status: str = "ok"
     error: str = ""
+    config: str = PRIMARY_LABEL          # guardrail label of the RiskCfg used; selection accepts only the primary
 
 
 def _win(df: pd.DataFrame, a: date, b: date) -> pd.DataFrame:
@@ -68,6 +87,7 @@ def _swin(s: pd.Series, a: date, b: date) -> pd.Series:
 
 
 def select(runs: Mapping[str, VariantRun], a: date, b: date) -> tuple[Optional[str], dict]:
+    _assert_primary(runs)
     cands = []
     for vid, run in runs.items():
         if run.status != "ok":
@@ -92,6 +112,7 @@ class WFResult:
 
 
 def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = None) -> WFResult:
+    _assert_primary(runs)
     folds = list(folds or make_folds())
     picks, tparts, dparts, rows = [], [], [], []
     for f in folds:
@@ -122,6 +143,7 @@ def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = 
 
 
 def finalists(runs: Mapping[str, VariantRun], fold_table: pd.DataFrame) -> dict:
+    _assert_primary(runs)
     proc, info = select(runs, *FINALIST_RESELECT)
     out = {"procedure": {"variant": proc, "window": [d.isoformat() for d in FINALIST_RESELECT], **info}}
     if len(fold_table):
@@ -146,10 +168,12 @@ def sha256_file(path: Path) -> str:
 
 
 def write_freeze(path: Path, finalists_by_test: dict, triallog_path: Path, git_sha: str, grid_sha: str,
-                 spec_version: str) -> str:
+                 spec_version: str, config: str = PRIMARY_LABEL) -> str:
+    if config != PRIMARY_LABEL:
+        raise ComparisonConfigInSelection(f"FREEZE must use the primary configuration {PRIMARY_LABEL}, got {config}")
     lines = ["# FREEZE: intraday S/R finalists (written before the holdout)", "",
              f"- Written: {datetime.now(CT).isoformat(timespec='seconds')}",
-             f"- Spec version: {spec_version}", f"- Grid sha256: `{grid_sha}`", f"- Git sha: `{git_sha}`",
+             f"- Spec version: {spec_version}", f"- Configuration: {PRIMARY_LABEL} (primary loss guardrail, G1)", f"- Grid sha256: `{grid_sha}`", f"- Git sha: `{git_sha}`",
              f"- Trial log: `{triallog_path}` sha256 `{sha256_file(triallog_path)}`", "",
              "```json", json.dumps(finalists_by_test, indent=1, default=str), "```", ""]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -173,3 +197,9 @@ def run_holdout(freeze_path: Path, lock_path: Path, symbols_complete: Sequence[s
         fh.write(json.dumps({"opened_at_ct": datetime.now(CT).isoformat(timespec="seconds"),
                              "freeze_sha256": sha256_file(freeze_path)}))
     return scorer(finalists_by_test)
+
+
+# G3.10: the week loss counter restarts at every simulated window start (fold train/test starts, trading start,
+# holdout start). Days are not affected (the day counter resets every session anyway). Dates that are not
+# sessions are matched against the first session on/after them by the simulator.
+WINDOW_STARTS = _window_starts()
