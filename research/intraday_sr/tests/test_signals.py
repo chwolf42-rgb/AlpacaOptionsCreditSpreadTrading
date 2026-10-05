@@ -156,7 +156,11 @@ def test_funnel_counts_cover_touch_hold_arm_and_emit():
     funnel = signals_funnel(bars, start, end, cfg, sig)
     assert funnel.emits == len(list(signals(bars, start, end, cfg, sig)))
     assert funnel.emits >= 1
-    assert funnel.touches >= funnel.holds >= funnel.arms >= funnel.k_confirm_pass >= funnel.emits
+    assert funnel.touches >= funnel.holds >= funnel.arms >= funnel.k_confirm_pass
+    # A zone can be absent on the touch bar and present on the arm bar, so
+    # the forward tally is not a ceiling on emits. This variant is 1R.
+    assert funnel.build_fail_no_ahead_zone == 0
+    assert funnel.build_fail_zone_lt_1R == 0
 
 
 def _arm_zone(**overrides) -> Zone:
