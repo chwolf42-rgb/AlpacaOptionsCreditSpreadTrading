@@ -383,6 +383,14 @@ frequency (the combination stage).
 | P6 | Dev 2 | crypto: limiter allow-list, UTC calendar, off-hours pull, cost gate (approved 2026-10-04; runs before any crypto grid) | **CP-P5** reviews the gate; kill or continue |
 | P7 | Dev 2 + Dev 1 | crypto grid (+ ported layers) → freeze → holdout screen | **CP-P6 review** |
 | P8 | Dev 1 | forward holdout harness (approved 2026-10-04; shadow scoring under d2+w5, §6.5), pulls ≤ 30 req/min weekdays 08:15–15:15 CT and ≤ 60/min otherwise | limiter settings reviewed before the first market-hours pull; read at ≥ 100 trades and ≥ 3 months; **CP-P7 final review** |
+## 9. Parked: measured-move target (untested, not in any grid)
+
+CP0 (spec v1.3.1) removed `Formation.measured_move`. Section 5 targets are 1R, 2R, and `zone` only.
+A measured-move price taken from the neckline at the break mixes the pattern height with a later price,
+and adding it as a target would be a new spec version and new trials. It is parked here as an idea only.
+Nothing in phase 1 or phase 2 reads it, scores it, or logs it. `Formation.extreme` is the pattern low or
+high derived from the pivots, and that is what the stop uses.
+
 - Order: P0, then P1 ∥ P1', then P2 ∥ P2', then P3. Dev 2 starts P6 once P2 lands, so crypto data is ready by
   CP-P2 without delaying equity.
 - At every CP the Architect checks: guard coverage of the new features, OR/VWAP/gap availability times,

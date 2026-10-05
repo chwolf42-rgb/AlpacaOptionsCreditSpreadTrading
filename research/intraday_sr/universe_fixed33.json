@@ -1,0 +1,242 @@
+{
+ "name": "sr_fixed33",
+ "asof_session": "2018-12-31",
+ "rule": "Rank PIT S&P 500 members on 2018-12-31 by 60-session median dollar volume. Rule (pre-declared): 1. Candidates: panel columns that are PIT S&P 500 members on 2018-12-31 (panel.member), excluding ETFs, SPY and ~old columns. 2. Score: 60-session median dollar volume through 2018-12-31 (known at that close, so no lookahead into 2019+). 3. The #39 $5 raw-price screen is NOT applied: on this adjustment=all tape raw_close is split-adjusted (NVDA shows $3.30 vs ~$133 real), so it would drop names wrongly. All candidates clear the $50M volume floor. 4. Keep names still tradable on Alpaca with data through 2026-09 (an active, tradable asset with daily bars in Sep 2026). Ticker changes are followed (FB -> META). This is a deliberate survivorship filter requested for a live-tradable universe; it is the one known bias. 5. One share class per company (GOOGL kept, GOOG dropped). 6. Take the top 30, then add SPY, QQQ, IWM.",
+ "symbols": [
+  "SPY",
+  "QQQ",
+  "IWM",
+  "AMZN",
+  "AAPL",
+  "MSFT",
+  "NFLX",
+  "META",
+  "NVDA",
+  "GOOGL",
+  "AMD",
+  "BAC",
+  "V",
+  "JPM",
+  "BA",
+  "INTC",
+  "MU",
+  "BRK.B",
+  "ADBE",
+  "WFC",
+  "CSCO",
+  "C",
+  "MA",
+  "JNJ",
+  "CRM",
+  "HD",
+  "XOM",
+  "UNH",
+  "DIS",
+  "ORCL",
+  "PG",
+  "WMT",
+  "MRK"
+ ],
+ "index_etfs": [
+  "SPY",
+  "QQQ",
+  "IWM"
+ ],
+ "stocks_ranked": [
+  {
+   "rank": 1,
+   "pit_symbol": "AMZN",
+   "alpaca_symbol": "AMZN",
+   "median_dollar_volume_60d_usd": 12149921854
+  },
+  {
+   "rank": 2,
+   "pit_symbol": "AAPL",
+   "alpaca_symbol": "AAPL",
+   "median_dollar_volume_60d_usd": 7641328864
+  },
+  {
+   "rank": 3,
+   "pit_symbol": "MSFT",
+   "alpaca_symbol": "MSFT",
+   "median_dollar_volume_60d_usd": 4169502356
+  },
+  {
+   "rank": 4,
+   "pit_symbol": "NFLX",
+   "alpaca_symbol": "NFLX",
+   "median_dollar_volume_60d_usd": 3808212379
+  },
+  {
+   "rank": 5,
+   "pit_symbol": "FB",
+   "alpaca_symbol": "META",
+   "median_dollar_volume_60d_usd": 3722848134
+  },
+  {
+   "rank": 6,
+   "pit_symbol": "NVDA",
+   "alpaca_symbol": "NVDA",
+   "median_dollar_volume_60d_usd": 2806519505
+  },
+  {
+   "rank": 7,
+   "pit_symbol": "GOOGL",
+   "alpaca_symbol": "GOOGL",
+   "median_dollar_volume_60d_usd": 2482198413
+  },
+  {
+   "rank": 8,
+   "pit_symbol": "AMD",
+   "alpaca_symbol": "AMD",
+   "median_dollar_volume_60d_usd": 2162210019
+  },
+  {
+   "rank": 9,
+   "pit_symbol": "BAC",
+   "alpaca_symbol": "BAC",
+   "median_dollar_volume_60d_usd": 1783955067
+  },
+  {
+   "rank": 10,
+   "pit_symbol": "V",
+   "alpaca_symbol": "V",
+   "median_dollar_volume_60d_usd": 1681767623
+  },
+  {
+   "rank": 11,
+   "pit_symbol": "JPM",
+   "alpaca_symbol": "JPM",
+   "median_dollar_volume_60d_usd": 1672789130
+  },
+  {
+   "rank": 12,
+   "pit_symbol": "BA",
+   "alpaca_symbol": "BA",
+   "median_dollar_volume_60d_usd": 1502742790
+  },
+  {
+   "rank": 13,
+   "pit_symbol": "INTC",
+   "alpaca_symbol": "INTC",
+   "median_dollar_volume_60d_usd": 1301111291
+  },
+  {
+   "rank": 14,
+   "pit_symbol": "MU",
+   "alpaca_symbol": "MU",
+   "median_dollar_volume_60d_usd": 1213434227
+  },
+  {
+   "rank": 15,
+   "pit_symbol": "BRK.B",
+   "alpaca_symbol": "BRK.B",
+   "median_dollar_volume_60d_usd": 1149348377
+  },
+  {
+   "rank": 16,
+   "pit_symbol": "ADBE",
+   "alpaca_symbol": "ADBE",
+   "median_dollar_volume_60d_usd": 1125368613
+  },
+  {
+   "rank": 17,
+   "pit_symbol": "WFC",
+   "alpaca_symbol": "WFC",
+   "median_dollar_volume_60d_usd": 1067483465
+  },
+  {
+   "rank": 18,
+   "pit_symbol": "CSCO",
+   "alpaca_symbol": "CSCO",
+   "median_dollar_volume_60d_usd": 1048829927
+  },
+  {
+   "rank": 19,
+   "pit_symbol": "C",
+   "alpaca_symbol": "C",
+   "median_dollar_volume_60d_usd": 1026398879
+  },
+  {
+   "rank": 20,
+   "pit_symbol": "MA",
+   "alpaca_symbol": "MA",
+   "median_dollar_volume_60d_usd": 1025166223
+  },
+  {
+   "rank": 21,
+   "pit_symbol": "JNJ",
+   "alpaca_symbol": "JNJ",
+   "median_dollar_volume_60d_usd": 1004141465
+  },
+  {
+   "rank": 22,
+   "pit_symbol": "CRM",
+   "alpaca_symbol": "CRM",
+   "median_dollar_volume_60d_usd": 971062311
+  },
+  {
+   "rank": 23,
+   "pit_symbol": "HD",
+   "alpaca_symbol": "HD",
+   "median_dollar_volume_60d_usd": 957442980
+  },
+  {
+   "rank": 24,
+   "pit_symbol": "XOM",
+   "alpaca_symbol": "XOM",
+   "median_dollar_volume_60d_usd": 947487967
+  },
+  {
+   "rank": 25,
+   "pit_symbol": "UNH",
+   "alpaca_symbol": "UNH",
+   "median_dollar_volume_60d_usd": 946587076
+  },
+  {
+   "rank": 26,
+   "pit_symbol": "DIS",
+   "alpaca_symbol": "DIS",
+   "median_dollar_volume_60d_usd": 935679890
+  },
+  {
+   "rank": 27,
+   "pit_symbol": "ORCL",
+   "alpaca_symbol": "ORCL",
+   "median_dollar_volume_60d_usd": 910517363
+  },
+  {
+   "rank": 28,
+   "pit_symbol": "PG",
+   "alpaca_symbol": "PG",
+   "median_dollar_volume_60d_usd": 892299787
+  },
+  {
+   "rank": 29,
+   "pit_symbol": "WMT",
+   "alpaca_symbol": "WMT",
+   "median_dollar_volume_60d_usd": 877932587
+  },
+  {
+   "rank": 30,
+   "pit_symbol": "MRK",
+   "alpaca_symbol": "MRK",
+   "median_dollar_volume_60d_usd": 865909605
+  }
+ ],
+ "skipped_above_cutoff": [
+  {
+   "symbol": "GOOG",
+   "reason": "second share class"
+  }
+ ],
+ "bars": {
+  "timeframe": "5Min",
+  "session": "regular hours only, 09:30-16:00 ET (bar start < 16:00)",
+  "start": "2019-01-01T00:00:00Z",
+  "end": "2026-10-01T00:00:00Z",
+  "feed": "sip",
+  "adjustment": "all",
+  "derived": "15Min built from 5Min (research/intraday_lab/resample.py)"
+ }
+}

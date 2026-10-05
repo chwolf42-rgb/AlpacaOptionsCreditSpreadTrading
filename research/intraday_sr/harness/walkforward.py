@@ -285,46 +285,31 @@ def write_freeze(path: Path, finalists_by_test: dict, ledger, git_sha: str, grid
     return sha256_file(path)
 
 
-HOLDOUT_TOKEN_MODULES = ("research.intraday_sr.data.holdout", "research.intraday_sr.data.cache",
-                         "research.intraday_sr.data")
-
-
-def holdout_token_cls():
-    """Developer 2's HoldoutToken (D2-1 PR stacked on #20; SPEC v1.3.1 C2). Loud refusal if it has not landed."""
-    import importlib
-    for m in HOLDOUT_TOKEN_MODULES:
-        try:
-            cls = getattr(importlib.import_module(m), "HoldoutToken", None)
-        except ImportError:
-            continue
-        if cls is not None:
-            return cls
-    raise HoldoutRefused("HoldoutToken not available (D2-1 data layer not merged); the holdout cannot be loaded")
-
-
 def run_holdout(freeze_path: Path, lock_path: Path, symbols_complete: Sequence[str],
-                scorer: Callable[[dict, object], dict], finalists_by_test: dict, token_cls=None) -> dict:
+                scorer: Callable[[dict, object], dict], finalists_by_test: dict) -> dict:
     """Opens the holdout exactly once and is the ONLY place that constructs a HoldoutToken (SPEC v1.3.1 C2).
-    Refuses without FREEZE.md, with < 33 complete symbols, if holdout.lock exists (a second opening is a protocol
-    breach) or if the token type is unavailable (checked BEFORE the lock is created). Then creates holdout.lock,
-    constructs the token (which itself checks FREEZE) and calls scorer(finalists_by_test, token); the scorer passes
-    the token to the data loaders, whose default end is 2026-03-31."""
+
+    Refuses without FREEZE.md, with < 33 complete symbols, or if holdout.lock exists (a second opening is a protocol
+    breach). Then creates holdout.lock, builds the token via HoldoutToken._from_freeze (caller-name gated to this
+    function) and calls scorer(finalists_by_test, token). Loaders default to end=2026-03-31 and require the token
+    for any bar on or after 2026-04-01.
+    """
+    from research.intraday_sr.data.holdout import HoldoutLocked, HoldoutToken
     freeze_path, lock_path = Path(freeze_path), Path(lock_path)
-    if not freeze_path.exists():
+    if not freeze_path.is_file():
         raise HoldoutRefused("FREEZE.md missing")
     if len(set(symbols_complete)) < N_SYMBOLS_REQUIRED:
         raise HoldoutRefused(f"only {len(set(symbols_complete))} of {N_SYMBOLS_REQUIRED} symbols complete")
     if lock_path.exists():
         raise HoldoutRefused(f"holdout.lock exists ({lock_path.read_text()[:200]}); a second opening is a protocol breach")
-    token_cls = token_cls or holdout_token_cls()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "x") as fh:            # atomic create; races also refuse
         fh.write(json.dumps({"opened_at_ct": datetime.now(CT).isoformat(timespec="seconds"),
                              "freeze_sha256": sha256_file(freeze_path)}))
     try:
-        token = token_cls(freeze_path=freeze_path)
-    except TypeError:
-        token = token_cls(freeze_path)
+        token = HoldoutToken._from_freeze(freeze_path)   # must be called from run_holdout (D2-1 gate)
+    except HoldoutLocked as e:
+        raise HoldoutRefused(str(e)) from e
     return scorer(finalists_by_test, token)
 
 
