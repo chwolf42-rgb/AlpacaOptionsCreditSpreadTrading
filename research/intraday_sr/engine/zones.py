@@ -18,7 +18,8 @@ import pandas as pd
 from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.engine.levels import _atr_from_segments, _segments, levels_at
 from research.intraday_sr.engine.tape import floor_15m, session_day
-from research.intraday_sr.types import BarSet, EngineCfg, Level, Zone
+from research.intraday_sr.engine.zone_cache import cached_zones, tape_token, zone_cfg_token
+from research.intraday_sr.types import BarSet, EngineCfg, Level, Zone, as_et
 
 
 def fast_zones(
@@ -175,6 +176,12 @@ def zones_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Zone]:
     visible = prices_as_of(bars.visible(as_of), as_of)
     if visible.empty or "symbol" not in visible.columns:
         return []
+    stamp_key = as_et(as_of, "as_of")
+    key = (tape_token(visible), stamp_key, zone_cfg_token(cfg))
+    return cached_zones(key, lambda: _zones_at_frame(visible, stamp_key, cfg))
+
+
+def _zones_at_frame(visible: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Zone]:
     current = session_day(visible["session"].iloc[-1])
     stamp = floor_15m(as_of, current)
     if stamp is None or stamp > as_of:

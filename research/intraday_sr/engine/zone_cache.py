@@ -98,6 +98,18 @@ def level_cfg_token(cfg: EngineCfg) -> str:
     return _token(cfg, skip=_NOT_ZONE_SIDE | _ZONE_ONLY)
 
 
+def _epoch_ns_array(stamps: pd.Series) -> np.ndarray:
+    """UTC nanoseconds without walking Python datetime objects."""
+    values = stamps
+    dtype = values.dtype
+    if not (isinstance(dtype, pd.DatetimeTZDtype) or pd.api.types.is_datetime64_dtype(dtype)):
+        values = pd.to_datetime(values)
+        dtype = values.dtype
+    unit = str(getattr(dtype, "unit", "ns"))
+    scale = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}[unit]
+    return values.astype("int64").to_numpy(dtype=np.int64) * np.int64(scale)
+
+
 def tape_token(frame: pd.DataFrame) -> str:
     """Content hash of one symbol's visible bars."""
     digest = hashlib.sha256()
@@ -108,8 +120,7 @@ def tape_token(frame: pd.DataFrame) -> str:
         values = np.ascontiguousarray(frame[column].to_numpy(dtype=np.float64))
         digest.update(values.tobytes())
     if "available_at" in frame.columns and len(frame):
-        stamps = pd.to_datetime(frame["available_at"]).astype("int64").to_numpy()
-        digest.update(np.ascontiguousarray(stamps).tobytes())
+        digest.update(np.ascontiguousarray(_epoch_ns_array(frame["available_at"])).tobytes())
     return digest.hexdigest()
 
 
@@ -133,10 +144,65 @@ def cached_zones(key: tuple, build):
     return zones
 
 
+def prefix_hashes(frame: pd.DataFrame) -> np.ndarray:
+    """Running FNV-1a of each prefix, so a later as-of can reuse an earlier stamp.
+
+    The mix is the same columns as ``tape_token`` (open, high, low, close,
+    volume, available_at). Two prefixes with the same bars share a hash, which
+    is what a truncated tape and ``visible(as_of)`` are.
+    """
+    n = len(frame)
+    out = np.empty(n, dtype=np.uint64)
+    if n == 0:
+        return out
+    mixed = np.zeros(n, dtype=np.uint64)
+    for name in ("open", "high", "low", "close", "volume"):
+        if name not in frame.columns:
+            continue
+        values = np.ascontiguousarray(frame[name].to_numpy(dtype=np.float64))
+        mixed ^= values.view(np.uint64)
+    if "available_at" in frame.columns:
+        mixed ^= np.ascontiguousarray(_epoch_ns_array(frame["available_at"])).view(np.uint64)
+    state = 14695981039346656037
+    prime = 1099511628211
+    mask = (1 << 64) - 1
+    for index in range(n):
+        state = ((state ^ int(mixed[index])) * prime) & mask
+        out[index] = state
+    return out
+
+
+_SIGNALS: OrderedDict[tuple, tuple] = OrderedDict()
+
+
+def cached_signals(key: tuple) -> list | None:
+    """Return a stored signal list, or None on a miss."""
+    found = _SIGNALS.get(key)
+    if found is None:
+        return None
+    _SIGNALS.move_to_end(key)
+    return list(found)
+
+
+def store_signals(key: tuple, signals: list) -> None:
+    _remember(_SIGNALS, key, tuple(signals))
+
+
+_EXTRA_CLEARS: list = []
+
+
+def register_cache_clear(fn) -> None:
+    """Let another module drop its own snapshots when the zone cache is cleared."""
+    _EXTRA_CLEARS.append(fn)
+
+
 def clear_zone_cache() -> None:
     """Drop every cached snapshot. Tests use this so cases do not share tapes."""
     _ZONES.clear()
     _LEVELS.clear()
+    _SIGNALS.clear()
+    for fn in _EXTRA_CLEARS:
+        fn()
 
 
 def _token(cfg: EngineCfg, *, skip: frozenset[str]) -> str:

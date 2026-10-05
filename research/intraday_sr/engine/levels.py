@@ -15,8 +15,16 @@ import numpy as np
 import pandas as pd
 
 from research.intraday_sr.data.badprint import prices_as_of
-from research.intraday_sr.engine.tape import at_time, session_day
-from research.intraday_sr.types import ET, BarSet, EngineCfg, Level
+from research.intraday_sr.engine.tape import at_time, minute_of_day, session_day
+from research.intraday_sr.engine.zone_cache import (
+    _epoch_ns_array,
+    cached_levels,
+    level_cfg_token,
+    prefix_hashes,
+    register_cache_clear,
+    tape_token,
+)
+from research.intraday_sr.types import ET, BarSet, EngineCfg, Level, as_et
 
 
 def _strict_mask(values: np.ndarray, n: int, *, high: bool) -> np.ndarray:
@@ -38,14 +46,54 @@ def _strict_mask(values: np.ndarray, n: int, *, high: bool) -> np.ndarray:
     return ok
 
 
+_TF_CACHE: dict[tuple, pd.DataFrame | None] = {}
+_TF_PARENT: dict[tuple, dict] = {}
+
+
+def _clear_tf_cache() -> None:
+    _TF_CACHE.clear()
+    _TF_PARENT.clear()
+
+
+register_cache_clear(_clear_tf_cache)
+
+
 def timeframe_frame(group: pd.DataFrame, tf: str) -> pd.DataFrame | None:
-    """Closed ``tf`` bars for the signal stack. ``5m`` returns ``group``."""
+    """Closed ``tf`` bars for the signal stack. ``5m`` returns ``group``.
+
+    A prefix of a tape already resampled is the closed buckets whose
+    ``available_at`` is still inside that prefix.
+    """
     if tf == "5m":
         return group
-    built = _bucket_table(group, tf, full=True)
-    if built is None or not built["high"]:
+    if group is None or group.empty:
         return None
-    return pd.DataFrame(built)
+    hashes = prefix_hashes(group)
+    symbol = str(group["symbol"].iloc[0]) if "symbol" in group.columns else ""
+    key = (tf, symbol, int(hashes[-1]))
+    if key in _TF_CACHE:
+        return _TF_CACHE[key]
+    parent = _TF_PARENT.get((tf, symbol))
+    if (
+        parent is not None
+        and len(hashes) <= len(parent["hashes"])
+        and int(parent["hashes"][len(hashes) - 1]) == key[2]
+    ):
+        end_ns = np.int64(pd.Timestamp(_as_dt(group["available_at"].iloc[-1])).value)
+        full = parent["frame"]
+        sliced = full.loc[parent["avail_ns"] <= end_ns].reset_index(drop=True)
+        _TF_CACHE[key] = sliced
+        return sliced
+    built = _bucket_table(group, tf, full=True)
+    frame = None if built is None or not built["high"] else pd.DataFrame(built)
+    _TF_CACHE[key] = frame
+    if frame is not None and (parent is None or len(hashes) >= len(parent["hashes"])):
+        _TF_PARENT[(tf, symbol)] = {
+            "hashes": hashes,
+            "frame": frame,
+            "avail_ns": _epoch_ns(frame["available_at"]),
+        }
+    return frame
 
 
 def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
@@ -53,6 +101,12 @@ def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
     frame = prices_as_of(bars.visible(as_of), as_of)
     if frame.empty or "symbol" not in frame.columns:
         return []
+    stamp = as_et(as_of, "as_of")
+    key = (tape_token(frame), stamp, level_cfg_token(cfg))
+    return cached_levels(key, lambda: _levels_from_frame(frame, stamp, cfg))
+
+
+def _levels_from_frame(frame: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Level]:
     found: list[Level] = []
     for symbol, group in frame.groupby("symbol", sort=True):
         group = group.sort_values("ts")
@@ -67,7 +121,21 @@ def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
 
 def _symbol_levels(symbol: str, group: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Level]:
     pivots, prices = _pivot_tape(symbol, group, cfg)
-    return _levels_at_stamp(symbol, group, pivots, prices, as_of, cfg)
+    return _levels_at_stamp(
+        symbol, group, pivots, prices, as_of, cfg, opening=_opening_range_table(group)
+    )
+
+
+_PIVOTS: dict[tuple, tuple[list[Level], np.ndarray]] = {}
+_PIVOT_PARENT: dict[tuple, dict] = {}
+
+
+def _clear_pivot_cache() -> None:
+    _PIVOTS.clear()
+    _PIVOT_PARENT.clear()
+
+
+register_cache_clear(_clear_pivot_cache)
 
 
 def _pivot_tape(
@@ -76,8 +144,36 @@ def _pivot_tape(
     """Pivots on the whole tape. ``available_at`` is the confirmation close.
 
     A later stamp keeps a pivot only when that confirmation is already in
-    the past, so this list can be built once and sliced per 15m close.
+    the past. A shorter tape that is a prefix of one already built is a
+    slice of that list: future bars do not change a pivot whose confirming
+    bar has already closed.
     """
+    if group.empty:
+        return [], np.empty(0, dtype=np.float64)
+    hashes = prefix_hashes(group)
+    key = int(hashes[-1])
+    cfg_key = (symbol, level_cfg_token(cfg))
+    cache_key = (cfg_key, key)
+    found = _PIVOTS.get(cache_key)
+    if found is not None:
+        return found
+    parent = _PIVOT_PARENT.get(cfg_key)
+    if parent is not None and len(hashes) <= len(parent["hashes"]) and int(parent["hashes"][len(hashes) - 1]) == key:
+        end = _as_dt(group["available_at"].iloc[-1])
+        cut = bisect.bisect_right(parent["pivots"], end, key=lambda level: level.available_at)
+        sliced = (parent["pivots"][:cut], parent["prices"][:cut])
+        _PIVOTS[cache_key] = sliced
+        return sliced
+    pivots, prices = _pivot_tape_build(symbol, group, cfg)
+    _PIVOTS[cache_key] = (pivots, prices)
+    if parent is None or len(hashes) >= len(parent["hashes"]):
+        _PIVOT_PARENT[cfg_key] = {"hashes": hashes, "pivots": pivots, "prices": prices}
+    return pivots, prices
+
+
+def _pivot_tape_build(
+    symbol: str, group: pd.DataFrame, cfg: EngineCfg
+) -> tuple[list[Level], np.ndarray]:
     found: list[Level] = []
     found.extend(_pivot_levels(symbol, group, "5m", int(cfg.n_5m)))
     found.extend(_higher_pivots(symbol, group, cfg))
@@ -93,6 +189,7 @@ def _levels_at_stamp(
     prices: np.ndarray,
     as_of: datetime,
     cfg: EngineCfg,
+    opening: dict | None = None,
 ) -> list[Level]:
     """Candidates at ``as_of`` from bars closed by ``as_of``.
 
@@ -116,7 +213,9 @@ def _levels_at_stamp(
     today = prefix.iloc[int(start) : int(stop)]
     levels: list[Level] = list(chosen)
     levels.extend(_prior_day(symbol, segments, as_of))
-    levels.extend(_opening_range(symbol, today, as_of))
+    if opening is None:
+        opening = _opening_range_table(today)
+    levels.extend(_opening_range_at(symbol, segments[-1][0], as_of, opening))
     vwap = _session_vwap(symbol, today)
     if vwap is not None:
         levels.append(vwap)
@@ -211,9 +310,7 @@ def _bucket_table(group: pd.DataFrame, tf: str, *, full: bool) -> dict | None:
 
 
 def _all_buckets(group: pd.DataFrame, *, full: bool) -> dict[str, dict]:
-    """One 5m walk. 15m and 1h need their closing bar. 1d needs the session close."""
-    from datetime import timedelta
-
+    """One numpy pass per session. 15m and 1h need their closing bar. 1d needs the session close."""
     from research.intraday_sr.data.calendar import session_close, session_open
 
     empty = {"high": [], "low": [], "ts": [], "available_at": []}
@@ -227,8 +324,8 @@ def _all_buckets(group: pd.DataFrame, *, full: bool) -> dict[str, dict]:
     changes = np.flatnonzero(np.diff(codes)) + 1
     starts = np.concatenate(([0], changes))
     ends = np.concatenate((changes, [len(codes)]))
-    ts = [_as_dt(value) for value in group["ts"]]
-    av = [_as_dt(value) for value in group["available_at"]]
+    ts_ns = _epoch_ns(group["ts"])
+    av_ns = _epoch_ns(group["available_at"])
     high = group["high"].to_numpy(dtype=np.float64)
     low = group["low"].to_numpy(dtype=np.float64)
     open_ = group["open"].to_numpy(dtype=np.float64) if full else None
@@ -237,49 +334,94 @@ def _all_buckets(group: pd.DataFrame, *, full: bool) -> dict[str, dict]:
     vwap = group["vwap"].to_numpy(dtype=np.float64) if full and "vwap" in group.columns else close
     symbol = group["symbol"].iloc[0] if full and "symbol" in group.columns else ""
     factor = float(group["adj_factor"].iloc[0]) if full and "adj_factor" in group.columns else 1.0
-    width_15 = timedelta(minutes=15)
-    width_1h = timedelta(hours=1)
-    half_hour = timedelta(minutes=30)
+    width_15 = np.int64(15 * 60 * 1_000_000_000)
+    width_1h = np.int64(60 * 60 * 1_000_000_000)
+    half_hour = np.int64(30 * 60 * 1_000_000_000)
     for start, stop, session in zip(starts, ends, uniques):
         day_key = session_day(session)
         open_at = session_open(day_key)
         close_at = session_close(day_key)
         if open_at is None or close_at is None:
             continue
-        buckets_15: dict[datetime, list[int]] = {}
-        buckets_1h: dict[datetime, list[int]] = {}
-        closed = False
-        day_members: list[int] = []
-        for index in range(int(start), int(stop)):
-            opened = ts[index]
-            if opened < open_at or av[index] > close_at:
-                continue
-            day_members.append(index)
-            if av[index] == close_at:
-                closed = True
-            step_15 = int((opened - open_at) // width_15)
-            buckets_15.setdefault(open_at + step_15 * width_15, []).append(index)
-            if opened >= close_at - half_hour:
-                buckets_1h.setdefault(close_at - half_hour, []).append(index)
-            else:
-                step_h = int((opened - open_at) // width_1h)
-                buckets_1h.setdefault(open_at + step_h * width_1h, []).append(index)
-        _emit_closed(built["15m"], buckets_15, width_15, close_at, high, low, av, open_, close, volume, vwap, symbol, day_key, factor, full)
-        _emit_closed(built["1h"], buckets_1h, width_1h, close_at, high, low, av, open_, close, volume, vwap, symbol, day_key, factor, full)
-        if closed and day_members:
-            _store_members(built["1d"], day_members, open_at, close_at, high, low, open_, close, volume, vwap, symbol, day_key, factor, full)
+        open_ns = np.int64(pd.Timestamp(open_at).value)
+        close_ns = np.int64(pd.Timestamp(close_at).value)
+        opened = ts_ns[int(start) : int(stop)]
+        available = av_ns[int(start) : int(stop)]
+        keep = (opened >= open_ns) & (available <= close_ns)
+        if not keep.any():
+            continue
+        local = np.flatnonzero(keep)
+        idx = local + int(start)
+        opened = opened[keep]
+        available = available[keep]
+        step_15 = (opened - open_ns) // width_15
+        _emit_step_buckets(
+            built["15m"], idx, step_15, open_ns, width_15, close_ns, available,
+            high, low, open_, close, volume, vwap, symbol, day_key, factor, full,
+        )
+        step_h = (opened - open_ns) // width_1h
+        bucket_h = open_ns + step_h * width_1h
+        last_start = close_ns - half_hour
+        bucket_h = np.where(opened >= last_start, last_start, bucket_h)
+        _emit_start_buckets(
+            built["1h"], idx, bucket_h, width_1h, close_ns, available,
+            high, low, open_, close, volume, vwap, symbol, day_key, factor, full,
+        )
+        if np.any(available == close_ns):
+            _store_members(
+                built["1d"], idx, open_at, close_at, high, low, open_, close, volume, vwap, symbol, day_key, factor, full
+            )
     return built
 
 
-def _emit_closed(bucket, groups, width, close_at, high, low, available, open_, close, volume, vwap, symbol, day, factor, full) -> None:
-    for key in sorted(groups):
-        end = key + width
-        if end > close_at:
-            end = close_at
-        members = groups[key]
-        if not any(available[index] == end for index in members):
+def _emit_step_buckets(bucket, idx, step, origin_ns, width_ns, close_ns, available, high, low, open_, close, volume, vwap, symbol, day, factor, full) -> None:
+    """Buckets whose start is ``origin + step * width``, capped at the session close."""
+    if step.size == 0:
+        return
+    order = np.argsort(step, kind="mergesort")
+    step = step[order]
+    idx = idx[order]
+    available = available[order]
+    _emit_grouped(bucket, idx, step, available, origin_ns, width_ns, close_ns, True, high, low, open_, close, volume, vwap, symbol, day, factor, full)
+
+
+def _emit_start_buckets(bucket, idx, start_ns, width_ns, close_ns, available, high, low, open_, close, volume, vwap, symbol, day, factor, full) -> None:
+    """Buckets already addressed by absolute start time (the last half-hour shares one key)."""
+    if start_ns.size == 0:
+        return
+    order = np.argsort(start_ns, kind="mergesort")
+    start_ns = start_ns[order]
+    idx = idx[order]
+    available = available[order]
+    _emit_grouped(bucket, idx, start_ns, available, np.int64(0), width_ns, close_ns, False, high, low, open_, close, volume, vwap, symbol, day, factor, full)
+
+
+def _emit_grouped(bucket, idx, keys, available, origin_ns, width_ns, close_ns, from_step, high, low, open_, close, volume, vwap, symbol, day, factor, full) -> None:
+    uniq, first = np.unique(keys, return_index=True)
+    bounds = np.concatenate((first[1:], [len(keys)]))
+    for key, left, right in zip(uniq, first, bounds):
+        start_ns = origin_ns + np.int64(key) * width_ns if from_step else np.int64(key)
+        end_ns = start_ns + width_ns
+        if end_ns > close_ns:
+            end_ns = close_ns
+        if not np.any(available[left:right] == end_ns):
             continue
-        _store_members(bucket, members, key, end, high, low, open_, close, volume, vwap, symbol, day, factor, full)
+        _store_members(
+            bucket,
+            idx[left:right],
+            _from_ns(start_ns),
+            _from_ns(end_ns),
+            high, low, open_, close, volume, vwap, symbol, day, factor, full,
+        )
+
+
+def _epoch_ns(stamps: pd.Series) -> np.ndarray:
+    """UTC nanoseconds. Pandas 3 ``astype(int64)`` is the dtype unit, not always ns."""
+    return _epoch_ns_array(stamps)
+
+
+def _from_ns(stamp_ns: np.int64) -> datetime:
+    return datetime.fromtimestamp(int(stamp_ns) / 1_000_000_000, ET)
 
 
 def _store_members(bucket, members, start, end, high, low, open_, close, volume, vwap, symbol, day, factor, full) -> None:
@@ -328,35 +470,60 @@ def _prior_day(symbol: str, segments: list[tuple], as_of: datetime) -> list[Leve
     ]
 
 
-def _opening_range(symbol: str, group: pd.DataFrame, as_of: datetime) -> list[Level]:
-    current = session_day(group["session"].iloc[-1])
-    available = at_time(current, time(10, 0))
+def _opening_range_table(group: pd.DataFrame) -> dict:
+    """Session → (high, low) of the 09:30–10:00 window. One pass per tape.
+
+    Later stamps look the pair up. The window does not include the 10:00 bar,
+    and the levels themselves are withheld until that bar has closed.
+    """
+    if group.empty or "ts" not in group.columns or "session" not in group.columns:
+        return {}
+    minute = minute_of_day(group["ts"])
+    in_window = (minute >= 9 * 60 + 30) & (minute < 10 * 60)
+    if not in_window.any():
+        return {}
+    high = group["high"].to_numpy(dtype=np.float64)
+    low = group["low"].to_numpy(dtype=np.float64)
+    codes, uniques = pd.factorize(group["session"], sort=False)
+    changes = np.flatnonzero(np.diff(codes)) + 1
+    starts = np.concatenate(([0], changes))
+    ends = np.concatenate((changes, [len(codes)]))
+    table: dict = {}
+    for start, stop, session in zip(starts, ends, uniques):
+        sl = slice(int(start), int(stop))
+        mask = in_window[sl]
+        if not mask.any():
+            continue
+        table[session_day(session)] = (float(high[sl][mask].max()), float(low[sl][mask].min()))
+    return table
+
+
+def _opening_range_at(symbol: str, day, as_of: datetime, opening: dict) -> list[Level]:
+    available = at_time(day, time(10, 0))
     if available > as_of:
         return []
-    start = at_time(current, time(9, 30))
-    stamps = group["ts"]
-    window = group.loc[(stamps >= start) & (stamps < available)]
-    if window.empty:
+    pair = opening.get(day)
+    if pair is None:
         return []
+    high, low = pair
     return [
-        _level(symbol, "orh", float(window["high"].max()), available),
-        _level(symbol, "orl", float(window["low"].min()), available),
+        _level(symbol, "orh", high, available),
+        _level(symbol, "orl", low, available),
     ]
 
 
 def _session_vwap(symbol: str, group: pd.DataFrame) -> Level | None:
-    current = session_day(group["session"].iloc[-1])
-    today = group.loc[[session_day(value) == current for value in group["session"]]]
-    if today.empty:
+    """Running VWAP of ``group``. Callers pass the current session only."""
+    if group.empty:
         return None
-    volume = today["volume"].to_numpy(dtype=np.float64)
-    price = today["vwap"].to_numpy(dtype=np.float64) if "vwap" in today.columns else today["close"].to_numpy(dtype=np.float64)
+    volume = group["volume"].to_numpy(dtype=np.float64)
+    price = group["vwap"].to_numpy(dtype=np.float64) if "vwap" in group.columns else group["close"].to_numpy(dtype=np.float64)
     total = float(volume.sum())
     if total <= 0.0:
-        value = float(today["close"].iloc[-1])
+        value = float(group["close"].iloc[-1])
     else:
         value = float((price * volume).sum() / total)
-    return _level(symbol, "vwap", value, today["available_at"].iloc[-1])
+    return _level(symbol, "vwap", value, group["available_at"].iloc[-1])
 
 
 def _hvn(symbol: str, group: pd.DataFrame, segments: list[tuple], as_of: datetime, atr: float, cfg: EngineCfg) -> list[Level]:

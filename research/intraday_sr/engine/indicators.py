@@ -8,6 +8,7 @@ same recurrences run under ``njit`` and the engine uses those arrays.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 try:
     from numba import njit
@@ -58,24 +59,81 @@ def rvol(volume: np.ndarray, session: np.ndarray, slot: np.ndarray, lookback: in
 
     ``session`` and ``slot`` are integer codes. The current session is not
     in its own median. One row per session per slot is the expected shape.
+    A complete grid is a ``(session × slot)`` matrix and the median is one
+    rolling reduction down each column. A missing bar is dropped from that
+    slot's history rather than counted as a session, matching a per-slot walk.
     """
     vols = np.asarray(volume, dtype=np.float64)
     sessions = np.asarray(session)
     slots = np.asarray(slot)
-    out = np.full(len(vols), np.nan, dtype=np.float64)
-    if len(vols) == 0:
+    n = int(vols.shape[0])
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0 or lookback < 1:
         return out
-    for slot_value in np.unique(slots):
-        index = np.flatnonzero(slots == slot_value)
-        prior = vols[index]
-        for position, row in enumerate(index):
-            window = prior[max(0, position - lookback) : position]
-            if window.size == 0:
-                continue
-            median = float(np.median(window))
-            if median > 0.0 and np.isfinite(median):
-                out[row] = prior[position] / median
+    sess_code = _factorize(sessions)
+    slot_code = _factorize(slots)
+    n_sess = int(sess_code.max()) + 1
+    n_slot = int(slot_code.max()) + 1
+    flat = sess_code.astype(np.int64) * n_slot + slot_code.astype(np.int64)
+    complete = np.unique(flat).size == n and n == n_sess * n_slot
+    if complete:
+        matrix = np.empty((n_sess, n_slot), dtype=np.float64)
+        matrix[sess_code, slot_code] = vols
+        ratio = _prior_median_ratio_2d(matrix, int(lookback))
+        out[:] = ratio[sess_code, slot_code]
+        return out
+    for slot_value in range(n_slot):
+        index = np.flatnonzero(slot_code == slot_value)
+        if index.size == 0:
+            continue
+        out[index] = _prior_median_ratio_1d(vols[index], int(lookback))
     return out
+
+
+def _factorize(values: np.ndarray) -> np.ndarray:
+    """Appearance-order codes. ``np.unique`` would sort and scramble session order."""
+    codes, _uniques = pd.factorize(np.asarray(values), sort=False)
+    return codes.astype(np.int64, copy=False)
+
+
+def _prior_median_ratio_1d(values: np.ndarray, lookback: int) -> np.ndarray:
+    """``values[i] / median(values[max(0, i-lookback):i])``."""
+    n = int(values.shape[0])
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n <= 1:
+        return out
+    head = min(n, lookback)
+    for index in range(1, head):
+        median = float(np.median(values[:index]))
+        if median > 0.0 and np.isfinite(median):
+            out[index] = values[index] / median
+    if n > lookback:
+        windows = np.lib.stride_tricks.sliding_window_view(values, lookback)
+        median = np.median(windows[: n - lookback], axis=1)
+        good = (median > 0.0) & np.isfinite(median)
+        dest = np.arange(lookback, n)
+        out[dest[good]] = values[dest[good]] / median[good]
+    return out
+
+
+def _prior_median_ratio_2d(matrix: np.ndarray, lookback: int) -> np.ndarray:
+    """Column-wise prior-window median. ``matrix`` is ``(session, slot)``."""
+    n_sess = int(matrix.shape[0])
+    ratio = np.full(matrix.shape, np.nan, dtype=np.float64)
+    if n_sess <= 1:
+        return ratio
+    head = min(n_sess, lookback)
+    for index in range(1, head):
+        median = np.median(matrix[:index], axis=0)
+        good = (median > 0.0) & np.isfinite(median)
+        ratio[index, good] = matrix[index, good] / median[good]
+    if n_sess > lookback:
+        windows = np.lib.stride_tricks.sliding_window_view(matrix, lookback, axis=0)
+        median = np.median(windows[: n_sess - lookback], axis=-1)
+        good = (median > 0.0) & np.isfinite(median)
+        block = matrix[lookback:]
+        ratio[lookback:][good] = block[good] / median[good]
+    return ratio
 
 
 def _rsi_python(close: np.ndarray, length: int) -> np.ndarray:
