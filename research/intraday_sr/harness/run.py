@@ -21,17 +21,14 @@ The holdout is never touched here (see walkforward.run_holdout).
 from __future__ import annotations
 
 import argparse
-import copyreg
 import importlib
 import json
 import multiprocessing as mp
 import os
-import pickle
 import resource
 import shutil
 import sys
 import time
-import types
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -44,6 +41,7 @@ from research.intraday_sr.harness import readout as RO
 from research.intraday_sr.harness import stats as S
 from research.intraday_sr.harness.compare import write_compare
 from research.intraday_sr.harness import s0grids
+from research.intraday_sr.harness import spill as SP
 from research.intraday_sr.harness.config import COMPARISON, PENDING_R5, PRIMARY, CostCfg, RiskCfg
 from research.intraday_sr.harness.grid_check import check_grids_module, grid_hash
 from research.intraday_sr.harness.portfolio import SignalContractError, simulate
@@ -53,14 +51,6 @@ from research.intraday_sr.harness.walkforward import (DEV_END, VariantRun, exact
 
 SPEC_VERSION = "v1.3.1"
 _G: dict = {}          # fork-shared state for workers
-
-# S0 Signal/Zone freeze their mappings as MappingProxyType, which pickle refuses. Pass 1 spills signals to disk, so
-# pickle a proxy as a proxy over a plain dict copy (read-only on load, equal by content).
-def _mapping_proxy(d: dict) -> types.MappingProxyType:
-    return types.MappingProxyType(d)
-
-
-copyreg.pickle(types.MappingProxyType, lambda m: (_mapping_proxy, (dict(m),)))
 
 
 def engine_cfg_for(variant: dict):
@@ -322,7 +312,7 @@ def symbol_pass(sym: str) -> dict:
                 continue
             secs[vid] = time.perf_counter() - t1
             t2 = time.perf_counter()
-            _write_spill(spill, vid, sym, got)        # a spill failure is a harness fault: it stops the run
+            SP.write(spill, vid, sym, got)        # a spill failure is a harness fault: it stops the run
             spill_s[vid] = time.perf_counter() - t2
             sigs[vid] = len(got)
     finally:
@@ -330,24 +320,6 @@ def symbol_pass(sym: str) -> dict:
     payload = ad.symbol_payload(sym) if (_G.get("chunk_transfer") and hasattr(ad, "symbol_payload")) else None
     return {"symbol": sym, "signals": sigs, "errors": errs, "secs": secs, "spill_s": spill_s, "order": order,
             "load_s": load_s, "total_s": time.perf_counter() - t0, "maxrss_mb": _maxrss_mb(), "pid": os.getpid(), "payload": payload}
-
-
-def _write_spill(spill: Path, vid: str, sym: str, sigs: list) -> None:
-    d = spill / vid
-    d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f".{sym}.{os.getpid()}.tmp"
-    with open(tmp, "wb") as fh:
-        pickle.dump(sigs, fh, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, d / f"{sym}.pkl")
-
-
-def _read_spill(spill: Path, vid: str, symbols: list) -> list:
-    """Signals for one variant in `symbols` order: exactly the list the unchunked path builds."""
-    out = []
-    for sym in symbols:
-        with open(spill / vid / f"{sym}.pkl", "rb") as fh:
-            out.extend(pickle.load(fh))
-    return out
 
 
 def run_symbol_passes(ad, symbols: list, variants: list, workers: int, spill_dir: Path) -> dict:
@@ -443,7 +415,7 @@ def _signals(variant: dict, keep: bool = True) -> list:
     if vid in _SIGCACHE:
         return _SIGCACHE[vid]
     if _G.get("spill_dir"):
-        sigs = _read_spill(Path(_G["spill_dir"]), vid, _G["symbols"])
+        sigs = SP.read(Path(_G["spill_dir"]), vid, _G["symbols"])
     else:
         sigs = [s for sym in _G["symbols"] for s in _G["adapter"].signals(sym, variant)]
     if keep:

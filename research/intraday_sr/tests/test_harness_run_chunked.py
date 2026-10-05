@@ -136,3 +136,20 @@ def test_symbols_filter_and_timing_only(tmp_path):
     assert not (tmp_path / "tim" / "ledger_smoke").exists() and (tmp_path / "tim" / "timing.json").is_file()
     with pytest.raises(SystemExit):
         R.main(["--tests", "A", "--tag", "bad", "--out", str(tmp_path), "--symbols", "ZZZ"])
+
+
+def test_spill_file_loads_in_a_fresh_process(tmp_path):
+    """Spilled S0 signals (MappingProxyType fields) unpickle outside the run, equal to the originals."""
+    import subprocess
+    import sys
+
+    from research.intraday_sr.harness import spill as SP
+
+    sigs = [sig(symbol="AAA", day="2024-03-04"), sig(symbol="AAA", day="2024-03-05")]
+    SP.write(tmp_path, "A-fx0", "AAA", sigs)
+    assert repr(SP.read(tmp_path, "A-fx0", ["AAA"])) == repr(sigs)      # repr: the stub targets hold NaN
+    code = ("import pickle,sys; s=pickle.load(open(sys.argv[1],'rb')); "
+            "print(len(s), type(s[0].components).__name__, s[0].components['n_confirm'])")
+    outp = subprocess.run([sys.executable, "-c", code, str(tmp_path / "A-fx0" / "AAA.pkl")], capture_output=True,
+                          text=True, cwd=str(__import__("pathlib").Path(__file__).resolve().parents[3]), check=True)
+    assert outp.stdout.split() == ["2", "mappingproxy", "3.0"]
