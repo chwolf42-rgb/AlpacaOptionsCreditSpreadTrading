@@ -20,6 +20,7 @@ from research.intraday_sr.engine.zone_cache import (
     _epoch_ns_array,
     cached_levels,
     level_cfg_token,
+    prefix_digest,
     prefix_hashes,
     register_cache_clear,
     tape_token,
@@ -70,14 +71,14 @@ def timeframe_frame(group: pd.DataFrame, tf: str) -> pd.DataFrame | None:
         return None
     hashes = prefix_hashes(group)
     symbol = str(group["symbol"].iloc[0]) if "symbol" in group.columns else ""
-    key = (tf, symbol, int(hashes[-1]))
+    key = (tf, symbol, prefix_digest(hashes, -1))
     if key in _TF_CACHE:
         return _TF_CACHE[key]
     parent = _TF_PARENT.get((tf, symbol))
     if (
         parent is not None
         and len(hashes) <= len(parent["hashes"])
-        and int(parent["hashes"][len(hashes) - 1]) == key[2]
+        and prefix_digest(parent["hashes"], len(hashes) - 1) == key[2]
     ):
         end_ns = np.int64(pd.Timestamp(_as_dt(group["available_at"].iloc[-1])).value)
         full = parent["frame"]
@@ -85,6 +86,8 @@ def timeframe_frame(group: pd.DataFrame, tf: str) -> pd.DataFrame | None:
         _TF_CACHE[key] = sliced
         return sliced
     built = _bucket_table(group, tf, full=True)
+    if built is not None:
+        built.pop("_record", None)
     frame = None if built is None or not built["high"] else pd.DataFrame(built)
     _TF_CACHE[key] = frame
     if frame is not None and (parent is None or len(hashes) >= len(parent["hashes"])):
@@ -126,6 +129,171 @@ def _symbol_levels(symbol: str, group: pd.DataFrame, as_of: datetime, cfg: Engin
     )
 
 
+class _LevelTape:
+    """One pass over a symbol tape, then a cheap level set at each 15m stamp.
+
+    Session stats and ATR are fixed for completed days. A stamp only rescans
+    the current session. A bad-print clamp is applied when its visible_at is
+    already at or before the stamp; otherwise that stamp falls back to
+    ``prices_as_of`` so a not-yet-visible spike cannot leak into HVN or the
+    opening range.
+    """
+
+    def __init__(self, symbol: str, frame: pd.DataFrame, cfg: EngineCfg):
+        self.symbol = symbol
+        self.cfg = cfg
+        self.frame = frame.reset_index(drop=True)
+        self.hashes = prefix_hashes(self.frame)
+        self.pivots, self.prices = _pivot_tape(symbol, self.frame, cfg, self.hashes)
+        self.opening = _opening_range_table(self.frame)
+        group = self.frame
+        self.available = list(group["available_at"])
+        self.high = group["high"].to_numpy(dtype=np.float64)
+        self.low = group["low"].to_numpy(dtype=np.float64)
+        self.close = group["close"].to_numpy(dtype=np.float64)
+        self.volume = group["volume"].to_numpy(dtype=np.float64)
+        if "vwap" in group.columns:
+            self.vwap = group["vwap"].to_numpy(dtype=np.float64)
+        else:
+            self.vwap = self.close
+        if "adj_factor" in group.columns:
+            self.factor = group["adj_factor"].to_numpy(dtype=np.float64)
+        else:
+            self.factor = np.ones(len(group), dtype=np.float64)
+        self.segments = _segments(group)
+        self.seg_index = np.empty(len(group), dtype=np.int32)
+        for index, segment in enumerate(self.segments):
+            self.seg_index[int(segment[4]) : int(segment[5])] = index
+        self.atr_by_day: dict = {}
+        running: list = []
+        length = int(cfg.atr_length)
+        for segment in self.segments:
+            running.append(segment)
+            self.atr_by_day[segment[0]] = _atr_from_segments(running, at_time(segment[0], time(12, 0)), length)
+        if "bad_print" in group.columns and len(group):
+            self.flag_idx = np.flatnonzero(group["bad_print"].to_numpy(dtype=bool))
+            self.vis_ns = _epoch_ns(group["bad_print_visible_at"]) if "bad_print_visible_at" in group.columns else np.zeros(len(group), dtype=np.int64)
+            self.high_u = group["high_unclamped"].to_numpy(dtype=np.float64) if "high_unclamped" in group.columns else self.high
+            self.low_u = group["low_unclamped"].to_numpy(dtype=np.float64) if "low_unclamped" in group.columns else self.low
+        else:
+            self.flag_idx = np.empty(0, dtype=np.int64)
+            self.vis_ns = np.empty(0, dtype=np.int64)
+            self.high_u = self.high
+            self.low_u = self.low
+
+    def hidden_indices(self, cutoff: int, stamp_ns: int) -> np.ndarray:
+        if self.flag_idx.size == 0 or cutoff <= 0:
+            return self.flag_idx[:0]
+        right = int(np.searchsorted(self.flag_idx, cutoff, side="left"))
+        flags = self.flag_idx[:right]
+        if flags.size == 0:
+            return flags
+        return flags[self.vis_ns[flags] > stamp_ns]
+
+    def levels_at(self, cutoff: int, stamp: datetime) -> list[Level]:
+        stamp_ns = int(pd.Timestamp(stamp).value)
+        hidden = self.hidden_indices(cutoff, stamp_ns)
+        if hidden.size:
+            prefix = prices_as_of(self.frame.iloc[:cutoff], stamp)
+            return _levels_at_stamp(
+                self.symbol,
+                prefix,
+                self.pivots,
+                self.prices,
+                stamp,
+                self.cfg,
+                opening=_opening_range_table(prefix),
+            )
+        return self._fast(cutoff, stamp)
+
+    def asof_high_low(self, begin: int, cutoff: int, stamp: datetime) -> tuple[np.ndarray, np.ndarray]:
+        """High and low of ``[begin, cutoff)`` with clamps not yet visible restored."""
+        stamp_ns = int(pd.Timestamp(stamp).value)
+        hidden = self.hidden_indices(cutoff, stamp_ns)
+        in_slice = hidden[hidden >= begin] if hidden.size else hidden
+        if in_slice.size == 0:
+            return self.low[begin:cutoff], self.high[begin:cutoff]
+        low = self.low[begin:cutoff].copy()
+        high = self.high[begin:cutoff].copy()
+        local = in_slice - begin
+        low[local] = self.low_u[in_slice]
+        high[local] = self.high_u[in_slice]
+        return low, high
+
+    def _fast(self, cutoff: int, stamp: datetime) -> list[Level]:
+        if cutoff <= 0 or not self.segments:
+            return []
+        si = int(self.seg_index[cutoff - 1])
+        day, _high, _low, _close, start, _stop = self.segments[si]
+        today_high = float(self.high[start:cutoff].max())
+        today_low = float(self.low[start:cutoff].min())
+        today_close = float(self.close[cutoff - 1])
+        today = (day, today_high, today_low, today_close, start, cutoff)
+        parts = [self.segments[si - 1], today] if si else [today]
+        atr = self.atr_by_day.get(day)
+        last_close = today_close
+        cut = bisect.bisect_right(self.pivots, stamp, key=lambda level: level.available_at)
+        if atr is None:
+            chosen = self.pivots[:cut]
+        else:
+            band = float(self.cfg.candidate_band_atr) * atr + 1e-9
+            mask = np.abs(self.prices[:cut] - last_close) <= band
+            chosen = [self.pivots[int(index)] for index in np.flatnonzero(mask)]
+        levels: list[Level] = list(chosen)
+        levels.extend(_prior_day(self.symbol, parts, stamp))
+        levels.extend(_opening_range_at(self.symbol, day, stamp, self.opening))
+        vwap = _vwap_slice(
+            self.symbol,
+            self.vwap[start:cutoff],
+            self.close[start:cutoff],
+            self.volume[start:cutoff],
+            self.available[cutoff - 1],
+        )
+        if vwap is not None:
+            levels.append(vwap)
+        if atr is not None:
+            profile = self.segments[max(0, si - int(self.cfg.profile_sessions)) : si]
+            hvn_segments = list(profile) + [today]
+            levels.extend(
+                _hvn_arrays(
+                    self.symbol,
+                    self.high,
+                    self.low,
+                    self.close,
+                    self.volume,
+                    self.available[cutoff - 1],
+                    hvn_segments,
+                    atr,
+                    self.cfg,
+                )
+            )
+            levels.extend(
+                _rounds_values(
+                    self.symbol,
+                    last_close,
+                    float(self.factor[cutoff - 1]),
+                    self.available[cutoff - 1],
+                    atr,
+                    self.cfg,
+                )
+            )
+            band = float(self.cfg.candidate_band_atr) * atr + 1e-9
+            levels = [level for level in levels if abs(level.price - last_close) <= band]
+        levels.sort(key=lambda level: (level.symbol, level.available_at, level.kind, level.price))
+        return levels
+
+
+def _vwap_slice(symbol: str, price: np.ndarray, close: np.ndarray, volume: np.ndarray, available) -> Level | None:
+    if price.size == 0:
+        return None
+    total = float(volume.sum())
+    if total <= 0.0:
+        value = float(close[-1])
+    else:
+        value = float((price * volume).sum() / total)
+    return _level(symbol, "vwap", value, available)
+
+
 _PIVOTS: dict[tuple, tuple[list[Level], np.ndarray]] = {}
 _PIVOT_PARENT: dict[tuple, dict] = {}
 
@@ -139,7 +307,7 @@ register_cache_clear(_clear_pivot_cache)
 
 
 def _pivot_tape(
-    symbol: str, group: pd.DataFrame, cfg: EngineCfg
+    symbol: str, group: pd.DataFrame, cfg: EngineCfg, hashes: np.ndarray | None = None
 ) -> tuple[list[Level], np.ndarray]:
     """Pivots on the whole tape. ``available_at`` is the confirmation close.
 
@@ -150,15 +318,16 @@ def _pivot_tape(
     """
     if group.empty:
         return [], np.empty(0, dtype=np.float64)
-    hashes = prefix_hashes(group)
-    key = int(hashes[-1])
+    if hashes is None:
+        hashes = prefix_hashes(group)
+    key = prefix_digest(hashes, -1)
     cfg_key = (symbol, level_cfg_token(cfg))
     cache_key = (cfg_key, key)
     found = _PIVOTS.get(cache_key)
     if found is not None:
         return found
     parent = _PIVOT_PARENT.get(cfg_key)
-    if parent is not None and len(hashes) <= len(parent["hashes"]) and int(parent["hashes"][len(hashes) - 1]) == key:
+    if parent is not None and len(hashes) <= len(parent["hashes"]) and prefix_digest(parent["hashes"], len(hashes) - 1) == key:
         end = _as_dt(group["available_at"].iloc[-1])
         cut = bisect.bisect_right(parent["pivots"], end, key=lambda level: level.available_at)
         sliced = (parent["pivots"][:cut], parent["prices"][:cut])
@@ -274,22 +443,162 @@ def _atr_from_segments(segments: list[tuple], as_of: datetime, length: int) -> f
     return float(atr)
 
 
-def _pivot_levels(symbol: str, group: pd.DataFrame, tf: str, n: int) -> list[Level]:
+def _pivot_levels(
+    symbol: str,
+    group: pd.DataFrame,
+    tf: str,
+    n: int,
+    high_events: list | None = None,
+    low_events: list | None = None,
+) -> list[Level]:
     if len(group) < 2 * n + 1:
         return []
     lows = group["low"].to_numpy(dtype=np.float64)
     highs = group["high"].to_numpy(dtype=np.float64)
     low_at = _strict_mask(lows, n, high=False)
     high_at = _strict_mask(highs, n, high=True)
-    stamps = group["available_at"].tolist()
+    stamps = [_as_dt(value) for value in group["available_at"].tolist()]
+    avail_ns = _epoch_ns(group["available_at"])
+    if high_events is None:
+        high_events, low_events = _bar_clamp_events(group, highs, lows)
     found: list[Level] = []
     for index in np.flatnonzero(low_at | high_at):
-        available = stamps[int(index) + n]
+        index = int(index)
+        confirm = stamps[index + n]
+        confirm_ns = int(avail_ns[index + n])
         if bool(low_at[index]):
+            available = _pivot_ready(
+                index, n, confirm, confirm_ns, False, float(lows[index]), lows, low_events
+            )
             found.append(_level(symbol, f"pivot_{tf}", float(lows[index]), available))
         if bool(high_at[index]):
+            available = _pivot_ready(
+                index, n, confirm, confirm_ns, True, float(highs[index]), highs, high_events
+            )
             found.append(_level(symbol, f"pivot_{tf}", float(highs[index]), available))
     return found
+
+
+def _bar_clamp_events(group: pd.DataFrame, highs: np.ndarray, lows: np.ndarray) -> tuple[list, list]:
+    """Per-bar clamp steps. Empty when the bar's extreme is already final."""
+    n = len(group)
+    high_events: list = [[] for _ in range(n)]
+    low_events: list = [[] for _ in range(n)]
+    if "bad_print" not in group.columns or "high_unclamped" not in group.columns:
+        return high_events, low_events
+    bad = group["bad_print"].to_numpy(dtype=bool)
+    if not bool(bad.any()):
+        return high_events, low_events
+    high_u = group["high_unclamped"].to_numpy(dtype=np.float64)
+    low_u = group["low_unclamped"].to_numpy(dtype=np.float64)
+    vis_ns = _epoch_ns(group["bad_print_visible_at"])
+    vis_dt = [_as_dt(value) for value in group["bad_print_visible_at"].tolist()]
+    for index in np.flatnonzero(bad):
+        index = int(index)
+        stamp = vis_dt[index]
+        when = int(vis_ns[index])
+        if high_u[index] > highs[index]:
+            high_events[index].append((when, float(high_u[index]), stamp))
+        if low_u[index] < lows[index]:
+            low_events[index].append((when, float(low_u[index]), stamp))
+    return high_events, low_events
+
+
+def _events_from_members(group: pd.DataFrame, member_lists: list, clamped_high, clamped_low) -> tuple[list, list]:
+    """Clamp steps for one higher-timeframe bucket, from its 5m members."""
+    high_u = group["high_unclamped"].to_numpy(dtype=np.float64)
+    low_u = group["low_unclamped"].to_numpy(dtype=np.float64)
+    bad = group["bad_print"].to_numpy(dtype=bool)
+    vis_ns = _epoch_ns(group["bad_print_visible_at"])
+    vis_dt = [_as_dt(value) for value in group["bad_print_visible_at"].tolist()]
+    high_events = []
+    low_events = []
+    for members, chi, clo in zip(member_lists, clamped_high, clamped_low):
+        he = []
+        le = []
+        for index in members:
+            index = int(index)
+            if not bad[index]:
+                continue
+            when = int(vis_ns[index])
+            stamp = vis_dt[index]
+            if high_u[index] > float(chi):
+                he.append((when, float(high_u[index]), stamp))
+            if low_u[index] < float(clo):
+                le.append((when, float(low_u[index]), stamp))
+        high_events.append(he)
+        low_events.append(le)
+    return high_events, low_events
+
+
+def _asof_high(clamped: float, events: list, stamp_ns: int) -> float:
+    current = clamped
+    for when, extreme, _stamp in events:
+        if when > stamp_ns and extreme > current:
+            current = extreme
+    return current
+
+
+def _asof_low(clamped: float, events: list, stamp_ns: int) -> float:
+    current = clamped
+    for when, extreme, _stamp in events:
+        if when > stamp_ns and extreme < current:
+            current = extreme
+    return current
+
+
+def _pivot_ready(index: int, n: int, confirm, confirm_ns: int, is_high: bool, centre: float, clamped: np.ndarray, events: list):
+    """When a clamped pivot is knowable.
+
+    A bad print in the pivot window can create the pivot by pulling a
+    neighbour back inside the strict test. That pivot stays hidden until
+    the clamp is visible, which can be after the confirming bar when the
+    bad print sits in the right-hand window. The centre price itself is
+    the clamped extreme, so it waits until that bar's own clamp is in too.
+    """
+    ready_ns = confirm_ns
+    ready = confirm
+    for offset in range(index - n, index + n + 1):
+        steps = events[offset]
+        if not steps:
+            continue
+        when_ns, when = _extreme_ready(
+            is_centre=offset == index,
+            is_high=is_high,
+            centre=centre,
+            clamped=float(clamped[offset]),
+            events=steps,
+            confirm_ns=confirm_ns,
+            confirm=confirm,
+        )
+        if when_ns > ready_ns:
+            ready_ns = when_ns
+            ready = when
+    return ready
+
+
+def _extreme_ready(is_centre: bool, is_high: bool, centre: float, clamped: float, events: list, confirm_ns: int, confirm):
+    candidates = [(confirm_ns, confirm)]
+    for when, _extreme, stamp in events:
+        if when > confirm_ns:
+            candidates.append((when, stamp))
+    candidates.sort(key=lambda item: item[0])
+    for when, stamp in candidates:
+        if is_high:
+            extreme = _asof_high(clamped, events, when)
+            if is_centre:
+                if extreme <= clamped + 1e-9:
+                    return when, stamp
+            elif extreme < centre:
+                return when, stamp
+        else:
+            extreme = _asof_low(clamped, events, when)
+            if is_centre:
+                if extreme >= clamped - 1e-9:
+                    return when, stamp
+            elif extreme > centre:
+                return when, stamp
+    return candidates[-1]
 
 
 def _higher_pivots(symbol: str, group: pd.DataFrame, cfg: EngineCfg) -> list[Level]:
@@ -298,9 +607,18 @@ def _higher_pivots(symbol: str, group: pd.DataFrame, cfg: EngineCfg) -> list[Lev
     tables = _all_buckets(group, full=False)
     for tf, n in (("15m", int(cfg.n_15m)), ("1h", int(cfg.n_1h)), ("1d", int(cfg.n_1d))):
         payload = tables[tf]
+        recorded = payload.pop("_record", None)
         if not payload["high"]:
             continue
-        found.extend(_pivot_levels(symbol, pd.DataFrame(payload), tf, n))
+        frame = pd.DataFrame(
+            {"high": payload["high"], "low": payload["low"], "ts": payload["ts"], "available_at": payload["available_at"]}
+        )
+        high_events = low_events = None
+        if recorded is not None:
+            high_events, low_events = _events_from_members(
+                group, recorded, frame["high"].to_numpy(), frame["low"].to_numpy()
+            )
+        found.extend(_pivot_levels(symbol, frame, tf, n, high_events, low_events))
     return found
 
 
@@ -318,6 +636,14 @@ def _all_buckets(group: pd.DataFrame, *, full: bool) -> dict[str, dict]:
         for key in ("open", "close", "volume", "vwap", "symbol", "session", "adj_factor"):
             empty[key] = []
     built = {tf: {key: [] for key in empty} for tf in ("15m", "1h", "1d")}
+    track_clamps = (
+        "bad_print" in group.columns
+        and "high_unclamped" in group.columns
+        and bool(np.any(group["bad_print"].to_numpy(dtype=bool)))
+    )
+    if track_clamps:
+        for payload in built.values():
+            payload["_record"] = []
     if group.empty or "session" not in group.columns:
         return built
     codes, uniques = pd.factorize(group["session"], sort=False)
@@ -425,6 +751,9 @@ def _from_ns(stamp_ns: np.int64) -> datetime:
 
 
 def _store_members(bucket, members, start, end, high, low, open_, close, volume, vwap, symbol, day, factor, full) -> None:
+    recorded = bucket.get("_record")
+    if recorded is not None:
+        recorded.append(np.asarray(members, dtype=np.int32).copy())
     bucket["high"].append(float(high[members].max()))
     bucket["low"].append(float(low[members].min()))
     bucket["ts"].append(start)
@@ -527,6 +856,22 @@ def _session_vwap(symbol: str, group: pd.DataFrame) -> Level | None:
 
 
 def _hvn(symbol: str, group: pd.DataFrame, segments: list[tuple], as_of: datetime, atr: float, cfg: EngineCfg) -> list[Level]:
+    if group.empty:
+        return []
+    return _hvn_arrays(
+        symbol,
+        group["high"].to_numpy(dtype=np.float64),
+        group["low"].to_numpy(dtype=np.float64),
+        group["close"].to_numpy(dtype=np.float64),
+        group["volume"].to_numpy(dtype=np.float64),
+        group["available_at"].iloc[-1],
+        segments,
+        atr,
+        cfg,
+    )
+
+
+def _hvn_arrays(symbol, high, low, close, vol, available, segments, atr, cfg) -> list[Level]:
     if not segments:
         return []
     current = segments[-1][0]
@@ -536,10 +881,6 @@ def _hvn(symbol: str, group: pd.DataFrame, segments: list[tuple], as_of: datetim
     chosen = chosen + today
     if not chosen:
         return []
-    high = group["high"].to_numpy(dtype=np.float64)
-    low = group["low"].to_numpy(dtype=np.float64)
-    close = group["close"].to_numpy(dtype=np.float64)
-    vol = group["volume"].to_numpy(dtype=np.float64)
     parts_t = []
     parts_v = []
     for _day, _h, _l, _c, start, stop in chosen:
@@ -574,7 +915,6 @@ def _hvn(symbol: str, group: pd.DataFrame, segments: list[tuple], as_of: datetim
             shelves.append((start, prev))
             start = prev = price
     shelves.append((start, prev))
-    available = group["available_at"].iloc[-1]
     found: list[Level] = []
     for low, high in shelves:
         mid = 0.5 * (low + high)
@@ -587,6 +927,10 @@ def _hvn(symbol: str, group: pd.DataFrame, segments: list[tuple], as_of: datetim
 def _rounds(symbol: str, group: pd.DataFrame, as_of: datetime, atr: float, cfg: EngineCfg) -> list[Level]:
     last = float(group["close"].iloc[-1])
     factor = float(group["adj_factor"].iloc[-1]) if "adj_factor" in group.columns else 1.0
+    return _rounds_values(symbol, last, factor, group["available_at"].iloc[-1], atr, cfg)
+
+
+def _rounds_values(symbol: str, last: float, factor: float, available, atr: float, cfg: EngineCfg) -> list[Level]:
     if not np.isfinite(factor) or factor <= 0.0:
         factor = 1.0
     traded = last * factor
@@ -598,7 +942,6 @@ def _rounds(symbol: str, group: pd.DataFrame, as_of: datetime, atr: float, cfg: 
     high = traded + band
     first = np.floor(low / step) * step
     cursor = float(first)
-    available = group["available_at"].iloc[-1]
     found: list[Level] = []
     # A wide ATR can span many rounds. Cap the walk so a bad ATR cannot explode.
     guard = 0

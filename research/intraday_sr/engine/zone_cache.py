@@ -144,31 +144,83 @@ def cached_zones(key: tuple, build):
     return zones
 
 
-def prefix_hashes(frame: pd.DataFrame) -> np.ndarray:
-    """Running FNV-1a of each prefix, so a later as-of can reuse an earlier stamp.
+def prefix_digest(hashes: np.ndarray, index: int) -> bytes:
+    """128-bit digest of the prefix ending at ``index``."""
+    return hashes[index].tobytes()
 
-    The mix is the same columns as ``tape_token`` (open, high, low, close,
-    volume, available_at). Two prefixes with the same bars share a hash, which
-    is what a truncated tape and ``visible(as_of)`` are.
+
+def prefix_hashes(frame: pd.DataFrame) -> np.ndarray:
+    """Running blake2b-128 of each prefix, one 16-byte digest per bar.
+
+    Every byte of symbol, open, high, low, close, volume, and available_at
+    enters the chain. vwap, adj_factor, and session do too when they are
+    present, because they move VWAP levels, round numbers, and the prior-day
+    pair. A bad-print flag and its visible_at enter as the clamp state of
+    that bar. Folding those columns into one integer first is not used: a
+    swap of open and close would survive that fold.
+
+    A shortened tape and ``visible(as_of)`` share a digest when they share
+    the same leading bars, which is what the prefix cache matches on.
     """
     n = len(frame)
-    out = np.empty(n, dtype=np.uint64)
+    out = np.empty((n, 16), dtype=np.uint8)
     if n == 0:
         return out
-    mixed = np.zeros(n, dtype=np.uint64)
-    for name in ("open", "high", "low", "close", "volume"):
+    pieces: list[np.ndarray] = []
+    if "symbol" in frame.columns:
+        symbols = frame["symbol"].astype(str).to_numpy()
+    else:
+        symbols = np.array([""] * n, dtype=object)
+    sym_bytes = [value.encode("utf-8") for value in symbols]
+    same_symbol = all(raw == sym_bytes[0] for raw in sym_bytes)
+    for name in ("open", "high", "low", "close", "volume", "vwap", "adj_factor"):
         if name not in frame.columns:
             continue
         values = np.ascontiguousarray(frame[name].to_numpy(dtype=np.float64))
-        mixed ^= values.view(np.uint64)
+        pieces.append(values.view(np.uint8).reshape(n, 8))
     if "available_at" in frame.columns:
-        mixed ^= np.ascontiguousarray(_epoch_ns_array(frame["available_at"])).view(np.uint64)
-    state = 14695981039346656037
-    prime = 1099511628211
-    mask = (1 << 64) - 1
+        avail = np.ascontiguousarray(_epoch_ns_array(frame["available_at"]))
+        pieces.append(avail.view(np.uint8).reshape(n, 8))
+    if "session" in frame.columns:
+        session = frame["session"]
+        if np.issubdtype(session.dtype, np.integer):
+            sess = np.ascontiguousarray(session.to_numpy(dtype=np.int64))
+        else:
+            parsed = pd.DatetimeIndex(pd.to_datetime(session.to_numpy()))
+            sess = (
+                parsed.year.astype(np.int64) * 10000
+                + parsed.month.astype(np.int64) * 100
+                + parsed.day.astype(np.int64)
+            ).to_numpy()
+        pieces.append(np.ascontiguousarray(sess).view(np.uint8).reshape(n, 8))
+    if "bad_print" in frame.columns:
+        flag = np.ascontiguousarray(frame["bad_print"].to_numpy(dtype=np.uint8)).reshape(n, 1)
+        pieces.append(flag)
+        if "bad_print_visible_at" in frame.columns:
+            vis = np.ascontiguousarray(_epoch_ns_array(frame["bad_print_visible_at"]))
+        else:
+            vis = np.zeros(n, dtype=np.int64)
+        pieces.append(np.ascontiguousarray(vis.view(np.uint8).reshape(n, 8)))
+    block = np.ascontiguousarray(np.concatenate(pieces, axis=1) if pieces else np.zeros((n, 0), dtype=np.uint8))
+    width = int(block.shape[1])
+    hasher = hashlib.blake2b(digest_size=16)
+    flat = memoryview(block.reshape(-1))
+    if same_symbol:
+        raw = sym_bytes[0]
+        prefix = len(raw).to_bytes(4, "little") + raw
+        for index in range(n):
+            hasher.update(prefix)
+            if width:
+                hasher.update(flat[index * width : (index + 1) * width])
+            out[index] = np.frombuffer(hasher.digest(), dtype=np.uint8)
+        return out
     for index in range(n):
-        state = ((state ^ int(mixed[index])) * prime) & mask
-        out[index] = state
+        raw = sym_bytes[index]
+        hasher.update(len(raw).to_bytes(4, "little"))
+        hasher.update(raw)
+        if width:
+            hasher.update(flat[index * width : (index + 1) * width])
+        out[index] = np.frombuffer(hasher.digest(), dtype=np.uint8)
     return out
 
 

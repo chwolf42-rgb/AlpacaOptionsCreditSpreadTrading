@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
 import importlib
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pytest
 
 from research.intraday_sr.engine import levels_at, signals, signals_funnel
-from research.intraday_sr.engine.levels import _levels_at_stamp, _pivot_tape
+from research.intraday_sr.engine.levels import _LevelTape, _levels_at_stamp, _pivot_tape
 from research.intraday_sr.engine.signals import SignalFunnel, _build, _entry_prices, _step
-from research.intraday_sr.engine.zone_cache import clear_zone_cache, level_cfg_token, zone_cfg_token
+from research.intraday_sr.engine.zone_cache import (
+    clear_zone_cache,
+    level_cfg_token,
+    prefix_digest,
+    prefix_hashes,
+    zone_cfg_token,
+)
 from research.intraday_sr.engine.zones import fast_zones
 from research.intraday_sr.grids import TEST_A
 from research.intraday_sr.tests.fixtures.synthetic import _concat, _frame_from_closes, _volumes, _weekdays, trend_bars
@@ -104,19 +112,22 @@ def test_zone_cfg_hash_includes_k_and_level_hash_does_not():
 def test_warm_cache_reuses_levels_across_signal_axes(monkeypatch):
     clear_zone_cache()
     signal_engine = importlib.import_module("research.intraday_sr.engine.signals")
+    # A settings-path test reloads this module, so the class has to be the one
+    # the live ``signals`` function closes over, not an earlier import.
+    tape_cls = signal_engine._LevelTape
     calls = {"levels": 0, "zones": 0}
-    real_levels = signal_engine._levels_at_stamp
+    real_levels = tape_cls.levels_at
     real_zones = signal_engine.fast_zones
 
-    def count_levels(*args, **kwargs):
+    def count_levels(self, cutoff, stamp):
         calls["levels"] += 1
-        return real_levels(*args, **kwargs)
+        return real_levels(self, cutoff, stamp)
 
     def count_zones(*args, **kwargs):
         calls["zones"] += 1
         return real_zones(*args, **kwargs)
 
-    monkeypatch.setattr(signal_engine, "_levels_at_stamp", count_levels)
+    monkeypatch.setattr(tape_cls, "levels_at", count_levels)
     monkeypatch.setattr(signal_engine, "fast_zones", count_zones)
     frame = trend_bars()
     bars = BarSet(frame)
@@ -286,3 +297,47 @@ def test_entry_prices_keep_the_unclamped_extremes():
     priced = _entry_prices(frame)
     assert float(priced["high"].iloc[0]) == 120.0
     assert float(priced["low"].iloc[0]) == 80.0
+
+
+def test_level_tape_matches_levels_at_on_a_spy_window():
+    """The per-stamp builder and levels_at agree on a real SPY slice."""
+    root = Path("/tmp/d2data")
+    if not (root / "part_0000_SPY.parquet").is_file():
+        pytest.skip("SPY cache is not on this machine")
+    from research.intraday_sr.data.adjust import load_adj_factors
+    from research.intraday_sr.data.cache import load_symbol
+
+    factors = load_adj_factors(root / "adj_factors" / "adj_factors.parquet")
+    frame, _report = load_symbol(root, "SPY", factors=factors, start=date(2019, 1, 2), end=date(2019, 6, 28))
+    cfg = EngineCfg(k_zones=3)
+    plan = _LevelTape("SPY", frame, cfg)
+    clear_zone_cache()
+    stamps = []
+    if "bad_print" in frame.columns:
+        flagged = frame.index[frame["bad_print"].to_numpy(dtype=bool)]
+        if len(flagged):
+            stamps.append(frame["available_at"].iloc[int(flagged[0])].to_pydatetime())
+    for month in (4, 5, 6):
+        day = frame.loc[pd.to_datetime(frame["ts"]).dt.month == month].iloc[30]
+        stamps.append(day["available_at"].to_pydatetime())
+    bars = BarSet(frame)
+    for stamp in stamps:
+        cutoff = int((frame["available_at"] <= stamp).sum())
+        fast = plan.levels_at(cutoff, stamp)
+        direct = levels_at(bars, stamp, cfg)
+        assert [(level.kind, level.price, level.available_at) for level in fast] == [
+            (level.kind, level.price, level.available_at) for level in direct
+        ]
+
+
+def test_prefix_hash_changes_when_ohlc_is_swapped_or_volume_changes():
+    frame = trend_bars().head(40).reset_index(drop=True)
+    original = prefix_digest(prefix_hashes(frame), len(frame) - 1)
+    swapped = frame.copy()
+    swapped.loc[3, ["open", "close"]] = swapped.loc[3, ["close", "open"]].to_numpy()
+    assert prefix_digest(prefix_hashes(swapped), len(swapped) - 1) != original
+    louder = frame.copy()
+    louder.loc[5, "volume"] = float(louder.loc[5, "volume"]) + 1.0
+    assert prefix_digest(prefix_hashes(louder), len(louder) - 1) != original
+    short = frame.iloc[:17].reset_index(drop=True)
+    assert prefix_digest(prefix_hashes(short), len(short) - 1) == prefix_digest(prefix_hashes(frame), len(short) - 1)
