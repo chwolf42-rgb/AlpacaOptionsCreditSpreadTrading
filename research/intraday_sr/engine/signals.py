@@ -22,10 +22,8 @@ import pandas as pd
 from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.engine.indicators import macd, rsi_wilder, rvol, stochastic
 from research.intraday_sr.engine.levels import (
+    _LevelTape,
     _atr_from_segments,
-    _levels_at_stamp,
-    _opening_range_table,
-    _pivot_tape,
     _segments,
     timeframe_frame,
 )
@@ -35,7 +33,7 @@ from research.intraday_sr.engine.zone_cache import (
     cached_signals,
     cached_zones,
     level_cfg_token,
-    prefix_hashes,
+    prefix_digest,
     store_signals,
     tape_token,
     zone_cfg_token,
@@ -93,7 +91,9 @@ def signals(
     if visible.empty or "symbol" not in visible.columns:
         return iter(())
     # Clamped highs and lows feed levels and zones only. The stack's touch,
-    # arm, trigger, and stop read the unclamped extremes.
+    # arm, trigger, and stop read the unclamped extremes. prices_as_of(end)
+    # hides clamps that are not visible by the window end; each 15m stamp
+    # hides any clamp whose visible_at is still after that stamp.
     clamped = prices_as_of(visible, end)
     raw = _entry_prices(visible)
     start_at = as_et(start, "start")
@@ -174,21 +174,15 @@ def _symbol_signals(
     if tape.empty:
         return []
     base = clamped.reset_index(drop=True)
-    # Pivots are causal once confirmed. The ±2·ATR_d band is applied at each
-    # 15m stamp from that stamp's close, so a March level is not dropped
-    # because June's close has moved away.
-    pivots, pivot_prices = _pivot_tape(symbol, base, cfg)
+    # Pivots are confirmed on the clamped tape, and a pivot whose window
+    # contains a not-yet-visible bad print is dated at that clamp's visible_at.
+    # Each 15m stamp then keeps only clamps with visible_at <= stamp. Touch,
+    # arm, trigger, and stop stay on the unclamped entry tape.
+    plan = _LevelTape(symbol, base, cfg)
     segments = _segments(base)
-    # Prefix hashes, not the whole-tape hash: a shorter as-of is a prefix of
-    # a longer one, so stamps already built stay hits. The opening-range pair
-    # is one pass per session and then a lookup.
-    history = prefix_hashes(base)
-    opening = _opening_range_table(base)
+    history = plan.hashes
     zones_key_cfg = zone_cfg_token(cfg)
     levels_key_cfg = level_cfg_token(cfg)
-    atr_by_day: dict = {}
-    tape_low = base["low"].to_numpy(dtype=np.float64)
-    tape_high = base["high"].to_numpy(dtype=np.float64)
     tape_open = base["open"].to_numpy(dtype=np.float64)
     tape_close = base["close"].to_numpy(dtype=np.float64)
     tape_volume = base["volume"].to_numpy(dtype=np.float64)
@@ -238,9 +232,9 @@ def _symbol_signals(
             continue
         if recompute not in snapshots:
             current_day = sessions[index]
-            if current_day not in atr_by_day:
-                atr_by_day[current_day] = _atr_from_segments(segments, stamp_at, int(cfg.atr_length))
-            atr = atr_by_day[current_day]
+            atr = plan.atr_by_day.get(current_day)
+            if atr is None:
+                atr = _atr_from_segments(segments, stamp_at, int(cfg.atr_length))
             if atr is None:
                 snapshots[recompute] = []
             else:
@@ -254,8 +248,9 @@ def _symbol_signals(
                     begin = first_of_day[origin]
                     sl = slice(begin, cutoff)
                     ages = day_index[current_day] - session_ord[begin:cutoff]
-                    level_key = (int(history[cutoff - 1]), symbol, recompute, levels_key_cfg)
-                    zone_key = (int(history[cutoff - 1]), symbol, sig.entry_tf, recompute, zones_key_cfg)
+                    digest = prefix_digest(history, cutoff - 1)
+                    level_key = (digest, symbol, recompute, levels_key_cfg)
+                    zone_key = (digest, symbol, sig.entry_tf, recompute, zones_key_cfg)
 
                     def build_zones(
                         symbol=symbol,
@@ -265,24 +260,15 @@ def _symbol_signals(
                         sl=sl,
                         ages=ages,
                         level_key=level_key,
+                        begin=begin,
                     ):
-                        live = cached_levels(
-                            level_key,
-                            lambda: _levels_at_stamp(
-                                symbol,
-                                base.iloc[:cutoff],
-                                pivots,
-                                pivot_prices,
-                                recompute,
-                                cfg,
-                                opening=opening,
-                            ),
-                        )
+                        live = cached_levels(level_key, lambda: plan.levels_at(cutoff, recompute))
+                        touch_low, touch_high = plan.asof_high_low(begin, cutoff, recompute)
                         return fast_zones(
                             live,
                             symbol=symbol,
-                            lows=tape_low[sl],
-                            highs=tape_high[sl],
+                            lows=touch_low,
+                            highs=touch_high,
                             opens=tape_open[sl],
                             closes=tape_close[sl],
                             volume=tape_volume[sl],
