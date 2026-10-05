@@ -12,6 +12,7 @@ unclamped high and low.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Iterator
 
@@ -28,8 +29,49 @@ from research.intraday_sr.engine.levels import (
     timeframe_frame,
 )
 from research.intraday_sr.engine.tape import floor_15m, minute_of_day, session_day
+from research.intraday_sr.engine.zone_cache import (
+    cached_levels,
+    cached_zones,
+    level_cfg_token,
+    tape_token,
+    zone_cfg_token,
+)
 from research.intraday_sr.engine.zones import fast_zones
 from research.intraday_sr.types import ET, BarSet, EngineCfg, Signal, SignalCfg, Zone, as_et
+
+
+@dataclass
+class SignalFunnel:
+    """How many stack stages fired inside one ``signals`` call.
+
+    ``touches``, ``holds``, and ``arms`` count bar/zone pairs on the entry
+    timeframe. ``k_confirm_pass`` is how many of those arms cleared the
+    optional-flag minimum. ``emits`` is the number of ``Signal`` objects
+    returned. ``build_fail_no_ahead_zone`` and ``build_fail_zone_lt_1R``
+    count skipped builds for ``target == "zone"`` only (SPEC v1.3.1 §5:
+    skip when the zone target is missing or less than 1R away).
+    """
+
+    touches: int = 0
+    holds: int = 0
+    arms: int = 0
+    k_confirm_pass: int = 0
+    emits: int = 0
+    build_fail_no_ahead_zone: int = 0
+    build_fail_zone_lt_1R: int = 0
+
+
+def signals_funnel(
+    bars: BarSet,
+    start: datetime,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+) -> SignalFunnel:
+    """Run Test A and return the touch → hold → arm → emit counts."""
+    funnel = SignalFunnel()
+    list(signals(bars, start, end, cfg, sig, funnel=funnel))
+    return funnel
 
 
 def signals(
@@ -38,48 +80,84 @@ def signals(
     end: datetime,
     cfg: EngineCfg,
     sig: SignalCfg,
+    funnel: SignalFunnel | None = None,
 ) -> Iterator[Signal]:
     """Armed Test A entries whose ``available_at`` is inside ``[start, end]``."""
     if sig.test != "A":
         return iter(())
-    visible = prices_as_of(bars.visible(end), end)
+    visible = bars.visible(end)
     if visible.empty or "symbol" not in visible.columns:
         return iter(())
+    # Clamped highs and lows feed levels and zones only. The stack's touch,
+    # arm, trigger, and stop read the unclamped extremes.
+    clamped = prices_as_of(visible, end)
+    raw = _entry_prices(visible)
     start_at = as_et(start, "start")
     end_at = as_et(end, "end")
     found: list[Signal] = []
-    for symbol, group in visible.groupby("symbol", sort=True):
-        group = group.sort_values("ts")
-        if "tf" in group.columns:
-            group = group.loc[group["tf"].astype(str) == "5m"]
+    raw_groups = {
+        str(symbol): _five_minute(group)
+        for symbol, group in raw.groupby("symbol", sort=True)
+    }
+    for symbol, group in clamped.groupby("symbol", sort=True):
+        group = _five_minute(group)
         if group.empty:
             continue
-        found.extend(_symbol_signals(str(symbol), group, start_at, end_at, cfg, sig))
+        entry = raw_groups.get(str(symbol))
+        if entry is None or entry.empty:
+            continue
+        found.extend(
+            _symbol_signals(str(symbol), group, entry, start_at, end_at, cfg, sig, funnel)
+        )
     found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
+    if funnel is not None:
+        funnel.emits += len(found)
     return iter(found)
+
+
+def _five_minute(group: pd.DataFrame) -> pd.DataFrame:
+    group = group.sort_values("ts")
+    if "tf" in group.columns:
+        group = group.loc[group["tf"].astype(str) == "5m"]
+    return group
+
+
+def _entry_prices(frame: pd.DataFrame) -> pd.DataFrame:
+    """High and low as printed. Levels and zones do not use this frame."""
+    if frame.empty or "high_unclamped" not in frame.columns:
+        return frame
+    out = frame.copy()
+    out["high"] = frame["high_unclamped"].to_numpy()
+    out["low"] = frame["low_unclamped"].to_numpy()
+    return out
 
 
 def _symbol_signals(
     symbol: str,
-    group: pd.DataFrame,
+    clamped: pd.DataFrame,
+    raw: pd.DataFrame,
     start: datetime,
     end: datetime,
     cfg: EngineCfg,
     sig: SignalCfg,
+    funnel: SignalFunnel | None,
 ) -> list[Signal]:
-    tape = group if sig.entry_tf == "5m" else timeframe_frame(group, sig.entry_tf)
+    tape = raw if sig.entry_tf == "5m" else timeframe_frame(raw, sig.entry_tf)
     if tape is None or tape.empty:
         return []
     tape = tape.sort_values("ts").reset_index(drop=True)
     tape = tape.loc[tape["available_at"] <= end]
     if tape.empty:
         return []
-    base = group.reset_index(drop=True)
+    base = clamped.reset_index(drop=True)
     # Pivots are causal once confirmed. The ±2·ATR_d band is applied at each
     # 15m stamp from that stamp's close, so a March level is not dropped
     # because June's close has moved away.
     pivots, pivot_prices = _pivot_tape(symbol, base, cfg)
     segments = _segments(base)
+    history = tape_token(base)
+    zones_key_cfg = zone_cfg_token(cfg)
+    levels_key_cfg = level_cfg_token(cfg)
     atr_by_day: dict = {}
     tape_low = base["low"].to_numpy(dtype=np.float64)
     tape_high = base["high"].to_numpy(dtype=np.float64)
@@ -118,6 +196,7 @@ def _symbol_signals(
     armed_until: dict[str, int] = {}
     out: list[Signal] = []
     warmup = datetime.fromisoformat(str(cfg.warmup_date)).date()
+    cutoff_cursor = 0
     for index in range(len(tape)):
         stamp_at = available[index]
         if stamp_at < start or stamp_at > end:
@@ -137,9 +216,9 @@ def _symbol_signals(
             if atr is None:
                 snapshots[recompute] = []
             else:
-                cutoff = 0
-                while cutoff < len(tape_avail) and tape_avail[cutoff] <= recompute:
-                    cutoff += 1
+                while cutoff_cursor < len(tape_avail) and tape_avail[cutoff_cursor] <= recompute:
+                    cutoff_cursor += 1
+                cutoff = cutoff_cursor
                 if cutoff == 0:
                     snapshots[recompute] = []
                 else:
@@ -147,24 +226,60 @@ def _symbol_signals(
                     begin = first_of_day[origin]
                     sl = slice(begin, cutoff)
                     ages = day_index[current_day] - session_ord[begin:cutoff]
-                    live = _levels_at_stamp(
-                        symbol, base.iloc[:cutoff], pivots, pivot_prices, recompute, cfg
-                    )
-                    snapshots[recompute] = fast_zones(
-                        live,
+                    level_key = (history, symbol, recompute, levels_key_cfg)
+                    zone_key = (history, symbol, sig.entry_tf, recompute, zones_key_cfg)
+
+                    def build_zones(
                         symbol=symbol,
-                        lows=tape_low[sl],
-                        highs=tape_high[sl],
-                        opens=tape_open[sl],
-                        closes=tape_close[sl],
-                        volume=tape_volume[sl],
+                        cutoff=cutoff,
+                        recompute=recompute,
+                        atr=atr,
+                        sl=sl,
                         ages=ages,
-                        last_close=float(tape_close[cutoff - 1]),
-                        atr=float(atr),
-                        stamp=recompute,
-                        cfg=cfg,
-                    )
+                        level_key=level_key,
+                    ):
+                        live = cached_levels(
+                            level_key,
+                            lambda: _levels_at_stamp(
+                                symbol, base.iloc[:cutoff], pivots, pivot_prices, recompute, cfg
+                            ),
+                        )
+                        return fast_zones(
+                            live,
+                            symbol=symbol,
+                            lows=tape_low[sl],
+                            highs=tape_high[sl],
+                            opens=tape_open[sl],
+                            closes=tape_close[sl],
+                            volume=tape_volume[sl],
+                            ages=ages,
+                            last_close=float(tape_close[cutoff - 1]),
+                            atr=float(atr),
+                            stamp=recompute,
+                            cfg=cfg,
+                        )
+
+                    snapshots[recompute] = cached_zones(zone_key, build_zones)
         zones = snapshots[recompute]
+        if funnel is not None and zones:
+            _tally(
+                funnel,
+                index,
+                zones,
+                opens,
+                highs,
+                lows,
+                closes,
+                osc,
+                hist,
+                _line,
+                _signal,
+                volume_ratio,
+                oversold,
+                overbought,
+                cfg,
+                sig,
+            )
         if not zones:
             continue
         out.extend(
@@ -188,9 +303,59 @@ def _symbol_signals(
                 sig=sig,
                 width=width,
                 armed_until=armed_until,
+                funnel=funnel,
             )
         )
     return out
+
+
+def _tally(
+    funnel: SignalFunnel,
+    index: int,
+    zones: list[Zone],
+    opens,
+    highs,
+    lows,
+    closes,
+    osc,
+    hist,
+    macd_line,
+    macd_signal,
+    volume_ratio,
+    oversold: float,
+    overbought: float,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+) -> None:
+    window = int(cfg.touch_window_bars)
+    for zone in zones:
+        if not _is_touch(index, zone, lows, highs, closes):
+            continue
+        funnel.touches += 1
+        rc = _hold_index(index, zone, opens, highs, lows, closes, window)
+        if rc is None:
+            continue
+        funnel.holds += 1
+        arm = _arm_index(rc, zone, highs, lows, closes, cfg)
+        if arm is None:
+            continue
+        funnel.arms += 1
+        flags = _optional_flags(
+            index,
+            rc,
+            arm,
+            zone,
+            osc,
+            hist,
+            macd_line,
+            macd_signal,
+            volume_ratio,
+            oversold,
+            overbought,
+            sig.rvol_min,
+        )
+        if sum(flags.values()) >= int(sig.k_confirm):
+            funnel.k_confirm_pass += 1
 
 
 def _step(
@@ -214,6 +379,7 @@ def _step(
     sig: SignalCfg,
     width: timedelta,
     armed_until: dict[str, int],
+    funnel: SignalFunnel | None = None,
 ) -> list[Signal]:
     found: list[Signal] = []
     window = int(cfg.touch_window_bars)
@@ -252,9 +418,13 @@ def _step(
         )
         if sum(flags.values()) < int(sig.k_confirm):
             continue
-        signal = _build(
+        signal, reason = _build(
             zone, rc_at, index, highs, lows, closes, available, factors, flags, zones, cfg, sig, width
         )
+        if funnel is not None and reason == "no_ahead":
+            funnel.build_fail_no_ahead_zone += 1
+        elif funnel is not None and reason == "zone_lt_1r":
+            funnel.build_fail_zone_lt_1R += 1
         if signal is None:
             continue
         armed_until[zone.zone_id] = index + int(cfg.cancel_bars)
@@ -366,7 +536,15 @@ def _adjusted_offset(cfg: EngineCfg, factor: float) -> float:
     return float(cfg.entry_offset) / factor
 
 
-def _build(zone, rc, arm, highs, lows, closes, available, factors, flags, zones, cfg, sig, width) -> Signal | None:
+def _build(zone, rc, arm, highs, lows, closes, available, factors, flags, zones, cfg, sig, width):
+    """Build one signal, or ``(None, reason)`` when the zone target has no room.
+
+    SPEC v1.3.1 §5 skips a trade only when the chosen target is ``zone`` and
+    that zone is missing or less than 1R from the trigger. ``1R`` and ``2R``
+    are measured from the stop and always build when risk is positive.
+    ``targets['zone']`` is stored when an opposite zone sits ahead, including
+    when it is nearer than 1R on a fixed-R variant.
+    """
     direction = 1 if zone.side == "support" else -1
     offset = _adjusted_offset(cfg, float(factors[rc]))
     if direction == 1:
@@ -376,16 +554,11 @@ def _build(zone, rc, arm, highs, lows, closes, available, factors, flags, zones,
         floor = trigger - float(cfg.stop_floor_atr) * zone.atr_d
         stop = min(natural, floor)
         risk = trigger - stop
-        if risk <= 0.0:
-            return None
-        ahead = [item for item in zones if item.side == "resistance" and item.low > trigger]
-        if not ahead:
-            return None
-        target_zone = min(item.low for item in ahead)
+        ahead = [item.low for item in zones if item.side == "resistance" and item.low > trigger]
+        target_zone = min(ahead) if ahead else None
         one_r = trigger + risk
-        if target_zone - trigger < risk:
-            return None
-        targets = {"1R": one_r, "2R": trigger + 2.0 * risk, "zone": target_zone}
+        two_r = trigger + 2.0 * risk
+        room = None if target_zone is None else target_zone - trigger
     else:
         trigger = float(lows[rc]) - offset
         pullback = float(np.max(highs[rc + 1 : arm + 1]))
@@ -393,18 +566,23 @@ def _build(zone, rc, arm, highs, lows, closes, available, factors, flags, zones,
         floor = trigger + float(cfg.stop_floor_atr) * zone.atr_d
         stop = max(natural, floor)
         risk = stop - trigger
-        if risk <= 0.0:
-            return None
-        ahead = [item for item in zones if item.side == "support" and item.high < trigger]
-        if not ahead:
-            return None
-        target_zone = max(item.high for item in ahead)
+        ahead = [item.high for item in zones if item.side == "support" and item.high < trigger]
+        target_zone = max(ahead) if ahead else None
         one_r = trigger - risk
-        if trigger - target_zone < risk:
-            return None
-        targets = {"1R": one_r, "2R": trigger - 2.0 * risk, "zone": target_zone}
+        two_r = trigger - 2.0 * risk
+        room = None if target_zone is None else trigger - target_zone
+    if risk <= 0.0:
+        return None, None
+    if sig.target == "zone":
+        if target_zone is None:
+            return None, "no_ahead"
+        if room < risk:
+            return None, "zone_lt_1r"
+    targets = {"1R": one_r, "2R": two_r}
+    if target_zone is not None:
+        targets["zone"] = float(target_zone)
     count = int(sum(flags.values()))
-    return Signal(
+    signal = Signal(
         symbol=zone.symbol,
         tf=sig.entry_tf,
         direction=direction,
@@ -421,6 +599,7 @@ def _build(zone, rc, arm, highs, lows, closes, available, factors, flags, zones,
         variant_id=sig.variant_id,
         confluence=count,
     )
+    return signal, None
 
 
 def _oscillator(name: str, highs, lows, closes) -> np.ndarray:
