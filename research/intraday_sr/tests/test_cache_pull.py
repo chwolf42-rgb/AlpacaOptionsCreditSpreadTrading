@@ -8,7 +8,7 @@ from datetime import date, datetime
 import pandas as pd
 import pytest
 
-from research.intraday_sr.data.cache import load_symbol, validate_symbol
+from research.intraday_sr.data.cache import load_symbol, symbol_cache_path, validate_symbol
 from research.intraday_sr.data.pull import HttpResponse, pull_gaps
 from research.intraday_sr.data.ratelimit import TimeOfDayLimiter
 from research.intraday_sr.types import ET
@@ -32,6 +32,22 @@ def _limiter() -> TimeOfDayLimiter:
         sleep=lambda seconds: clock.__setitem__("m", clock["m"] + seconds),
         now=lambda: datetime(2024, 6, 15, 12, 0, tzinfo=ET),
     )
+
+
+def test_symbol_cache_path_requires_one_part_file(tmp_path):
+    nested = tmp_path / "adj_factors"
+    nested.mkdir()
+    (tmp_path / "part_0003_SPY.parquet").write_bytes(b"")
+    (tmp_path / "SPY.parquet").write_bytes(b"")
+    (nested / "part_0003_SPY.parquet").write_bytes(b"")
+    (tmp_path / "part_0009_BRK-B.parquet").write_bytes(b"")
+    assert symbol_cache_path(tmp_path, "SPY").name == "part_0003_SPY.parquet"
+    assert symbol_cache_path(tmp_path, "BRK.B").name == "part_0009_BRK-B.parquet"
+    with pytest.raises(FileNotFoundError):
+        symbol_cache_path(tmp_path, "QQQ")
+    (tmp_path / "part_0004_SPY.parquet").write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        symbol_cache_path(tmp_path, "SPY")
 
 
 def test_load_symbol_reads_a_local_file(tmp_path):

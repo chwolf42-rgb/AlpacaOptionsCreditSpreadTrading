@@ -82,12 +82,13 @@ def repair_bad_prints(frame: pd.DataFrame, atr_by_session: dict) -> tuple[pd.Dat
     opens = out["open"].to_numpy(dtype=np.float64)
     stamps = pd.to_datetime(out["ts"])
     count = 0
+    unchecked = 0
     start = 0
     while start < len(out):
         stop = start + 1
         while stop < len(out) and symbols[stop] == symbols[start]:
             stop += 1
-        count += _repair_span(
+        flagged_here, missed = _repair_span(
             start,
             stop,
             symbols,
@@ -104,6 +105,8 @@ def repair_bad_prints(frame: pd.DataFrame, atr_by_session: dict) -> tuple[pd.Dat
             available,
             atr_by_session,
         )
+        count += flagged_here
+        unchecked += missed
         start = stop
     out["high"] = high
     out["low"] = low
@@ -111,6 +114,7 @@ def repair_bad_prints(frame: pd.DataFrame, atr_by_session: dict) -> tuple[pd.Dat
     out["low_unclamped"] = unclamped_low
     out["bad_print"] = flagged
     out["bad_print_visible_at"] = visible_at
+    out.attrs["session_end_unchecked"] = unchecked
     return out, count
 
 
@@ -138,8 +142,17 @@ def _repair_span(
     visible_at,
     available,
     atr_by_session: dict,
-) -> int:
+) -> tuple[int, int]:
+    """Return flagged spikes and bars with no same-session t+1 and t+2.
+
+    Those session-end bars stay unflagged and unclamped. Nothing is borrowed
+    from the next session or from an official close.
+    """
     count = 0
+    unchecked = 0
+    for index in range(start, stop):
+        if not _has_forward_pair(index, stop, sessions, stamps):
+            unchecked += 1
     for index in range(start + 2, stop - 2):
         if sessions[index] != sessions[index - 1] or sessions[index] != sessions[index + 2]:
             continue
@@ -166,4 +179,17 @@ def _repair_span(
         flagged[index] = True
         visible_at[index] = available[index + 2]
         count += 1
-    return count
+    return count, unchecked
+
+
+def _has_forward_pair(index: int, stop: int, sessions, stamps: pd.Series) -> bool:
+    """True when t+1 and t+2 are the next two 5m bars of this same session."""
+    if index + 2 >= stop:
+        return False
+    if sessions[index] != sessions[index + 1] or sessions[index] != sessions[index + 2]:
+        return False
+    opened = stamps.iloc[index]
+    return (
+        stamps.iloc[index + 1] - opened == pd.Timedelta(minutes=5)
+        and stamps.iloc[index + 2] - stamps.iloc[index + 1] == pd.Timedelta(minutes=5)
+    )

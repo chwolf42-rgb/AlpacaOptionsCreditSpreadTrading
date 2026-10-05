@@ -281,7 +281,8 @@ class Signal:
 
     ``trigger``, ``stop``, and ``targets`` are adjusted prices.
     ``as_traded = adjusted * Bar.adj_factor``, where ``Bar.adj_factor`` is
-    raw/adjusted. ``targets`` keys are exactly ``1R``, ``2R``, and ``zone``.
+    raw/adjusted. ``targets`` always has ``1R`` and ``2R``. ``zone`` is
+    included only when an opposite zone sits ahead of the trigger.
 
     ``confluence`` is how many of the three optional conditions held
     (oscillator, MACD, RVOL), from 0 to 3. It equals the count of those
@@ -320,8 +321,9 @@ class Signal:
         object.__setattr__(self, "stop", float(self.stop))
         object.__setattr__(self, "targets", freeze_map(self.targets))
         object.__setattr__(self, "components", freeze_map(self.components))
-        if set(self.targets) != _TARGET_KEYS:
-            raise ValueError("Signal.targets keys must be exactly 1R, 2R, and zone")
+        keys = set(self.targets)
+        if "1R" not in keys or "2R" not in keys or not keys <= _TARGET_KEYS:
+            raise ValueError("Signal.targets must include 1R and 2R; zone is optional")
         flag_count = sum(1 for name in _OPTIONAL_FLAGS if float(self.components.get(name, 0.0)) != 0.0)
         if flag_count != self.confluence:
             raise ValueError("Signal.confluence must equal the optional-condition count")

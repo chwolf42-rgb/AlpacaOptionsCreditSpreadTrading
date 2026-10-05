@@ -139,6 +139,16 @@ def test_normalize_flags_a_spike_from_wilder_atr():
     assert float(flagged["high"].iloc[0]) == pytest.approx(100.0)
 
 
+def test_session_end_bars_are_unchecked_and_unclamped():
+    day = date(2024, 6, 12)
+    raw = _session(day, np.full(78, 100.0), spike_at=77)
+    repaired, count = repair_bad_prints(raw, {("SPY", day): 2.0})
+    assert count == 0
+    assert repaired.attrs["session_end_unchecked"] == 2
+    assert not bool(repaired["bad_print"].iloc[-2:].any())
+    assert float(repaired["high"].iloc[-1]) == float(raw["high"].iloc[-1])
+
+
 def test_a_real_move_that_does_not_revert_is_left_alone():
     day = date(2024, 6, 12)
     closes = np.full(78, 100.0)
@@ -210,11 +220,11 @@ def test_aapl_factor_is_the_inverse_of_trading(tmp_path):
 def test_iterator_does_not_require_every_symbol_up_front(tmp_path):
     day = date(2024, 6, 12)
     factors = pd.Series({("SPY", day): 1.0, ("QQQ", day): 1.0})
-    for symbol, level in (("SPY", 100.0), ("QQQ", 200.0)):
+    for part, (symbol, level) in enumerate((("SPY", 100.0), ("QQQ", 200.0))):
         frame = _session(day, np.full(78, level))
         frame["symbol"] = symbol
         frame["ts"] = [ts.replace(tzinfo=None) for ts in frame["ts"]]
-        frame.to_parquet(tmp_path / f"{symbol}.parquet", index=False)
+        frame.to_parquet(tmp_path / f"part_{part:04d}_{symbol}.parquet", index=False)
     seen = []
     for symbol, frame, report in iter_symbol_bars(tmp_path, factors=factors, symbols=("SPY", "QQQ"), start=day, end=day):
         seen.append(symbol)
