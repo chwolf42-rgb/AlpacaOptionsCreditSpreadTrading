@@ -1,7 +1,7 @@
-# Intraday S/R confluence research: spec v1.3.3 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3.4 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
-Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2 and v1.3.3 Mon 2026-10-05 (CT). Values marked
+Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2, v1.3.3 and v1.3.4 Mon 2026-10-05 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
 v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
@@ -13,6 +13,10 @@ program N = **456**. Equity grids and F2/cache work are unchanged.
 v1.3.3 (Mon 2026-10-05 CT, before the 33×192 launch): zone collapse + density locks (Z1–Z8): pivot lookback,
 max zone width, straddle split, min clearance, stable zone identity. Fixed constants, no new trials; N stays 456;
 `GRID_SHA256` unchanged.
+v1.3.4 (Mon 2026-10-05 CT, before any 33×192 result is read): rulings R1–R5 on Christian's five requests. R1 rejects
+whole-day over-cap ranking (lookahead) and adds a cap-binding report row; R2–R5 are report-only side studies run after
+selection (zone sensitivity, d3+w6 guardrail row, IEX re-check, real option bars). No new trials; N stays 456;
+`GRID_SHA256` unchanged; launch head stays `30c20eb`; none of R1–R5 holds the 33×192 launch.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -42,6 +46,70 @@ binding and primary. Text kept for the record only.]*
 - Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
 
 **A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
+
+## v1.3.4 amendments (R1–R5) (Mon 2026-10-05 CT; these supersede earlier text wherever they conflict)
+
+Source: Christian's five requests, relayed via Chief of Staff and Team Manager (Trading has the same list), and the
+Architect's rulings on them, Mon 2026-10-05 CT. Committed **before** any 33×192 result is read. The new S/R rules are
+deliberately **not** matched to the old bot; nothing here asks the engine to reproduce old-bot zones or signals.
+
+**No new trials. N stays 456. No new grid axes. No engine change.** Every item is either a causal rule restated or a
+report-only output computed after selection. `GRID_SHA256` is unchanged:
+`2ef95123c015d70a1751f559f21fa1249d0b08aea272319e232f2facb120aa22`. The launch head stays engine `30c20eb`.
+**None of R1–R5 holds the 33×192 launch**; the report rows and side studies are built in the harness/readout and run
+on the launch's outputs (or after selection / CP4, as stated per item).
+
+**R6. Window rule for R2, R4 and R5 (Architect, 2026-10-05).** These side studies never open or re-read the §6 holdout (2026-04-01 → 2026-09-30) or the G7 forward window. Before the §6 holdout is read, they use only data through 2026-03-31. After it is read, holdout-period rows may be added but are labeled *post-holdout, descriptive*, and they never change a freeze, a pass decision or a frontier flag. Nothing from them touches the G7 window until G7 has been read.
+
+**R5. Real Alpaca option bars (report only, after equity CP4).**
+1. After equity CP4, the options overlay finalists (both books, daily | weekly, O1) are **re-priced on real Alpaca
+   historical option bars from 2024-02 onward**, wherever bars exist for the contract the overlay would have traded.
+2. Reported **beside** the §7 Black-Scholes MODEL rows for the same trades, with coverage stated: trades priced on real
+   bars vs trades with no bars (missing contracts are counted and listed, never filled from the model).
+3. Report only. It never re-selects equity finalists or overlay finalists, never changes a MODEL row, and adds
+   **0 trials**. The MODEL label stays on every Black-Scholes number.
+4. Pulls follow §2.3 rate limits and the §9 operational rules (data endpoints only).
+
+**R4. IEX-feed re-check of the equity finalists (report only, after finalists are chosen).**
+1. The same frozen config (FREEZE.md variant, config hash, git sha) is re-run on **Alpaca IEX 5m bars** over a stated
+   window. The window is set by the IEX data actually available for the finalists' symbols, and is written in the
+   readout before the re-check is read.
+2. **Caveat (required in the readout):** IEX carries only a small share of consolidated volume, so RVOL and the
+   volume-profile zones (HVN, session VWAP inputs) will differ materially from the SIP run. Signal and trade counts are
+   expected to differ.
+3. Read it as a **robustness check of the live feed**, not a pass/fail gate on its own. It adds **0 trials** and never
+   feeds selection, FREEZE, the §8 pass bar or frontier flags. The SIP development cache stays the authority (§2).
+
+**R3. Extra guardrail comparison row d3+w6 (report only, amends G1/G4).**
+1. Add comparison `RiskCfg(max_losses_day=3, max_losses_week=6)` (**d3+w6**: 3 losses/session, 6/week) to
+   `guardrail_compare.parquet`.
+2. Run **after** selection on the same per-fold selected variants and the same frozen finalists, with only `RiskCfg`
+   changed (G2). **0 trials.**
+3. The comparison set becomes **none, d2+w6, d3+w6**. **Primary stays d2+w5** (`PRIMARY_GUARDRAIL` unchanged).
+   The G4 per-finalist table becomes 4 rows: primary d2+w5 (first; this is the result), none, d2+w6, d3+w6.
+4. G2's ban stands: choosing the best guardrail after seeing results is forbidden.
+
+**R2. Zone-setting sensitivity (post-selection side study, frozen finalists only).**
+1. Grid: `min_clearance_atr` {0.05, **0.10**, 0.15} × `max_zone_width_atr` {0.75, **1.0**, 1.25} = **9 cells**;
+   0.10/1.0 is the primary cell (it must reproduce the primary result exactly).
+2. Run only on the frozen finalists, after FREEZE. Report-only, logged as **robustness**. It never feeds selection,
+   FREEZE, the §8 pass bar or the A1 frontier flags, and is not counted in N.
+3. Output goes to its own parquet (e.g. `zone_sensitivity.parquet`), which no selection, freeze or holdout code reads
+   (checked at checkpoints like G8's `guardrail_compare.parquet` rule).
+4. **0.10/1.0 stay locked for the primary run** (Z2, Z4, Z8). A finding here does not change them; any change needs a
+   new spec version committed before the run that uses it.
+
+**R1. Over-cap signal ranking (whole-day ranking REJECTED; report row added).**
+1. Ranking signals that exceed the caps by **whole-day signal score** is **rejected**: it needs signals that arrive
+   later in the session, which is lookahead and cannot be traded live.
+2. **Primary stays causal (unchanged §5 / G3.9):** entries are taken in time order; same-bar ties go to the higher
+   zone score, then symbol A→Z.
+3. **Add a 0-trial report row** (primary config, per test and per finalist):
+   - the share of sessions where the **12/day cap** binds, and the share where the **4-concurrent cap** binds;
+   - the count and the score distribution of **skipped vs taken** signals (skipped by a cap, reported separately
+     from signals blocked by the guardrail, G3.11).
+4. A causal alternative (a pre-set score floor, or reserved slots) needs its own **pre-registered study after CP4**;
+   its trials are counted in N.
 
 ## v1.3.3 amendments (Mon 2026-10-05 CT; these supersede §5 "Levels" and "Zones" wherever they conflict)
 
@@ -100,6 +168,7 @@ splits (Z2) → straddle split (Z3) → clearance trim (Z4.1) → pad (Z3/Z4.2) 
 
 **Z8. Audit note.** 0.10·ATR_d now does real selection work (90–93% of emitting zones sit within 0.25·ATR_d).
 It stays fixed and is **not** tuned on results; any change needs a new spec version committed before the run.
+*(v1.3.4 R2: a 9-cell clearance × width sensitivity runs only as a post-selection side study on frozen finalists.)*
 
 ## v1.3.2 amendments (Mon 2026-10-05 CT; these supersede A2, G6, and the §5/§7 options overlay text wherever they conflict)
 
@@ -137,6 +206,7 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
   is not a grid axis.
 - **Comparison configurations (report only):** **none** (the existing caps only) and **d2+w6** (2 losses/day,
   6 losses/week). The v1.1 combinations d2, w5 and w6 on their own are dropped.
+  *(v1.3.4 R3: add **d3+w6** (3 losses/session, 6/week); comparison set = none, d2+w6, d3+w6; primary stays d2+w5.)*
 
 **G2. Multiple testing and selection.**
 - The guardrail is fixed ex ante. It is not a searched parameter, so it adds **0 trials**. N stays 192 (Test A),
@@ -191,7 +261,7 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
 
 **G4. Readouts.**
 - **Per finalist** (equity and each options overlay row), a 3-row table: **primary d2+w5** (first row; this is the
-  result), **none**, and **d2+w6**. Columns: trades/mo; win rate; mean R with its 95% day-block bootstrap CI (§8
+  result), **none**, and **d2+w6** *(v1.3.4 R3: plus **d3+w6**, 4 rows)*. Columns: trades/mo; win rate; mean R with its 95% day-block bootstrap CI (§8
   settings); monthly return at 0.5% risk (mean with its month-block 95% CI); max drawdown; days halted by the day
   limit; weeks halted by the week limit; daily-stop days; signals blocked by the guardrail.
 - Every readout states the trades/mo each configuration actually achieved, in words, against Christian's ~200/mo
@@ -271,7 +341,7 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
   out in its fill bar; a daily-stop flatten whose losses count; R = 0 not counted as a loss.
 - **No selection used a comparison configuration:** selection, finalist and freeze code read only primary-config
   rows; no selection, freeze or holdout code reads `guardrail_compare.parquet`; the logged grid hash includes
-  `PRIMARY_GUARDRAIL`; and N is still 450.
+  `PRIMARY_GUARDRAIL`; and N is still 450 *(v1.3.2: 456)*.
 
 ## v1.3.1 clarifications (no new trials)
 
@@ -580,6 +650,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 - At most 3 concurrent positions and 1 per symbol. *(v1.1: 4 concurrent, see A1.)*
 - Daily loss stop: −1.5% equity, realized plus open. When hit, flatten and take no more entries that day.
 - At most 10 entries per day *(v1.1: 12, see A1)*. Ties go to the higher zone score, then symbol A→Z.
+  *(v1.3.4 R1: over-cap handling stays causal, time order then this tie-break; whole-day score ranking is rejected as
+  lookahead. A 0-trial report row gives cap-binding shares and skipped vs taken signals.)*
 - No new entries after 15:00 ET. Forced exit at the open of the 15:55 bar.
 - Model equity: $100,000, compounding daily.
 - If the `zone` target is less than 1R away, the trade is skipped.
@@ -656,6 +728,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 - **Regulatory fees:** 0.3 bp on sell notional.
 
 **Options (model-based; every number labeled MODEL):**
+*(v1.3.4 R5: after equity CP4, overlay finalists (both books) are also re-priced on real Alpaca option bars from
+2024-02 onward where bars exist, reported beside MODEL; report only, never re-selects.)*
 - **IV (index ETFs):**
   - σ_atm at time-to-expiry T: variance-time interpolation between the prior close's VIX9D (9 days) and
     VIX (30 days).
@@ -730,6 +804,8 @@ expected ceiling is ≈ 54 trades/mo at 60% WR [P]; see the G4 note.)* Monthly r
   - Every result vs. target is stated in words.
   - The trial count and grid hash appear on top.
   - *(v1.3: the 3-row guardrail table per finalist, primary d2+w5 / none / d2+w6, with trades/mo achieved; see G4.)*
+  - *(v1.3.4: d3+w6 row (R3); cap-binding row (R1); report-only blocks for zone sensitivity (R2), IEX re-check (R4)
+    and real option bars beside MODEL (R5).)*
 
 ## 9. Operational rules
 - Research only:
