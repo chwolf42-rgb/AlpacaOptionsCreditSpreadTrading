@@ -12,6 +12,7 @@ unclamped high and low.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Iterator
@@ -34,6 +35,7 @@ from research.intraday_sr.engine.zone_cache import (
     cached_zones,
     level_cfg_token,
     prefix_digest,
+    register_cache_clear,
     store_signals,
     tape_token,
     zone_cfg_token,
@@ -117,20 +119,25 @@ def signals(
         if hit is not None:
             return iter(hit)
     found: list[Signal] = []
-    raw_groups = {
-        str(symbol): _five_minute(group)
-        for symbol, group in raw.groupby("symbol", sort=True)
-    }
-    for symbol, group in clamped.groupby("symbol", sort=True):
-        group = _five_minute(group)
+    source_ptr = _open_ptr(clamped) if len(clamped) and "open" in clamped.columns else 0
+    raw_groups = {symbol: group for symbol, group in _symbol_frames(raw)}
+    prepared = []
+    group = None
+    entry = None
+    for symbol, group in _symbol_frames(clamped):
         if group.empty:
             continue
-        entry = raw_groups.get(str(symbol))
+        entry = raw_groups.get(symbol)
         if entry is None or entry.empty:
             continue
-        found.extend(
-            _symbol_signals(str(symbol), group, entry, start_at, end_at, cfg, sig, funnel)
-        )
+        prep = _ensure_prep(symbol, group, entry, end_at, cfg, sig, source_ptr)
+        if prep is not None and prep.available:
+            prepared.append(prep)
+    # Release the entry-tape copy and the groupby frames before the stamp
+    # walk fills the level cache. The prepared arrays already own the numbers.
+    del raw, raw_groups, clamped, group, entry
+    for prep in prepared:
+        found.extend(_emit(prep, start_at, end_at, cfg, sig, funnel))
     found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
     if funnel is not None:
         funnel.emits += len(found)
@@ -139,10 +146,23 @@ def signals(
     return iter(found)
 
 
+def _symbol_frames(frame: pd.DataFrame):
+    """One frame per symbol. A single symbol keeps the caller's block."""
+    symbols = pd.unique(frame["symbol"])
+    if len(symbols) == 1:
+        yield str(symbols[0]), _five_minute(frame)
+        return
+    for symbol, group in frame.groupby("symbol", sort=True):
+        yield str(symbol), _five_minute(group)
+
+
 def _five_minute(group: pd.DataFrame) -> pd.DataFrame:
-    group = group.sort_values("ts")
     if "tf" in group.columns:
-        group = group.loc[group["tf"].astype(str) == "5m"]
+        labels = group["tf"].to_numpy(copy=False)
+        if not np.all(labels.astype(str) == "5m"):
+            group = group.loc[group["tf"].astype(str) == "5m"]
+    if len(group) > 1 and not group["ts"].is_monotonic_increasing:
+        group = group.sort_values("ts")
     return group
 
 
@@ -150,76 +170,344 @@ def _entry_prices(frame: pd.DataFrame) -> pd.DataFrame:
     """High and low as printed. Levels and zones do not use this frame."""
     if frame.empty or "high_unclamped" not in frame.columns:
         return frame
-    out = frame.copy()
-    out["high"] = frame["high_unclamped"].to_numpy()
-    out["low"] = frame["low_unclamped"].to_numpy()
+    out = frame.copy(deep=False)
+    out["high"] = np.array(frame["high_unclamped"].to_numpy(copy=False), copy=True)
+    out["low"] = np.array(frame["low_unclamped"].to_numpy(copy=False), copy=True)
     return out
 
 
-def _symbol_signals(
+_PREP: dict[tuple, "_Prepared"] = {}
+_PREP_MAX = 8
+_SLICED = (
+    "closes",
+    "highs",
+    "lows",
+    "opens",
+    "volume",
+    "factors",
+    "available",
+    "sessions",
+    "osc",
+    "hist",
+    "macd_line",
+    "macd_signal",
+    "volume_ratio",
+)
+
+
+def _clear_prep() -> None:
+    _PREP.clear()
+
+
+register_cache_clear(_clear_prep)
+
+
+class _Prepared:
+    """Indicator and level state for one clamped tape.
+
+    A later call whose open array is a shorter prefix of this buffer reuses
+    the arrays. Indicators at bar i depend only on bars up to i, so the slice
+    matches a tape that was built on that prefix alone.
+    """
+
+    __slots__ = (
+        "key",
+        "symbol",
+        "n_base",
+        "base_close",
+        "plan",
+        "segments",
+        "history",
+        "zones_key_cfg",
+        "levels_key_cfg",
+        "tape_open",
+        "tape_close",
+        "tape_volume",
+        "tape_avail",
+        "day_index",
+        "first_of_day",
+        "ordered_days",
+        "day_pos",
+        "session_ord",
+        "closes",
+        "highs",
+        "lows",
+        "opens",
+        "volume",
+        "factors",
+        "available",
+        "sessions",
+        "osc",
+        "hist",
+        "macd_line",
+        "macd_signal",
+        "volume_ratio",
+        "oversold",
+        "overbought",
+        "width",
+    )
+
+    def view(self, end: datetime) -> "_Prepared":
+        cut = bisect.bisect_right(self.available, end)
+        if cut == len(self.available):
+            return self
+        twin = _Prepared.__new__(_Prepared)
+        for name in self.__slots__:
+            setattr(twin, name, getattr(self, name))
+        for name in _SLICED:
+            setattr(twin, name, getattr(self, name)[:cut])
+        return twin
+
+
+def _open_ptr(frame: pd.DataFrame) -> int:
+    # The stored column may be float32. Casting here would allocate a new
+    # buffer and the prefix identity would miss.
+    values = frame["open"].to_numpy(copy=False)
+    return int(values.__array_interface__["data"][0])
+
+
+def _prep_identity(sig: SignalCfg, cfg: EngineCfg) -> tuple:
+    return (
+        sig.entry_tf,
+        sig.oscillator,
+        int(cfg.rvol_sessions),
+        int(cfg.macd_fast),
+        int(cfg.macd_slow),
+        int(cfg.macd_signal),
+        level_cfg_token(cfg),
+    )
+
+
+def _reuse_prep(
+    base: pd.DataFrame,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    source_ptr: int,
+    symbol: str,
+) -> _Prepared | None:
+    if not source_ptr:
+        return None
+    key = (source_ptr, symbol, _prep_identity(sig, cfg))
+    parent = _PREP.get(key)
+    if parent is None:
+        return None
+    n = len(base)
+    if n == 0 or n > parent.n_base:
+        if n > parent.n_base:
+            _PREP.pop(key, None)
+        return None
+    if float(base["close"].iloc[n - 1]) != float(parent.base_close[n - 1]):
+        return None
+    if float(base["open"].iloc[0]) != float(parent.tape_open[0]):
+        return None
+    return parent.view(end)
+
+
+def _store_prep(prep: _Prepared) -> None:
+    current = _PREP.get(prep.key)
+    if current is not None and current.n_base > prep.n_base:
+        return
+    _PREP[prep.key] = prep
+    while len(_PREP) > _PREP_MAX:
+        _PREP.pop(next(iter(_PREP)))
+
+
+def _base_donor(source_ptr: int, symbol: str, base: pd.DataFrame, cfg: EngineCfg) -> _Prepared | None:
+    """Another entry timeframe on this same clamped tape.
+
+    Pivots and the 5m touch arrays depend only on the clamped base. A second
+    variant would otherwise build another full pivot list.
+    """
+    if not source_ptr or base.empty:
+        return None
+    token = level_cfg_token(cfg)
+    n = len(base)
+    last = float(base["close"].iloc[n - 1])
+    first = float(base["open"].iloc[0])
+    for prep in _PREP.values():
+        if prep.key[0] != source_ptr or prep.key[1] != symbol or prep.key[2][-1] != token:
+            continue
+        if prep.n_base != n:
+            continue
+        if float(prep.base_close[n - 1]) != last or float(prep.tape_open[0]) != first:
+            continue
+        return prep
+    return None
+
+
+def _build_prep(
+    symbol: str,
+    base: pd.DataFrame,
+    raw: pd.DataFrame,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    source_ptr: int,
+) -> _Prepared | None:
+    tape = raw if sig.entry_tf == "5m" else timeframe_frame(raw, sig.entry_tf)
+    if tape is None or tape.empty:
+        return None
+    if len(tape) > 1 and not tape["ts"].is_monotonic_increasing:
+        tape = tape.sort_values("ts")
+    if not (
+        isinstance(tape.index, pd.RangeIndex)
+        and tape.index.start == 0
+        and getattr(tape.index, "step", 1) == 1
+    ):
+        tape = tape.reset_index(drop=True)
+    if tape["available_at"].iloc[-1] > end or not tape["available_at"].is_monotonic_increasing:
+        tape = tape.loc[tape["available_at"] <= end]
+    if tape.empty:
+        return None
+    # Pivots are confirmed on the clamped tape, and a pivot whose window
+    # contains a not-yet-visible bad print is dated at that clamp's visible_at.
+    # Each 15m stamp then keeps only clamps with visible_at <= stamp. Touch,
+    # arm, trigger, and stop stay on the unclamped entry tape.
+    prep = _Prepared.__new__(_Prepared)
+    prep.symbol = symbol
+    prep.key = (source_ptr, symbol, _prep_identity(sig, cfg))
+    prep.n_base = len(base)
+    donor = _base_donor(source_ptr, symbol, base, cfg)
+    if donor is None:
+        prep.base_close = base["close"].to_numpy(dtype=np.float64)
+        prep.plan = _LevelTape(symbol, base, cfg)
+        prep.segments = _segments(base)
+        prep.history = prep.plan.hashes
+        prep.tape_open = base["open"].to_numpy(dtype=np.float64)
+        prep.tape_close = base["close"].to_numpy(dtype=np.float64)
+        prep.tape_volume = base["volume"].to_numpy(dtype=np.float64)
+        prep.tape_avail = [_as_dt(value) for value in base["available_at"]]
+        tape_session = [session_day(value) for value in base["session"]]
+        prep.day_index = {day: pos for pos, day in enumerate(sorted(set(tape_session)))}
+        first_of_day: dict = {}
+        for pos, day in enumerate(tape_session):
+            first_of_day.setdefault(day, pos)
+        prep.first_of_day = first_of_day
+        prep.ordered_days = sorted(first_of_day)
+        prep.day_pos = {day: pos for pos, day in enumerate(prep.ordered_days)}
+        prep.session_ord = np.array([prep.day_index[day] for day in tape_session], dtype=np.float64)
+    else:
+        prep.base_close = donor.base_close
+        prep.plan = donor.plan
+        prep.segments = donor.segments
+        prep.history = donor.history
+        prep.tape_open = donor.tape_open
+        prep.tape_close = donor.tape_close
+        prep.tape_volume = donor.tape_volume
+        prep.tape_avail = donor.tape_avail
+        prep.day_index = donor.day_index
+        prep.first_of_day = donor.first_of_day
+        prep.ordered_days = donor.ordered_days
+        prep.day_pos = donor.day_pos
+        prep.session_ord = donor.session_ord
+    prep.zones_key_cfg = zone_cfg_token(cfg)
+    prep.levels_key_cfg = level_cfg_token(cfg)
+    prep.closes = tape["close"].to_numpy(dtype=np.float64)
+    prep.highs = tape["high"].to_numpy(dtype=np.float64)
+    prep.lows = tape["low"].to_numpy(dtype=np.float64)
+    prep.opens = tape["open"].to_numpy(dtype=np.float64)
+    prep.volume = tape["volume"].to_numpy(dtype=np.float64)
+    if "adj_factor" in tape.columns:
+        prep.factors = tape["adj_factor"].to_numpy(dtype=np.float64)
+    else:
+        prep.factors = np.ones(len(tape), dtype=np.float64)
+    prep.available = [_as_dt(value) for value in tape["available_at"]]
+    if "session" in tape.columns:
+        prep.sessions = [session_day(value) for value in tape["session"]]
+    else:
+        prep.sessions = [prep.available[i].date() for i in range(len(tape))]
+    prep.osc = _oscillator(sig.oscillator, prep.highs, prep.lows, prep.closes)
+    prep.macd_line, prep.macd_signal, prep.hist = macd(
+        prep.closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal
+    )
+    slot = minute_of_day(tape["ts"])
+    session_codes = pd.factorize(np.array(prep.sessions, dtype=object), sort=False)[0]
+    prep.volume_ratio = rvol(prep.volume, session_codes, slot, int(cfg.rvol_sessions))
+    prep.oversold, prep.overbought = _thresholds(sig.oscillator)
+    prep.width = timedelta(minutes=5 if sig.entry_tf == "5m" else 15)
+    return prep
+
+
+def _ensure_prep(
     symbol: str,
     clamped: pd.DataFrame,
     raw: pd.DataFrame,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    source_ptr: int,
+) -> _Prepared | None:
+    if (
+        isinstance(clamped.index, pd.RangeIndex)
+        and clamped.index.start == 0
+        and getattr(clamped.index, "step", 1) == 1
+    ):
+        base = clamped
+    else:
+        base = clamped.reset_index(drop=True)
+    if base.empty:
+        return None
+    prep = _reuse_prep(base, end, cfg, sig, source_ptr, symbol)
+    if prep is None:
+        prep = _build_prep(symbol, base, raw, end, cfg, sig, source_ptr)
+        if prep is None:
+            return None
+        _store_prep(prep)
+    return prep
+
+
+def _emit(
+    prep: _Prepared,
     start: datetime,
     end: datetime,
     cfg: EngineCfg,
     sig: SignalCfg,
     funnel: SignalFunnel | None,
 ) -> list[Signal]:
-    tape = raw if sig.entry_tf == "5m" else timeframe_frame(raw, sig.entry_tf)
-    if tape is None or tape.empty:
-        return []
-    tape = tape.sort_values("ts").reset_index(drop=True)
-    tape = tape.loc[tape["available_at"] <= end]
-    if tape.empty:
-        return []
-    base = clamped.reset_index(drop=True)
-    # Pivots are confirmed on the clamped tape, and a pivot whose window
-    # contains a not-yet-visible bad print is dated at that clamp's visible_at.
-    # Each 15m stamp then keeps only clamps with visible_at <= stamp. Touch,
-    # arm, trigger, and stop stay on the unclamped entry tape.
-    plan = _LevelTape(symbol, base, cfg)
-    segments = _segments(base)
-    history = plan.hashes
+    symbol = prep.symbol
+    plan = prep.plan
+    segments = prep.segments
+    history = prep.history
+    # K changes the zone key and not the level key. Take both from this call
+    # so a reused tape does not serve another K's zones.
     zones_key_cfg = zone_cfg_token(cfg)
     levels_key_cfg = level_cfg_token(cfg)
-    tape_open = base["open"].to_numpy(dtype=np.float64)
-    tape_close = base["close"].to_numpy(dtype=np.float64)
-    tape_volume = base["volume"].to_numpy(dtype=np.float64)
-    tape_avail = [_as_dt(value) for value in base["available_at"]]
-    tape_session = [session_day(value) for value in base["session"]]
-    day_index = {day: pos for pos, day in enumerate(sorted(set(tape_session)))}
-    first_of_day: dict = {}
-    for pos, day in enumerate(tape_session):
-        first_of_day.setdefault(day, pos)
-    ordered_days = sorted(first_of_day)
-    day_pos = {day: pos for pos, day in enumerate(ordered_days)}
-    session_ord = np.array([day_index[day] for day in tape_session], dtype=np.float64)
-    closes = tape["close"].to_numpy(dtype=np.float64)
-    highs = tape["high"].to_numpy(dtype=np.float64)
-    lows = tape["low"].to_numpy(dtype=np.float64)
-    opens = tape["open"].to_numpy(dtype=np.float64)
-    volume = tape["volume"].to_numpy(dtype=np.float64)
-    if "adj_factor" in tape.columns:
-        factors = tape["adj_factor"].to_numpy(dtype=np.float64)
-    else:
-        factors = np.ones(len(tape), dtype=np.float64)
-    available = [_as_dt(value) for value in tape["available_at"]]
-    sessions = [session_day(value) for value in tape["session"]] if "session" in tape.columns else [available[i].date() for i in range(len(tape))]
-    osc = _oscillator(sig.oscillator, highs, lows, closes)
-    _line, _signal, hist = macd(closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
-    slot = minute_of_day(tape["ts"])
-    session_codes = pd.factorize(np.array(sessions, dtype=object), sort=False)[0]
-    volume_ratio = rvol(volume, session_codes, slot, int(cfg.rvol_sessions))
-    oversold, overbought = _thresholds(sig.oscillator)
-    width = timedelta(minutes=5 if sig.entry_tf == "5m" else 15)
-    snapshots: dict[datetime, list[Zone]] = {}
+    tape_open = prep.tape_open
+    tape_close = prep.tape_close
+    tape_volume = prep.tape_volume
+    tape_avail = prep.tape_avail
+    day_index = prep.day_index
+    first_of_day = prep.first_of_day
+    ordered_days = prep.ordered_days
+    day_pos = prep.day_pos
+    session_ord = prep.session_ord
+    closes = prep.closes
+    highs = prep.highs
+    lows = prep.lows
+    opens = prep.opens
+    volume = prep.volume
+    factors = prep.factors
+    available = prep.available
+    sessions = prep.sessions
+    osc = prep.osc
+    _line = prep.macd_line
+    _signal = prep.macd_signal
+    hist = prep.hist
+    volume_ratio = prep.volume_ratio
+    oversold = prep.oversold
+    overbought = prep.overbought
+    width = prep.width
+    # Only the current 15m stamp's zones stay materialized. The cache holds
+    # the compact history, so a full-span walk does not retain every Zone.
+    current_key = None
+    current_zones: list[Zone] = []
     # Per zone: touch index, rc index, or None once consumed.
     armed_until: dict[str, int] = {}
     out: list[Signal] = []
     warmup = datetime.fromisoformat(str(cfg.warmup_date)).date()
     cutoff_cursor = 0
-    for index in range(len(tape)):
+    for index in range(len(available)):
         stamp_at = available[index]
         if stamp_at < start or stamp_at > end:
             continue
@@ -230,19 +518,20 @@ def _symbol_signals(
         recompute = floor_15m(stamp_at, sessions[index])
         if recompute is None:
             continue
-        if recompute not in snapshots:
+        if recompute != current_key:
+            current_key = recompute
             current_day = sessions[index]
             atr = plan.atr_by_day.get(current_day)
             if atr is None:
                 atr = _atr_from_segments(segments, stamp_at, int(cfg.atr_length))
             if atr is None:
-                snapshots[recompute] = []
+                current_zones = []
             else:
                 while cutoff_cursor < len(tape_avail) and tape_avail[cutoff_cursor] <= recompute:
                     cutoff_cursor += 1
                 cutoff = cutoff_cursor
                 if cutoff == 0:
-                    snapshots[recompute] = []
+                    current_zones = []
                 else:
                     origin = ordered_days[max(0, day_pos[current_day] - int(cfg.touch_sessions))]
                     begin = first_of_day[origin]
@@ -262,7 +551,7 @@ def _symbol_signals(
                         level_key=level_key,
                         begin=begin,
                     ):
-                        live = cached_levels(level_key, lambda: plan.levels_at(cutoff, recompute))
+                        live = cached_levels(level_key, lambda: plan.pack(plan.levels_at(cutoff, recompute)))
                         touch_low, touch_high = plan.asof_high_low(begin, cutoff, recompute)
                         return fast_zones(
                             live,
@@ -279,8 +568,8 @@ def _symbol_signals(
                             cfg=cfg,
                         )
 
-                    snapshots[recompute] = cached_zones(zone_key, build_zones)
-        zones = snapshots[recompute]
+                    current_zones = cached_zones(zone_key, build_zones)
+        zones = current_zones
         if funnel is not None and zones:
             _tally(
                 funnel,
