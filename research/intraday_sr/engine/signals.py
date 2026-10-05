@@ -24,6 +24,7 @@ from research.intraday_sr.engine.indicators import macd, rsi_wilder, rvol, stoch
 from research.intraday_sr.engine.levels import (
     _atr_from_segments,
     _levels_at_stamp,
+    _opening_range_table,
     _pivot_tape,
     _segments,
     timeframe_frame,
@@ -31,8 +32,11 @@ from research.intraday_sr.engine.levels import (
 from research.intraday_sr.engine.tape import floor_15m, minute_of_day, session_day
 from research.intraday_sr.engine.zone_cache import (
     cached_levels,
+    cached_signals,
     cached_zones,
     level_cfg_token,
+    prefix_hashes,
+    store_signals,
     tape_token,
     zone_cfg_token,
 )
@@ -94,6 +98,24 @@ def signals(
     raw = _entry_prices(visible)
     start_at = as_et(start, "start")
     end_at = as_et(end, "end")
+    cache_key = None
+    if funnel is None:
+        cache_key = (
+            tape_token(clamped),
+            start_at,
+            end_at,
+            zone_cfg_token(cfg),
+            sig.variant_id,
+            sig.target,
+            int(sig.k_confirm),
+            sig.entry_tf,
+            sig.oscillator,
+            float(sig.rvol_min),
+            sig.test,
+        )
+        hit = cached_signals(cache_key)
+        if hit is not None:
+            return iter(hit)
     found: list[Signal] = []
     raw_groups = {
         str(symbol): _five_minute(group)
@@ -112,6 +134,8 @@ def signals(
     found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
     if funnel is not None:
         funnel.emits += len(found)
+    elif cache_key is not None:
+        store_signals(cache_key, found)
     return iter(found)
 
 
@@ -155,7 +179,11 @@ def _symbol_signals(
     # because June's close has moved away.
     pivots, pivot_prices = _pivot_tape(symbol, base, cfg)
     segments = _segments(base)
-    history = tape_token(base)
+    # Prefix hashes, not the whole-tape hash: a shorter as-of is a prefix of
+    # a longer one, so stamps already built stay hits. The opening-range pair
+    # is one pass per session and then a lookup.
+    history = prefix_hashes(base)
+    opening = _opening_range_table(base)
     zones_key_cfg = zone_cfg_token(cfg)
     levels_key_cfg = level_cfg_token(cfg)
     atr_by_day: dict = {}
@@ -226,8 +254,8 @@ def _symbol_signals(
                     begin = first_of_day[origin]
                     sl = slice(begin, cutoff)
                     ages = day_index[current_day] - session_ord[begin:cutoff]
-                    level_key = (history, symbol, recompute, levels_key_cfg)
-                    zone_key = (history, symbol, sig.entry_tf, recompute, zones_key_cfg)
+                    level_key = (int(history[cutoff - 1]), symbol, recompute, levels_key_cfg)
+                    zone_key = (int(history[cutoff - 1]), symbol, sig.entry_tf, recompute, zones_key_cfg)
 
                     def build_zones(
                         symbol=symbol,
@@ -241,7 +269,13 @@ def _symbol_signals(
                         live = cached_levels(
                             level_key,
                             lambda: _levels_at_stamp(
-                                symbol, base.iloc[:cutoff], pivots, pivot_prices, recompute, cfg
+                                symbol,
+                                base.iloc[:cutoff],
+                                pivots,
+                                pivot_prices,
+                                recompute,
+                                cfg,
+                                opening=opening,
                             ),
                         )
                         return fast_zones(
