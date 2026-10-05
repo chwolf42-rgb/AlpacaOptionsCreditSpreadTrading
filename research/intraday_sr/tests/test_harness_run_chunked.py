@@ -139,17 +139,46 @@ def test_symbols_filter_and_timing_only(tmp_path):
 
 
 def test_spill_file_loads_in_a_fresh_process(tmp_path):
-    """Spilled S0 signals (MappingProxyType fields) unpickle outside the run, equal to the originals."""
+    """Spilled S0 signals (_MapView / InitVar maps) unpickle outside the run with contents intact."""
+    import math
     import subprocess
     import sys
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
     from research.intraday_sr.harness import spill as SP
+    from research.intraday_sr.types import Signal, Zone
 
+    # Stub signals use NaN targets (repr compare only). Also round-trip a finite real Signal.
     sigs = [sig(symbol="AAA", day="2024-03-04"), sig(symbol="AAA", day="2024-03-05")]
     SP.write(tmp_path, "A-fx0", "AAA", sigs)
-    assert repr(SP.read(tmp_path, "A-fx0", ["AAA"])) == repr(sigs)      # repr: the stub targets hold NaN
+    assert repr(SP.read(tmp_path, "A-fx0", ["AAA"])) == repr(sigs)
     code = ("import pickle,sys; s=pickle.load(open(sys.argv[1],'rb')); "
             "print(len(s), type(s[0].components).__name__, s[0].components['n_confirm'])")
     outp = subprocess.run([sys.executable, "-c", code, str(tmp_path / "A-fx0" / "AAA.pkl")], capture_output=True,
                           text=True, cwd=str(__import__("pathlib").Path(__file__).resolve().parents[3]), check=True)
-    assert outp.stdout.split() == ["2", "mappingproxy", "3.0"]
+    assert outp.stdout.split()[:1] == ["2"]
+    assert outp.stdout.split()[2] == "3.0"
+    assert outp.stdout.split()[1] in ("_MapView", "mappingproxy")
+
+    et = ZoneInfo("America/New_York")
+    ts = datetime(2019, 6, 20, 10, 30, tzinfo=et)
+    z = Zone(symbol="SPY", low=100.0, high=101.0, side="support", score=0.5,
+             components={"touches": 1.0, "recency": 0.5}, kinds=("pivot_5m",),
+             as_of_ts=ts, valid_from_ts=ts, available_at=ts, engine_cfg="K3-rsi-1.5-5m-1R-k0",
+             tf="5m", atr_d=1.5)
+    s = Signal(symbol="SPY", tf="5m", direction=1, test="A", zone=z, formation=None,
+               trigger=101.5, stop=99.0, targets={"1R": 103.0, "2R": 104.5},
+               expires_at=ts, components={"rsi": 1.0}, as_of_ts=ts, available_at=ts,
+               variant_id="K3-rsi-1.5-5m-1R-k0", confluence=0)
+    SP.write(tmp_path, "finite", "SPY", [s])
+    got = SP.read(tmp_path, "finite", ["SPY"])[0]
+    assert got == s
+    assert dict(got.targets) == {"1R": 103.0, "2R": 104.5}
+    assert dict(got.components) == {"rsi": 1.0}
+    assert dict(got.zone.components) == {"touches": 1.0, "recency": 0.5}
+    # After clear_zone_cache / release_frozen_maps the spilled bytes must still load.
+    from research.intraday_sr.engine.zone_cache import clear_zone_cache
+    clear_zone_cache()
+    got2 = SP.read(tmp_path, "finite", ["SPY"])[0]
+    assert got2 == s and not math.isnan(got2.targets["1R"])
