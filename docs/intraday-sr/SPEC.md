@@ -1,13 +1,15 @@
-# Intraday S/R confluence research: spec v1.3.1 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3.2 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
-Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT). Values marked
+Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2 Mon 2026-10-05 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
 v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
 every result; a forward holdout is added. See the v1.3 amendments (G1–G8), which replace A3.
 v1.3.1 (Sun 2026-10-04 CT, before any run): clarifications C1–C3 (bad prints, holdout lock, guardrail constant),
-from the CP0 review of PR #20. No new trials; N stays 450.
+from the CP0 review of PR #20. No new trials; N was 450.
+v1.3.2 (Mon 2026-10-05 CT, before any options overlay run): dual-expiry books (O1). Options overlay N becomes 24;
+program N = **456**. Equity grids and F2/cache work are unchanged.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -27,7 +29,7 @@ Source: Christian's asks relayed via Trading after v1.0 was frozen. Committed be
 - Pricing: Black-Scholes repriced on every 5m bar from the underlying's high, low and close, using the §7 IV and skew model. If the stop and the TP are both reachable within a bar, the stop wins. Buy at the ask, sell at the bid, $0.05/contract.
 - Report per variant: win rate, avg win and avg loss, trades/mo, monthly mean with 95% CI, max DD, worst day, and break-even win rate after costs.
 - Caveat in every readout: VIX9D-based IV understates near-expiry skew and gamma, so these 0DTE numbers are low-confidence.
-- Total options variants = 9 (v1.0 overlay) + 9 (0DTE) = 18, all logged, never used to re-select equity finalists.
+- Total options variants = 9 (v1.0 overlay) + 9 (0DTE) = 18, all logged, never used to re-select equity finalists. *(v1.3.2 O1: dual books → 6 baseline + 18 A2 = 24 rows; N = 456. A2 scenarios apply to both books, not daily-only.)*
 
 **A3. Loss guardrails (reporting overlay, not selection).** *[Superseded by v1.3 G1–G8: the guardrail d2+w5 is now
 binding and primary. Text kept for the record only.]*
@@ -37,6 +39,23 @@ binding and primary. Text kept for the record only.]*
 - Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
 
 **A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
+
+## v1.3.2 amendments (Mon 2026-10-05 CT; these supersede A2, G6, and the §5/§7 options overlay text wherever they conflict)
+
+Source: Christian's reinforcer relayed by Trading via Team Manager on Mon 2026-10-05: **options overlay scaffolding must cover both daily and weekly expiries from the start** — side-by-side books, same exits and risk scenarios. Not daily-only. Committed before any options overlay run. Does **not** start overlay coding; Dev 1 implements only when the Architect clears parallel overlay work. Equity engine/harness (F2, cache, CP4) stays first.
+
+**O1. Dual-expiry books (binding scaffold rule).**
+1. From the first options overlay scaffold commit (`harness/options.py` and dependents), every overlay **scenario** runs **two books in parallel**: `book=daily` and `book=weekly`.
+2. Same frozen-finalist signals, same structure, same stop / take-profit / time-exit / sizing. Only the listed expiry chosen for that trade differs.
+3. **Daily book:** nearest listed expiry with calendar DTE ≤ 1 on that date (same-day / 0DTE when the calendar lists it). If none, skip for that book and count the skip. A skip is not a trade under G3.
+4. **Weekly book:** nearest listed **weekly** expiry for that symbol — Friday weeklies for single names; for SPY/QQQ/IWM the **Friday weekly** even after daily listings exist — with calendar DTE in **2–10** trading days **[P]**. Prefer Friday over mid-week weeklies when both exist **[P]**. If none, skip and count.
+5. Each `(scenario, book)` is its own G3 portfolio under primary **d2+w5**. Loss counts and blocked-signal counts do **not** cross books.
+6. **Readouts** always show daily | weekly side-by-side for every scenario. A scaffold or readout that is daily-only or weekly-only is a **protocol breach**.
+7. **A2 high-risk sleeve (amends A2):** the 9 option-price stop {−30%, −40%, −50%} × take-profit {+50%, +65%, +80%} scenarios, time exit **15:45 ET**, sizing **$2,000** premium on $100k (2%), apply to **both** books (A2 was daily/0DTE only). Still labeled *higher-risk, model-based*. VIX9D understatement caveat applies especially to the daily book; the weekly book is still MODEL. Rows = **9 × 2 = 18**.
+8. **Baseline §5 sleeve (amends §5 options overlay):** replace the DTE-bucket axis with the book axis. Structures stay {long ATM, long 1 strike OTM, debit vertical (long ATM, short nearest the equity target)}. Count = **3 structures × 2 books = 6** (was 9 structure×DTE). Exit still matches the equity trade (stop, target, or 15:55 forced exit) unless a scenario says otherwise.
+9. **Trial count N (amends G2 / A2 totals):** options overlay rows = 6 + 18 = **24**. Program N = 192 (Test A) + 192 (Test B) + 48 (formations) + 24 = **456** (was 450). Overlay rows are logged and feed DSR N; they still never re-select equity finalists. Guardrail comparisons remain 0 selection trials.
+10. §7 expiry **calendars** (what was listed when) stay the authority Dev 1 verifies against Cboe history. O1 only chooses which listed expiry each book takes. Single-name Friday-only listing history still means the daily book skips most single-name days — report those skips.
+11. G6 still applies: both books run under primary d2+w5; each `(scenario, book)` is its own portfolio; skips are not losses.
 
 ## v1.3 amendments (Sun 2026-10-04 CT; these supersede v1.2 and earlier wherever they conflict)
 
@@ -60,7 +79,7 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
 
 **G2. Multiple testing and selection.**
 - The guardrail is fixed ex ante. It is not a searched parameter, so it adds **0 trials**. N stays 192 (Test A),
-  192 (Test B), 48 (formations alone) and 18 (options overlays): 450 in total.
+  192 (Test B), 48 (formations alone) and 24 (options overlays under O1 dual books): **456** in total. *(v1.3.2: was 18 / 450.)*
 - The following are computed **only** on the primary configuration: per-fold variant selection (including the
   ≥ 200 train-trade minimum), both §6 finalist rules, FREEZE.md, every item of the §8 pass bar, the deflated Sharpe,
   the ±1-step neighborhood check, the per-year and per-symbol robustness checks, the holdout, the forward holdout
@@ -141,14 +160,14 @@ data, grids, folds, costs and the §8 pass bar are unchanged. **G1–G8 replace 
   d2+w5: 61 holdout trades, underpowered"), and that result cannot pass. The bar is not relaxed, and a comparison
   configuration cannot stand in for the primary one.
 
-**G6. Options overlays under the primary guardrail (amends A2 and the §5 options overlay).**
-- The 0DTE overlay (A2, 9 variants) runs under d2+w5. So does the v1.0 options overlay (9 variants), because every
-  reported result uses the primary configuration.
-- Each overlay variant is its own portfolio. It receives the frozen finalist's signals and applies G3 to its **own**
+**G6. Options overlays under the primary guardrail (amends A2 and the §5 options overlay).** *(v1.3.2: see O1 dual books.)*
+- Every overlay scenario runs under d2+w5 on **both** the daily and weekly books (O1). Every reported result uses the
+  primary configuration.
+- Each `(scenario, book)` is its own portfolio. It receives the frozen finalist's signals and applies G3 to its **own**
   closed option trades: a loss is an option trade with R < 0 after spread and fees (R = premium paid, §7). Signals
-  skipped because no same-day expiry existed are not trades and do not count.
-- Still 18 options variants, 0 added trials, never used to re-select equity finalists. The overlay readout gets the
-  same 3-row table (G4).
+  skipped because that book's expiry did not exist are not trades and do not count.
+- **24** options rows (6 baseline + 18 A2×books), 0 added selection trials, never used to re-select equity finalists.
+  The overlay readout gets the same 3-row table (G4) **per book**, shown side-by-side (O1.6).
 
 **G7. Forward holdout (approved by Christian via Trading, Sun 2026-10-04).**
 - **Purpose:** a confirmation read after the §6 holdout, because 2026-04-01 → 2026-09-30 is shared by every phase-1
@@ -230,7 +249,7 @@ stays 450.
 
 ## 0. Scope and non-goals
 - Question: does a support/resistance confluence entry on 5m/15m, flat by the close, have a positive
-  after-cost edge out of sample on a fixed liquid universe, as equities and as a 0–7 DTE long-options overlay?
+  after-cost edge out of sample on a fixed liquid universe, as equities and as a long-options overlay with **daily and weekly** expiry books side-by-side (O1)?
 - Not in scope: live or paper trading, changes under `src/alpaca_options_credit/`, any running bot,
   tuning toward Christian's targets. Results below target are reported plainly.
 
@@ -516,11 +535,12 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 - **Test A:** 3·2·2·2·2·3 = **144** variants. **Test B:** the same 144. *(Superseded by v1.1 A1: 192 each, with `k_confirm` added and `k_cluster` fixed at 0.25.)*
 - **Formations alone:** 4 kinds × TF (2) × target (3) × pivot tolerance {0.15, 0.25 ATR_d} (2) = **48**,
   i.e. 12 per kind.
-- **Options overlay:** 9 variants, applied only to frozen equity finalists, never used to re-select them:
-  - structure: long ATM, long 1 strike OTM, or a debit vertical (long ATM, short at the strike nearest the
-    equity target);
-  - DTE bucket: 0–1, 2–4, or 5–7.
-  - *(v1.3: runs under the primary guardrail d2+w5, see G6.)*
+- **Options overlay:** applied only to frozen equity finalists, never used to re-select them. *(v1.3.2 O1 dual books.)*
+  - **Books (required):** every scenario runs `daily` and `weekly` side-by-side (O1). Daily-only scaffolding is forbidden.
+  - **Baseline sleeve (6):** structure {long ATM, long 1 strike OTM, debit vertical (long ATM, short at the strike
+    nearest the equity target)} × book {daily, weekly}. The old DTE-bucket axis (0–1 / 2–4 / 5–7) is replaced by the book.
+  - **A2 high-risk sleeve (18):** 9 stop×TP scenarios × book {daily, weekly}; see A2 and O1.7.
+  - *(v1.3: runs under the primary guardrail d2+w5, see G6; v1.3.2: 24 rows, N = 456.)*
 - Everything else is fixed: N per TF, score weights, windows, buffers, and costs.
 - **Trial log:** `triallog.parquet` gets one row per (test, variant, fold) with the grid hash, git sha,
   symbols, and metrics. The trial count N per test feeds the deflated Sharpe in §6.
@@ -589,11 +609,13 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
   dividends.
   - Theta is charged by repricing at exit with the remaining T. Exit IV equals entry IV; sensitivity
     row: exit IV −10%.
-- **Expiries (conservative [P]; Dev 1 verifies against Cboe listing history):**
-  - Single names: Friday weeklies only.
+- **Expiries (conservative [P]; Dev 1 verifies against Cboe listing history):** *(v1.3.2: calendars feed O1 book choice.)*
+  - Single names: Friday weeklies only (daily book therefore skips most single-name days; count the skips).
   - SPY: M/W/F until 2022-11-13, daily from 2022-11-14.
   - QQQ and IWM: Fridays until 2022-12-31, then M/W/F/daily per verified history.
-  - Each DTE bucket uses the nearest listed expiry inside it, or skips.
+  - **Book selection (O1):** daily book → nearest listed expiry with DTE ≤ 1; weekly book → nearest Friday weekly with
+    DTE in 2–10 **[P]**. Skip that book when none exists. (The old “nearest listed expiry inside each DTE bucket” rule
+    is superseded by O1.)
 - **Strikes:**
   - Increment: $1 for ETFs and for names under $200, $2.50 for $200–$500, $5 above $500.
   - ATM is the nearest strike to the as-traded spot. OTM means one increment out.
@@ -637,7 +659,7 @@ expected ceiling is ≈ 54 trades/mo at 60% WR [P]; see the G4 note.)* Monthly r
   reported.
 - **Readout** (`docs/intraday-sr/READOUT.md`, generated):
   - One block each for Test A, Test B, F_W, F_IHS, F_M, F_HS.
-  - Columns: equity, plus options overlay per structure and DTE (MODEL).
+  - Columns: equity, plus options overlay per structure and book (daily | weekly, MODEL; O1).
   - Metrics: trades, trades/day, win rate, avg win/loss R, mean R [CI], monthly return [CI], max drawdown,
     Sharpe, DSR, % cap-limited, % stop-before-target-same-bar.
   - Robustness: per-year, per-symbol, and a parameter-neighborhood heatmap.
