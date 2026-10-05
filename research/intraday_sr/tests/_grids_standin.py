@@ -52,3 +52,20 @@ def grid_sha256(document=None) -> str:
 
 
 GRID_SHA256 = grid_sha256()
+
+# --- SPEC v1.3.2 O1 scaffold constants. NOT inputs to grid_document() / GRID_SHA256. ---
+# Developer 2's grids.py bump replaces the hashed OPTIONS / OPTIONS_0DTE rows (N 450 → 456).
+# Until that lands, the overlay reads these through s0grids.overlay_scaffold().
+OPTIONS_BOOKS_O1 = ("daily", "weekly")
+OPTIONS_BASELINE_O1 = tuple(sorted(
+    ({"grid": "options_o1_baseline", "structure": structure, "book": book, "premium_pct": 0.005,
+      "time_exit_et": "15:55", "exit_mode": "equity", "variant_id": f"OPT-{structure}-{book}"}
+     for structure in ("long_atm", "long_otm_1", "debit_vertical") for book in OPTIONS_BOOKS_O1),
+    key=lambda row: row["variant_id"]))
+OPTIONS_A2_O1 = tuple(sorted(
+    ({"grid": "options_o1_a2", "structure": "long_atm", "book": book, "stop_pct": stop, "take_profit_pct": take,
+      "time_exit_et": "15:45", "premium_pct": 0.02, "premium_dollars_at_100k": 2000, "exit_mode": "option_price",
+      "variant_id": f"OPT-A2-stop{stop}-tp{take}-{book}"}
+     for stop in (-30, -40, -50) for take in (50, 65, 80) for book in OPTIONS_BOOKS_O1),
+    key=lambda row: row["variant_id"]))
+N_PROGRAM_O1 = 456  # 192 Test A + 192 Test B + 48 formations + 24 overlay rows. Not N_TRIALS.
