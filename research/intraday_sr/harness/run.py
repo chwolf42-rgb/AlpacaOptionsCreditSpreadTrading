@@ -112,6 +112,8 @@ class S0Adapter:
             getattr(self.grids, "UNIVERSE", None) or self.grids.load_universe_symbols())
         self._factors = None
         self._frames: dict = {}
+        self._frame_files: dict = {}        # pass-1 handoff: symbol -> pickled frame written by its worker
+        self._sessions_by_sym: dict = {}
         self._engine_secs: dict = {}
 
     def symbols(self) -> list:
@@ -133,6 +135,8 @@ class S0Adapter:
 
     def frame(self, sym: str):
         """Load via #22 cache.load_symbol (default end 2026-03-31; no HoldoutToken)."""
+        if sym not in self._frames and sym in self._frame_files:
+            self._frames[sym] = pd.read_pickle(self._frame_files[sym])
         if sym not in self._frames:
             from datetime import date as _date
             fr, _report = self.cache.load_symbol(
@@ -151,15 +155,42 @@ class S0Adapter:
         return self._frames[sym]
 
     def bar_source(self, symbols):
+        """Frames handed off as files by pass-1 workers are read one at a time and NOT kept: the bar source holds its
+        own per-session copies, so the parent never holds all 33 full frames (about 0.6 GB)."""
         from research.intraday_sr.harness.portfolio import FrameBarSource
-        return FrameBarSource({s: self.frame(s) for s in symbols})
+        ad = self
 
-    # Per-symbol chunking: a pass-1 worker loads its symbol; the parent adopts the loaded frame for simulation.
+        class _Lazy:
+            def items(self_):
+                for s_ in symbols:
+                    if s_ not in ad._frames and s_ in ad._frame_files:
+                        fr = pd.read_pickle(ad._frame_files[s_])
+                        ad._sessions_by_sym[s_] = set(fr["session"].unique())
+                        yield s_, fr
+                        del fr
+                    else:
+                        yield s_, ad.frame(s_)
+        return FrameBarSource(_Lazy())
+
+    # Per-symbol chunking: a pass-1 worker loads its symbol and hands the loaded frame to the parent. With a frame
+    # directory set (harness.run sets <out>/_frames) the worker writes it there and returns only the path, so the
+    # parent's memory does not grow by one frame per finished symbol while pass-1 workers are still running.
     def symbol_payload(self, sym: str):
-        return self._frames.get(sym)
+        fr = self._frames.get(sym)
+        fdir = _G.get("frame_dir")
+        if fr is None or not fdir:
+            return fr
+        Path(fdir).mkdir(parents=True, exist_ok=True)
+        p = Path(fdir) / f"{sym}.pkl"
+        tmp = Path(fdir) / f".{sym}.{os.getpid()}.tmp"
+        fr.to_pickle(tmp)
+        os.replace(tmp, p)
+        return str(p)
 
     def adopt_symbol_payload(self, sym: str, payload) -> None:
-        if payload is not None:
+        if isinstance(payload, (str, Path)):
+            self._frame_files[sym] = Path(payload)
+        elif payload is not None:
             self._frames[sym] = payload
 
     def symbol_cost(self, sym: str) -> float:
@@ -180,6 +211,8 @@ class S0Adapter:
         for s in self._symbols:
             if s in self._frames:
                 days.update(map(_as_date, self._frames[s]["session"].unique()))
+            elif s in self._sessions_by_sym:
+                days.update(map(_as_date, self._sessions_by_sym[s]))
         if not days:
             days.update(map(_as_date, self.frame(self._symbols[0])["session"].unique()))
         return sorted(days)
@@ -289,20 +322,41 @@ def clear_engine_caches() -> None:
     clear_zone_cache()
 
 
+def release_engine_signals() -> None:
+    """After each (variant, symbol) is spilled: drop the engine's retained signal list once it is over budget and
+    return the frozen-map bytes (Developer 2's hook; each signals() call otherwise grows the map buffer ~8 MB)."""
+    try:
+        from research.intraday_sr.engine.zone_cache import release_oversized_signals
+    except ImportError:          # stub adapters / engines without the hook
+        return
+    release_oversized_signals()
+
+
+def _rss_now_mb() -> float:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return float("nan")
+
+
 def _maxrss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def symbol_pass(sym: str) -> dict:
     """Pass-1 task: load `sym` once, signals for every requested variant (chunk_order), then clear engine caches.
-    Each (variant, symbol) signal list is spilled to <spill>/<variant_id>/<symbol>.pkl as soon as it is built, so
-    neither the worker nor the parent holds the whole grid's signals."""
+    Each (variant, symbol) signal list is spilled to <spill>/<variant_id>/<symbol>.npz (compact columns; .pkl with
+    --spill-format pickle) as soon as it is built, so neither the worker nor the parent holds the grid's signals."""
     ad, variants, spill = _G["adapter"], _G["chunk_variants"], Path(_G["spill_dir"])
     t0 = time.perf_counter()
     if hasattr(ad, "frame"):
         ad.frame(sym)
     load_s = time.perf_counter() - t0
-    sigs, errs, secs, spill_s, order = {}, {}, {}, {}, []
+    sigs, errs, secs, spill_s, order, rss = {}, {}, {}, {}, [], {}
     try:
         for v in chunk_order(variants):
             vid = v["variant_id"]
@@ -318,14 +372,21 @@ def symbol_pass(sym: str) -> dict:
                 continue
             secs[vid] = time.perf_counter() - t1
             t2 = time.perf_counter()
-            SP.write(spill, vid, sym, got)        # a spill failure is a harness fault: it stops the run
+            if _G.get("spill_format", "compact") == "pickle":
+                SP.write(spill, vid, sym, got)    # legacy full objects (checks only)
+            else:
+                SP.write_compact(spill, vid, sym, got)   # a spill failure is a harness fault: it stops the run
             spill_s[vid] = time.perf_counter() - t2
             sigs[vid] = len(got)
+            del got                               # serialized to disk above, so nothing depends on the freed maps
+            release_engine_signals()
+            rss[vid] = _rss_now_mb()
     finally:
         clear_engine_caches()
     payload = ad.symbol_payload(sym) if (_G.get("chunk_transfer") and hasattr(ad, "symbol_payload")) else None
     return {"symbol": sym, "signals": sigs, "errors": errs, "secs": secs, "spill_s": spill_s, "order": order,
-            "load_s": load_s, "total_s": time.perf_counter() - t0, "maxrss_mb": _maxrss_mb(), "pid": os.getpid(), "payload": payload}
+            "load_s": load_s, "total_s": time.perf_counter() - t0, "maxrss_mb": _maxrss_mb(), "rss_after_mb": rss,
+            "pid": os.getpid(), "payload": payload}
 
 
 def run_symbol_passes(ad, symbols: list, variants: list, workers: int, spill_dir: Path) -> dict:
@@ -388,6 +449,8 @@ def run_variant(variant: dict, guardrail=PRIMARY, cost_mult: float = 1.0, keep_r
 
 def _drop_spill(out: Path, keep: bool) -> None:
     _SIGCACHE.clear()
+    if (out / "_frames").exists():          # pass-1 frame handoff files: never kept
+        shutil.rmtree(out / "_frames")
     if not keep and (out / "_signals").exists():
         shutil.rmtree(out / "_signals")
 
@@ -417,11 +480,18 @@ _SIGERR: dict = {}          # variant_id -> repr of the first pass-1 signal erro
 
 
 def _signals(variant: dict, keep: bool = True) -> list:
+    """One variant's signals across all run symbols. From the spill (chunked path) the default loader is compact:
+    lightweight records in `spill.merge_streams` order (available_at, symbol, within-symbol order), which is the
+    order `simulate` reaches from the legacy list, so results are identical; --pass2-loader objects reads the full
+    pickled Signals (legacy, needs --spill-format pickle)."""
     vid = variant["variant_id"]
     if vid in _SIGCACHE:
         return _SIGCACHE[vid]
     if _G.get("spill_dir"):
-        sigs = SP.read(Path(_G["spill_dir"]), vid, _G["symbols"])
+        if _G.get("pass2_loader", "compact") == "objects":
+            sigs = SP.read(Path(_G["spill_dir"]), vid, _G["symbols"])
+        else:
+            sigs = SP.read_compact(Path(_G["spill_dir"]), vid, _G["symbols"], rename=_G.get("spill_rename"))
     else:
         sigs = [s for sym in _G["symbols"] for s in _G["adapter"].signals(sym, variant)]
     if keep:
@@ -479,6 +549,12 @@ def main(argv=None):
                     help="legacy path (checks only): each worker takes one variant across all symbols")
     ap.add_argument("--keep-signals", action="store_true",
                     help="keep the pass-1 signal spill (<out>/<tag>/_signals) after the run")
+    ap.add_argument("--pass2-workers", type=int, default=0,
+                    help="pass-2 (simulation) pool size; default = --workers. Pass 2 workers are lighter than pass 1")
+    ap.add_argument("--spill-format", choices=("compact", "pickle"), default="compact",
+                    help="pass-1 spill: compact columns (.npz, default) or full pickled Signals (.pkl, checks only)")
+    ap.add_argument("--pass2-loader", choices=("compact", "objects"), default="compact",
+                    help="pass-2 signal loader: compact records (default) or full pickled Signals (legacy check)")
     ap.add_argument("--timing-only", action="store_true",
                     help="pass 1 + pass 2 only, then write timing.json; no walk-forward, ledger, manifest or readout")
     a = ap.parse_args(argv)
@@ -514,17 +590,23 @@ def main(argv=None):
                 raise SystemExit(f"Test {test} variants differ from grids.TEST_{test}; GRID_SHA256 would not cover them")
             gsha = s0grids.grid_sha256()
         plan.append((test, variants, gsha))
-    timing = {"run_id": a.tag, "symbols": syms, "workers": a.workers, "chunked": not a.no_chunk,
+    p2w = a.pass2_workers or a.workers
+    timing = {"run_id": a.tag, "symbols": syms, "workers": a.workers, "pass2_workers": p2w,
+              "spill_format": a.spill_format, "pass2_loader": a.pass2_loader, "chunked": not a.no_chunk,
               "grid_sha256": s0grids.grid_sha256(), "pass1": None, "pass2": {}}
-    _G.update(adapter=ad, symbols=syms)
+    _G.update(adapter=ad, symbols=syms, spill_format=a.spill_format, pass2_loader=a.pass2_loader)
     if not a.no_chunk:
         tp = time.time()
         spill = out / "_signals"
         if spill.exists():
             shutil.rmtree(spill)
+        if (out / "_frames").exists():
+            shutil.rmtree(out / "_frames")
+        _G["frame_dir"] = str(out / "_frames")
         recs = run_symbol_passes(ad, syms, [v for _, vs, _ in plan for v in vs], a.workers, spill)
         timing["pass1"] = {"wall_s": time.time() - tp, "per_symbol": recs,
-                           "spill_bytes": sum(f.stat().st_size for f in spill.rglob("*.pkl"))}
+                           "spill_bytes": sum(f.stat().st_size for f in spill.rglob("*")
+                                              if f.is_file() and f.suffix in (".pkl", ".npz"))}
     tp = time.time()
     _G.update(src=ad.bar_source(syms),
               sessions=[d for d in ad.sessions() if d <= DEV_END], all_sessions=list(ad.sessions()))
@@ -557,11 +639,11 @@ def main(argv=None):
                     "OOS-fold and holdout paths are exact: counters and equity ($100k) start at each window start"],
                 "adj_factors": adj_note, "started_at_ct": pd.Timestamp.now(tz="America/Chicago").isoformat()}
     mode = "per-symbol chunks" if not a.no_chunk else "per-variant (no-chunk)"
-    frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers}; {mode}", adj_note]
+    frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers} (pass 2: {p2w}); {mode}", adj_note]
     for test, variants, gsha in plan:
         inp.grid_sha = gsha
         tp = time.time()
-        timed = _par(_timed_run_variant, variants, a.workers)
+        timed = _par(_timed_run_variant, variants, p2w)
         results = [r for r, _, _ in timed]
         timing["pass2"][test] = {"wall_s": time.time() - tp,
                                  "per_variant": {r[0].variant_id: {"secs": sec, "maxrss_mb": mx}
