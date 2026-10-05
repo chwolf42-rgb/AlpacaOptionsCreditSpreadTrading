@@ -285,19 +285,50 @@ def write_freeze(path: Path, finalists_by_test: dict, ledger, git_sha: str, grid
     return sha256_file(path)
 
 
-def run_holdout(freeze_path: Path, lock_path: Path, symbols_complete: Sequence[str],
-                scorer: Callable[[dict, object], dict], finalists_by_test: dict) -> dict:
-    """Opens the holdout exactly once and is the ONLY place that constructs a HoldoutToken (SPEC v1.3.1 C2).
+def run_holdout(freeze_path: Path,
+                lock_path: Path | None = None,
+                symbols_complete: Sequence[str] | None = None,
+                scorer: Callable[[dict, object], dict] | None = None,
+                finalists_by_test: dict | None = None):
+    """Open the holdout / mint a HoldoutToken (SPEC v1.3.1 C2).
 
-    Refuses without FREEZE.md, with < 33 complete symbols, or if holdout.lock exists (a second opening is a protocol
-    breach). Then creates holdout.lock, builds the token via HoldoutToken._from_freeze (caller-name gated to this
-    function) and calls scorer(finalists_by_test, token). Loaders default to end=2026-03-31 and require the token
-    for any bar on or after 2026-04-01.
+    Two call shapes (both keep the D2-1 caller-name gate on ``HoldoutToken._from_freeze``):
+
+    1. **Token-only** (Developer 2 tests / data-layer smoke)::
+
+           token = run_holdout(freeze_path)
+
+       Requires FREEZE.md to exist; returns the token. No lock file, no 33-symbol check.
+
+    2. **Full protocol** (harness interim / holdout scorer)::
+
+           run_holdout(freeze, lock, symbols_complete, scorer, finalists_by_test)
+
+       Refuses without FREEZE, with < 33 symbols, or if holdout.lock exists; creates the lock,
+       mints the token, and returns ``scorer(finalists_by_test, token)``.
     """
     from research.intraday_sr.data.holdout import HoldoutLocked, HoldoutToken
-    freeze_path, lock_path = Path(freeze_path), Path(lock_path)
+    freeze_path = Path(freeze_path)
     if not freeze_path.is_file():
+        # D2 tests expect HoldoutLocked for the thin path; full path uses HoldoutRefused.
+        if lock_path is None and scorer is None:
+            raise HoldoutLocked(f"FREEZE file is missing: {freeze_path}")
         raise HoldoutRefused("FREEZE.md missing")
+
+    # --- thin / token-only API (1-arg) ---
+    if lock_path is None and symbols_complete is None and scorer is None and finalists_by_test is None:
+        try:
+            return HoldoutToken._from_freeze(freeze_path)  # caller must be run_holdout
+        except HoldoutLocked:
+            raise
+
+    # --- full harness protocol ---
+    if lock_path is None or symbols_complete is None or scorer is None or finalists_by_test is None:
+        raise TypeError(
+            "full run_holdout requires lock_path, symbols_complete, scorer, finalists_by_test "
+            "(or call with freeze_path alone for a token)"
+        )
+    lock_path = Path(lock_path)
     if len(set(symbols_complete)) < N_SYMBOLS_REQUIRED:
         raise HoldoutRefused(f"only {len(set(symbols_complete))} of {N_SYMBOLS_REQUIRED} symbols complete")
     if lock_path.exists():

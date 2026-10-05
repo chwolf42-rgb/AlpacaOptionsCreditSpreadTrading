@@ -357,7 +357,7 @@ def main(argv=None):
     log = TrialLog(out / "ledger_smoke") if ad.smoke else TrialLog(Path(a.ledger))
     inp = RO.ReadoutInputs(SPEC_VERSION, sha, "", {}, syms, smoke=ad.smoke)
     manifest = {"run_id": a.tag, "run_kind": kind, "spec_version": SPEC_VERSION, "git_sha": sha,
-                "config": PRIMARY.name, "symbols": syms, "ledger": str(log.path), "grids": {},
+                "guardrail": PRIMARY.name, "symbols": syms, "ledger": str(log.path), "grids": {},
                 "grid_sha256": s0grids.grid_sha256(), "grids_source": s0grids.source(),
                 "guardrails": {"primary": PRIMARY.name, "comparison": [g.name for g in COMPARISON]},
                 "frozen_constants_pending_r5": list(PENDING_R5),
@@ -447,7 +447,7 @@ def main(argv=None):
         for gcfg in COMPARISON:
             tg, dg, cnt = selected_path(wf.picks, vmap, gcfg)
             gs = RO.guardrail_stats(gcfg.name, tg, dg, cnt)
-            crow.append({"run_id": a.tag, "test": test, "scope": "selected_path", "config": gcfg.name,
+            crow.append({"run_id": a.tag, "test": test, "scope": "selected_path", "guardrail": gcfg.name,
                          "trades": gs["trades"], "trades_per_mo": gs["trades_per_mo"], "win_rate": gs["win_rate"],
                          "mean_r": gs["mean_r"].get("mean"), "monthly_mean": gs["monthly"].get("mean"),
                          "max_dd": gs["max_dd"], "worst_week": gs["worst_week"],

@@ -201,7 +201,7 @@ def guardrail_stats(name: str, trades: pd.DataFrame, daily: pd.Series, counters:
     n = 0 if trades is None else len(trades)
     weeks = len(pd.DatetimeIndex(pd.to_datetime(daily.index)).to_period("W").unique()) if len(daily) else 0
     day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if n else np.array([])
-    return {"config": name, "trades": n, "trades_per_mo": n / max(len(m), 1),
+    return {"guardrail": name, "trades": n, "trades_per_mo": n / max(len(m), 1),
             "win_rate": float((trades["pnl"] > 0).mean()) if n else None,
             "mean_r": S.day_block_mean_r(trades["r"].to_numpy(float), day) if n else {"mean": None},
             "monthly": S.block_mean(m.to_numpy()) if len(m) else {"mean": None},
@@ -218,9 +218,9 @@ def guardrail_rows(stats: Sequence[dict]) -> pd.DataFrame:
     """3-row table, primary d2+w5 first (this is the result), then none and d2+w6 (comparison, report only)."""
     order = {"d2+w5": 0, "none": 1, "d2+w6": 2}
     rows = []
-    for g in sorted(stats, key=lambda g: order.get(g["config"], 9)):
+    for g in sorted(stats, key=lambda g: order.get(g["guardrail"], 9)):
         rows.append({
-            "config": g["config"] + (" (PRIMARY)" if g["config"] == "d2+w5" else " (comparison)"),
+            "guardrail": g["guardrail"] + (" (PRIMARY)" if g["guardrail"] == "d2+w5" else " (comparison)"),
             "trades/mo": _num(g["trades_per_mo"], 1), "win rate": _pct(g["win_rate"], 1),
             "mean R [95% CI]": _ci(g["mean_r"]), "monthly @0.5% risk [95% CI]": _ci(g["monthly"], _pct),
             "max DD": _pct(g["max_dd"]), "worst week": _pct(g["worst_week"]),
@@ -237,7 +237,7 @@ def trades_per_month_words(stats: Sequence[dict]) -> str:
     for g in stats:
         t = g["trades_per_mo"]
         band = "inside" if FLAG_LO <= t <= FLAG_HI else ("below" if t < FLAG_LO else "above")
-        parts.append(f"{g['config']} achieved {t:.0f} trades/mo ({band} the 150-250 band; target ~200)")
+        parts.append(f"{g['guardrail']} achieved {t:.0f} trades/mo ({band} the 150-250 band; target ~200)")
     return "; ".join(parts) + "."
 
 

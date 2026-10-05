@@ -49,7 +49,7 @@ def test_freeze_refuses_comparison_config(tmp_path):
 
 
 def test_selection_and_freeze_never_open_the_compare_file(tmp_path, monkeypatch):
-    cp = CMP.write_compare(tmp_path, [{"config": "none", "trades": 1}])
+    cp = CMP.write_compare(tmp_path, [{"guardrail": "none", "trades": 1}])
     assert cp.parent.name == CMP.COMPARE_DIRNAME              # its own directory
     opened = []
     real_open, real_rp = builtins.open, pd.read_parquet
