@@ -8,6 +8,7 @@ that still need the raw high or low read ``high_unclamped`` / ``low_unclamped``.
 
 from __future__ import annotations
 
+import bisect
 from datetime import datetime, time
 
 import numpy as np
@@ -65,22 +66,66 @@ def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
 
 
 def _symbol_levels(symbol: str, group: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Level]:
-    segments = _segments(group)
+    pivots, prices = _pivot_tape(symbol, group, cfg)
+    return _levels_at_stamp(symbol, group, pivots, prices, as_of, cfg)
+
+
+def _pivot_tape(
+    symbol: str, group: pd.DataFrame, cfg: EngineCfg
+) -> tuple[list[Level], np.ndarray]:
+    """Pivots on the whole tape. ``available_at`` is the confirmation close.
+
+    A later stamp keeps a pivot only when that confirmation is already in
+    the past, so this list can be built once and sliced per 15m close.
+    """
+    found: list[Level] = []
+    found.extend(_pivot_levels(symbol, group, "5m", int(cfg.n_5m)))
+    found.extend(_higher_pivots(symbol, group, cfg))
+    found.sort(key=lambda level: (level.available_at, level.kind, level.price))
+    prices = np.array([level.price for level in found], dtype=np.float64)
+    return found, prices
+
+
+def _levels_at_stamp(
+    symbol: str,
+    prefix: pd.DataFrame,
+    pivots: list[Level],
+    prices: np.ndarray,
+    as_of: datetime,
+    cfg: EngineCfg,
+) -> list[Level]:
+    """Candidates at ``as_of`` from bars closed by ``as_of``.
+
+    The band is ±2·ATR_d around ``prefix``'s last close, not a later close.
+    """
+    if prefix.empty:
+        return []
+    segments = _segments(prefix)
+    if not segments:
+        return []
     atr = _atr_from_segments(segments, as_of, int(cfg.atr_length))
-    last_close = float(group["close"].iloc[-1])
-    levels: list[Level] = []
-    levels.extend(_pivot_levels(symbol, group, "5m", int(cfg.n_5m)))
-    levels.extend(_higher_pivots(symbol, group, cfg))
+    last_close = float(prefix["close"].iloc[-1])
+    cut = bisect.bisect_right(pivots, as_of, key=lambda level: level.available_at)
+    if atr is None:
+        chosen = pivots[:cut]
+    else:
+        band = float(cfg.candidate_band_atr) * atr + 1e-9
+        mask = np.abs(prices[:cut] - last_close) <= band
+        chosen = [pivots[int(index)] for index in np.flatnonzero(mask)]
+    _day, _high, _low, _close, start, stop = segments[-1]
+    today = prefix.iloc[int(start) : int(stop)]
+    levels: list[Level] = list(chosen)
     levels.extend(_prior_day(symbol, segments, as_of))
-    levels.extend(_opening_range(symbol, group, as_of))
-    vwap = _session_vwap(symbol, group)
+    levels.extend(_opening_range(symbol, today, as_of))
+    vwap = _session_vwap(symbol, today)
     if vwap is not None:
         levels.append(vwap)
     if atr is not None:
-        levels.extend(_hvn(symbol, group, segments, as_of, atr, cfg))
-        levels.extend(_rounds(symbol, group, as_of, atr, cfg))
-        band = float(cfg.candidate_band_atr) * atr
-        levels = [level for level in levels if abs(level.price - last_close) <= band + 1e-9]
+        levels.extend(_hvn(symbol, prefix, segments, as_of, atr, cfg))
+        levels.extend(_rounds(symbol, prefix, as_of, atr, cfg))
+        band = float(cfg.candidate_band_atr) * atr + 1e-9
+        levels = [level for level in levels if abs(level.price - last_close) <= band]
+    levels.sort(key=lambda level: (level.symbol, level.available_at, level.kind, level.price))
     return levels
 
 

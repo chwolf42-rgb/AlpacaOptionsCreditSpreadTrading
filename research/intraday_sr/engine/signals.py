@@ -20,7 +20,13 @@ import pandas as pd
 
 from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.engine.indicators import macd, rsi_wilder, rvol, stochastic
-from research.intraday_sr.engine.levels import _atr_from_segments, _segments, levels_at, timeframe_frame
+from research.intraday_sr.engine.levels import (
+    _atr_from_segments,
+    _levels_at_stamp,
+    _pivot_tape,
+    _segments,
+    timeframe_frame,
+)
 from research.intraday_sr.engine.tape import floor_15m, minute_of_day, session_day
 from research.intraday_sr.engine.zones import fast_zones
 from research.intraday_sr.types import ET, BarSet, EngineCfg, Signal, SignalCfg, Zone, as_et
@@ -69,8 +75,10 @@ def _symbol_signals(
     if tape.empty:
         return []
     base = group.reset_index(drop=True)
-    levels = levels_at(BarSet(base), end, cfg)
-    own_levels = [level for level in levels if level.symbol == symbol]
+    # Pivots are causal once confirmed. The ±2·ATR_d band is applied at each
+    # 15m stamp from that stamp's close, so a March level is not dropped
+    # because June's close has moved away.
+    pivots, pivot_prices = _pivot_tape(symbol, base, cfg)
     segments = _segments(base)
     atr_by_day: dict = {}
     tape_low = base["low"].to_numpy(dtype=np.float64)
@@ -139,7 +147,9 @@ def _symbol_signals(
                     begin = first_of_day[origin]
                     sl = slice(begin, cutoff)
                     ages = day_index[current_day] - session_ord[begin:cutoff]
-                    live = [level for level in own_levels if level.available_at <= recompute]
+                    live = _levels_at_stamp(
+                        symbol, base.iloc[:cutoff], pivots, pivot_prices, recompute, cfg
+                    )
                     snapshots[recompute] = fast_zones(
                         live,
                         symbol=symbol,
