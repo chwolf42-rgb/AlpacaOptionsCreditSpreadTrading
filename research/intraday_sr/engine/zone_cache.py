@@ -13,6 +13,8 @@ reuse each other's zones. The cache is process-local and bounded.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import hashlib
 import json
 from collections import OrderedDict
@@ -20,7 +22,7 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 
-from research.intraday_sr.types import EngineCfg, Level, Zone
+from research.intraday_sr.types import EngineCfg, Level, Zone, detach_live_maps, release_frozen_maps
 
 # Fields that do not change a level candidate or a zone's geometry or score.
 # Anything not listed here is part of the zone-side hash, so a new EngineCfg
@@ -142,9 +144,20 @@ _LEVELS = _Cache(_LEVEL_BYTES, 200_000)
 _SIGNALS = _Cache(_SIGNAL_BYTES, 64)
 
 
+# Bumped when zone geometry changes and cached snapshots must not be reused.
+_ZONE_PIPELINE = "v1.3.3-locks-1-3"
+
+
 def zone_cfg_token(cfg: EngineCfg) -> str:
-    """Hash of every EngineCfg field that can change zones or levels."""
-    return _token(cfg, skip=_NOT_ZONE_SIDE)
+    """Hash of every EngineCfg field that can change zones or levels.
+
+    The pipeline tag and ``max_zone_width_atr`` are part of the key so a
+    snapshot from before the v1.3.3 splits cannot be served.
+    """
+    base = _token(cfg, skip=_NOT_ZONE_SIDE)
+    width = float(cfg.max_zone_width_atr)
+    raw = f"{base}|max_zone_width_atr={width:.6f}|{_ZONE_PIPELINE}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def level_cfg_token(cfg: EngineCfg) -> str:
@@ -290,7 +303,29 @@ def cached_signals(key: tuple) -> list | None:
 
 
 def store_signals(key: tuple, signals: list) -> None:
-    _SIGNALS.put(key, tuple(signals), 256 + 512 * len(signals))
+    """Remember a signal list. Each signal keeps its zone, so the byte count is the object graph."""
+    _SIGNALS.put(key, tuple(signals), 256 + 3072 * len(signals))
+
+
+def release_oversized_signals() -> None:
+    """Drop a retained signal list that is already over the byte budget.
+
+    One oversized result stays cached so the same call is warm. A different
+    full-span variant would otherwise build its own list while the previous
+    one is still resident. Freed pages are returned so the next variant's
+    zone packs do not stack on top of that dead heap.
+    """
+    if _SIGNALS.nbytes <= _SIGNALS.max_bytes:
+        return
+    _SIGNALS.clear()
+    gc.collect()
+    # A caller that kept the previous list still reads the right floats.
+    detach_live_maps()
+    release_frozen_maps()
+    libc = ctypes.CDLL(None)
+    trim = getattr(libc, "malloc_trim", None)
+    if trim is not None:
+        trim(0)
 
 
 _EXTRA_CLEARS: list = []
@@ -310,6 +345,7 @@ def clear_zone_cache() -> None:
     _ZONES.clear()
     _LEVELS.clear()
     _SIGNALS.clear()
+    release_frozen_maps()
     for fn in _EXTRA_CLEARS:
         fn()
 

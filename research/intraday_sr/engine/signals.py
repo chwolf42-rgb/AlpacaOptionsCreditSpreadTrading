@@ -36,6 +36,7 @@ from research.intraday_sr.engine.zone_cache import (
     level_cfg_token,
     prefix_digest,
     register_cache_clear,
+    release_oversized_signals,
     store_signals,
     tape_token,
     zone_cfg_token,
@@ -118,6 +119,7 @@ def signals(
         hit = cached_signals(cache_key)
         if hit is not None:
             return iter(hit)
+        release_oversized_signals()
     found: list[Signal] = []
     source_ptr = _open_ptr(clamped) if len(clamped) and "open" in clamped.columns else 0
     raw_groups = {symbol: group for symbol, group in _symbol_frames(raw)}
@@ -550,6 +552,7 @@ def _emit(
                         ages=ages,
                         level_key=level_key,
                         begin=begin,
+                        origin=origin,
                     ):
                         live = cached_levels(level_key, lambda: plan.pack(plan.levels_at(cutoff, recompute)))
                         touch_low, touch_high = plan.asof_high_low(begin, cutoff, recompute)
@@ -566,6 +569,7 @@ def _emit(
                             atr=float(atr),
                             stamp=recompute,
                             cfg=cfg,
+                            pivot_not_before=origin,
                         )
 
                     current_zones = cached_zones(zone_key, build_zones)
