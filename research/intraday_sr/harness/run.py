@@ -104,6 +104,7 @@ class S0Adapter:
             getattr(self.grids, "UNIVERSE", None) or self.grids.load_universe_symbols())
         self._factors = None
         self._frames: dict = {}
+        self._engine_secs: dict = {}
 
     def symbols(self) -> list:
         return list(self._symbols)
@@ -123,15 +124,21 @@ class S0Adapter:
         return self._factors
 
     def frame(self, sym: str):
+        """Load via #22 cache.load_symbol (default end 2026-03-31; no HoldoutToken)."""
         if sym not in self._frames:
-            path = resolve_symbol_parquet(self.cache_root, sym)
-            raw = self.cache._read_parquet(path) if hasattr(self.cache, "_read_parquet") else __import__("pandas").read_parquet(path)
-            # normalize via public API by writing a temp? Prefer calling normalize_bars directly.
-            report = self.cache.validate_symbol(raw, sym)
-            if not report.ok:
-                raise self.cache.SymbolValidationError(report)
-            fr, _ = self.cache.normalize_bars(raw, factors=self.factors(), symbol=sym)
-            # float32 already from normalize; keep
+            from datetime import date as _date
+            fr, _report = self.cache.load_symbol(
+                self.cache_root, sym, factors=self.factors(),
+                start=_date(2019, 1, 2), end=_date(2026, 3, 31), token=None,
+            )
+            # harness expects session as datetime.date; D2-1 stores int YYYYMMDD
+            if len(fr) and not hasattr(fr["session"].iloc[0], "year"):
+                sser = fr["session"].astype(int)
+                fr = fr.copy()
+                fr["session"] = [_date(v // 10000, (v // 100) % 100, v % 100) for v in sser]
+            if "symbol" in fr.columns:
+                fr = fr.copy()
+                fr["symbol"] = fr["symbol"].astype(str)
             self._frames[sym] = fr
         return self._frames[sym]
 
@@ -140,21 +147,57 @@ class S0Adapter:
         return FrameBarSource({s: self.frame(s) for s in symbols})
 
     def sessions(self) -> list:
-        # only after frames loaded
+        from datetime import date as _date
+        def _as_date(x):
+            if isinstance(x, _date):
+                return x
+            x = int(x)
+            return _date(x // 10000, (x // 100) % 100, x % 100)
         days = set()
         for s in self._symbols:
             if s in self._frames:
-                days.update(self._frames[s]["session"].unique())
+                days.update(map(_as_date, self._frames[s]["session"].unique()))
         if not days:
-            # force-load first symbol to discover calendar
-            days.update(self.frame(self._symbols[0])["session"].unique())
+            days.update(map(_as_date, self.frame(self._symbols[0])["session"].unique()))
         return sorted(days)
 
     def signals(self, symbol: str, v: dict) -> list:
+        """Call engine.signals(...) as an iterator; SignalCfg.test is always A for Test A variants."""
         fr = self.frame(symbol)
+        if fr.empty:
+            return []
         bars = self.types.BarSet(fr)
-        start, end = fr["available_at"].iloc[0].to_pydatetime(), fr["available_at"].iloc[-1].to_pydatetime()
-        return list(self.engine.signals(bars, start, end, engine_cfg_for(v), signal_cfg_for(v)))
+        start = fr["available_at"].iloc[0].to_pydatetime()
+        end = fr["available_at"].iloc[-1].to_pydatetime()
+        cfg = engine_cfg_for(v)
+        sig = signal_cfg_for(v, test="A" if (v.get("test") or "A") == "A" else v.get("test"))
+        t0 = time.perf_counter()
+        out = list(self.engine.signals(bars, start, end, cfg, sig))  # iterator -> list
+        self._engine_secs[(symbol, v["variant_id"])] = time.perf_counter() - t0
+        return out
+
+
+def make_smoke_adapter():
+    """SPY+AAPL smoke: 5m/15m x k_confirm 0/3 (4 Test A variants). Labels run_kind=smoke.
+
+    Bars load via #22 load_symbol through /workspace/research4/cache_links/ (SYM.parquet
+    symlinks to part_NNNN — stands in for F1 until Developer 2 patches symbol_cache_path).
+    """
+    ids = [
+        "A-K3-rsi14_30_70-rvol1.5-5m-1R-k0",
+        "A-K3-rsi14_30_70-rvol1.5-5m-1R-k3",
+        "A-K3-rsi14_30_70-rvol1.5-15m-1R-k0",
+        "A-K3-rsi14_30_70-rvol1.5-15m-1R-k3",
+    ]
+    ad = S0Adapter(cache_root="/workspace/research4/cache_links",
+                   adj_path="/workspace/research4/cache_links/adj_factors/adj_factors.parquet",
+                   symbols=["SPY", "AAPL"])
+    ad.smoke = True
+    ad._variant_ids = set(ids)
+    _orig = ad.variants
+    ad.variants = lambda test, _o=_orig, _ids=set(ids): [v for v in _o(test) if v["variant_id"] in _ids]
+    ad._engine_secs = {}
+    return ad
 
 
 def load_adapter(spec: str | None):

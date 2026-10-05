@@ -103,18 +103,30 @@ def load_adj_factors(root: Path | str = DEFAULT_ROOT) -> pd.Series:
     key = str(root.resolve()) if root.exists() else str(root)
     if key in _CACHE:
         return _CACHE[key]
+    # Prefer the combined Trading parquet when `root` is a cache directory.
+    candidates = []
+    if root.is_file():
+        candidates.append(root)
+    else:
+        candidates += [root / "adj_factors" / "adj_factors.parquet", root / "adj_factors.parquet"]
     dev2 = _dev2_loader()
     out = None
+    source = "local"
     if dev2 is not None:
-        for call in (lambda: dev2(root), lambda: dev2(root / "adj_factors" / "adj_factors.parquet"), dev2):
-            try:
-                out = _normalize(call())
-                break
-            except TypeError:
-                continue
-    SOURCE[key] = "dev2" if out is not None else "local"
+        for path in candidates:
+            if path.is_file():
+                try:
+                    out = _normalize(dev2(path))
+                    source = "dev2"
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
     if out is None:
-        out = _local_load_all(root)
+        out = _local_load_all(root if root.is_dir() else root.parent)
+        source = "local"
+    SOURCE[key] = source
     _CACHE[key] = out
     return out
 

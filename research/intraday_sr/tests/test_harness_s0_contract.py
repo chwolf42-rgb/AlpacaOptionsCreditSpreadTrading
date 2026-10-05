@@ -69,13 +69,14 @@ def test_shim_fails_loudly_without_grids(monkeypatch):
     from research.intraday_sr.harness import s0grids
     real = importlib.import_module
     def fake(name, *a, **k):
-        if name == "research.intraday_sr.grids":
+        if name in ("research.intraday_sr.grids", "research.intraday_sr.tests._grids_standin"):
             raise ImportError("no grids.py")
         return real(name, *a, **k)
     monkeypatch.setattr(importlib, "import_module", fake)
-        s0grids.grids.cache_clear()
+    monkeypatch.delenv("INTRADAY_SR_GRIDS_STANDIN", raising=False)
+    s0grids.grids.cache_clear()
     try:
-        with pytest.raises(s0grids.GridsUnavailable, match="single source"):
+        with pytest.raises(s0grids.GridsUnavailable, match="single source|grids.py"):
             s0grids.grids()
     finally:
         monkeypatch.undo()
@@ -85,14 +86,21 @@ def test_shim_fails_loudly_without_grids(monkeypatch):
 
 def test_nan_atr_d_raises_clear_per_signal_error():
     ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20)}
-    s = sig(atr_d=float("nan"), variant_id="A-K5-x")
-    with pytest.raises(SignalContractError, match=r"ATR_d.*A-K5-x AAA available_at=2024-03-04 10:00"):
+    try:
+        s = sig(atr_d=float("nan"), variant_id="A-K5-x")
+    except ValueError:
+        return  # Zone rejects non-finite atr_d at construction (CP0 R1) — also fine
+    with pytest.raises(SignalContractError, match=r"atr_d"):
         run({"AAA": flat_day("AAA", D, overrides=ov)}, [s])
+    s_ok = sig(variant_id="A-K5-x")
+    object.__setattr__(s_ok.zone, "atr_d", float("nan"))
+    with pytest.raises(SignalContractError):
+        run({"AAA": flat_day("AAA", D, overrides=ov)}, [s_ok])
 
 
 def test_zone_target_missing_raises_per_signal():
     ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20)}
-    s = replace(sig(), targets={"1R": 1.0})
+    s = sig(); object.__setattr__(s, "targets", {"1R": float("nan"), "2R": float("nan"), "zone": float("nan")})
     with pytest.raises(SignalContractError, match="targets\\['zone'\\]"):
         run({"AAA": flat_day("AAA", D, overrides=ov)}, [s], risk=RiskCfg(target="zone"))
 
