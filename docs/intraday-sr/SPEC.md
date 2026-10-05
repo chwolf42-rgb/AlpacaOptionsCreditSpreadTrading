@@ -1,7 +1,7 @@
-# Intraday S/R confluence research: spec v1.3.2 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3.3 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
-Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2 Mon 2026-10-05 (CT). Values marked
+Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2 and v1.3.3 Mon 2026-10-05 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
 v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
@@ -10,6 +10,9 @@ v1.3.1 (Sun 2026-10-04 CT, before any run): clarifications C1–C3 (bad prints, 
 from the CP0 review of PR #20. No new trials; N was 450.
 v1.3.2 (Mon 2026-10-05 CT, before any options overlay run): dual-expiry books (O1). Options overlay N becomes 24;
 program N = **456**. Equity grids and F2/cache work are unchanged.
+v1.3.3 (Mon 2026-10-05 CT, before the 33×192 launch): zone collapse + density locks (Z1–Z8): pivot lookback,
+max zone width, straddle split, min clearance, stable zone identity. Fixed constants, no new trials; N stays 456;
+`GRID_SHA256` unchanged.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -39,6 +42,64 @@ binding and primary. Text kept for the record only.]*
 - Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
 
 **A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
+
+## v1.3.3 amendments (Mon 2026-10-05 CT; these supersede §5 "Levels" and "Zones" wherever they conflict)
+
+Source: zone-collapse ruling and density amendment, Mon 2026-10-05 CT (`reviews/ZONE_COLLAPSE_2026-10-05.md`).
+Diagnosis: single-linkage at 0.25·ATR_d over ~530–600 unbounded historical pivot candidates chained into one
+~3.1–3.4 ATR_d cluster that straddled `last_close` and was dropped, so K was inert (K3 ≡ K5 on SPY). After the
+first fix, the straddle split glued the near edge to `last_close` (median emitter gap 0.01 ATR_d) and zone identity
+reset every 15m recompute, giving ~30 emits/day. Committed **before** the 33×192 launch and any `PROGRAM_LEDGER`
+entry. Implemented on engine PR #23 at head `30c20eb`; Architect re-check **GO** Mon 2026-10-05 CT.
+
+**No new trials. N stays 456. No new grid axes.** Both new constants are fixed engine constants (`ClassVar`,
+not grid fields), so `GRID_SHA256` is unchanged:
+`2ef95123c015d70a1751f559f21fa1249d0b08aea272319e232f2facb120aa22`.
+
+**Z1. Swing-pivot lookback.** Swing-pivot candidates (all TFs: 5m/15m/1h/1d) are limited to pivots whose
+confirmation `available_at` falls in the prior `touch_sessions` (= 20) sessions plus today, up to `as_of`.
+PDH/PDL/PDC, ORH/ORL, session VWAP, HVN and round numbers are unchanged (already session- or profile-scoped).
+
+**Z2. Max zone width.** Single-linkage at fixed `k_cluster = 0.25·ATR_d` stays (no switch to complete-linkage).
+Add fixed `max_zone_width_atr = 1.0`. A cluster whose (max − min) member price exceeds 1.0·ATR_d is split at its
+largest internal gap between adjacent sorted members; if several gaps tie for largest, split at the lowest-priced
+one. Repeat recursively on each piece until every piece is ≤ 1.0·ATR_d wide.
+
+**Z3. Straddle split.** A cluster that straddles `last_close` is **never dropped**. It splits at `last_close` into
+a support piece (members strictly below `last_close`) and a resistance piece (members at or above). A level
+exactly at `last_close` goes to **resistance**. The minimum pad (0.05·ATR_d, §5) is anchored on the
+**price-facing edge** (support: `high`; resistance: `low`) and grows away from price, so a padded zone never
+contains or crosses `last_close`. No emitted zone contains `last_close`.
+
+**Z4. Minimum clearance (density lock a).** Add fixed `min_clearance_atr = 0.10`. Applies to every drafted zone,
+not only straddle halves:
+1. **Trim:** remove members whose price is closer than 0.10·ATR_d to `last_close`. A piece left empty is dropped.
+2. **Pad** per Z3 (price-facing edge anchored).
+3. **Drop:** drop any zone whose price-facing edge is still closer than 0.10·ATR_d to `last_close`. A gap of
+   **exactly** 0.10·ATR_d is kept (the drop test is strict `<`).
+
+**Z5. Stable zone identity across 15m recomputes (density lock c).**
+1. At each 15m recompute, a new zone inherits the stable identity of a previous zone on the **same side** whose
+   padded range overlaps it by **≥ 50% of the narrower padded width**.
+2. Matching is one-to-one, greedy: candidate pairs are taken in order of larger overlap, then higher previous
+   score, then lower `low`; each previous and each new zone is used at most once. Unmatched new zones get a new id.
+3. Identities **reset at each session start**. An empty recompute (one 15m book with no zones) does not by itself
+   wipe identities carried within the session.
+4. The stable id is internal to the engine. `Signal.zone` stays the snapshot `Zone` at the signal's `as_of`;
+   no interface field changes.
+5. A touch's arm bar is **frozen** the first time it is known. The existing `armed_until` / one-active-setup block
+   then suppresses re-arms of the same stable zone. This is **not** a daily cap: a new touch after the setup
+   cancels or expires may emit again.
+
+**Z6. Approach rule (density lock b): deferred.** Revisit only if Z4+Z5 leave emits/day high enough that the
+guardrail caps dominate selection.
+
+**Z7. Pipeline order (binding):** lookback-filtered levels (Z1) → single-linkage (`k_cluster`) → max-width gap
+splits (Z2) → straddle split (Z3) → clearance trim (Z4.1) → pad (Z3/Z4.2) → edge-clearance drop (Z4.3) →
+±2 ATR_d band → score → top `K` per side.
+
+**Z8. Audit note.** 0.10·ATR_d now does real selection work (90–93% of emitting zones sit within 0.25·ATR_d).
+It stays fixed and is **not** tuned on results; any change needs a new spec version committed before the run.
 
 ## v1.3.2 amendments (Mon 2026-10-05 CT; these supersede A2, G6, and the §5/§7 options overlay text wherever they conflict)
 
@@ -459,7 +520,7 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 
 ## 5. Strategy definition and pre-declared grids (frozen; caps enforced in `grids.py`)
 **Levels (all candidates):**
-- Swing pivots on 5m/15m/1h/1d.
+- Swing pivots on 5m/15m/1h/1d. *(v1.3.3 Z1: only pivots confirmed in the prior 20 sessions + today.)*
 - PDH, PDL, PDC.
 - ORH, ORL.
 - HVN shelf edges and midpoints.
@@ -470,6 +531,8 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 **Zones:**
 - Single-linkage clustering of candidates within `k_cluster × ATR_d`. The zone spans the min to max of its
   cluster, padded to at least 0.05 ATR_d.
+  *(v1.3.3 Z2–Z5, Z7: max width 1.0·ATR_d with gap splits, straddle split at last_close, pad anchored on the
+  price-facing edge, min clearance 0.10·ATR_d, stable identity across 15m recomputes; see the v1.3.3 amendments.)*
 - Score = 0.30·touches + 0.30·rejections + 0.20·recency + 0.20·volume, each a percentile rank among the
   symbol's zones at as_of. Ties break on more distinct kinds.
   - touches: bars entering the zone over the prior 20 sessions on the entry TF.
