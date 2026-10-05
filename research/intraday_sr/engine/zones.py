@@ -6,11 +6,19 @@ rejections, recency, and volume are percentile-ranked across that set, then
 weighted 0.30 / 0.30 / 0.20 / 0.20. Touches use the prior 20 sessions plus
 today on the 5m tape. Volume is that zone's share of the profile (the prior
 5 sessions plus today). The top ``K`` zones per side inside 2·ATR_d are kept.
+
+SPEC v1.3.3, in order: swing pivots are limited to the prior
+``touch_sessions`` plus today, single-linkage clusters wider than
+``max_zone_width_atr`` split at the largest price gap, and a cluster that
+contains last close splits into support and resistance instead of being
+dropped. Members within ``min_clearance_atr`` of last close are removed,
+padding anchors the edge nearest price so it cannot cross last close, and a
+zone whose price-facing edge is still closer than that clearance is dropped.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -36,33 +44,45 @@ def fast_zones(
     atr: float,
     stamp: datetime,
     cfg: EngineCfg,
+    pivot_not_before: date | None = None,
 ) -> list[Zone]:
     """Cluster and score without rebuilding a DataFrame.
 
     ``lows`` .. ``ages`` are the touch window already sliced to bars that
-    count at ``stamp``.
+    count at ``stamp``. ``pivot_not_before`` is the first session of the
+    prior ``touch_sessions`` plus today. Swing pivots older than that are
+    not zone members. Other level kinds stay.
     """
     if not levels or not np.isfinite(atr) or atr <= 0.0:
+        return []
+    levels = _zone_levels(levels, pivot_not_before, session_day(stamp))
+    if not levels:
         return []
     prices = np.array([level.price for level in levels], dtype=np.float64)
     threshold = float(cfg.k_cluster) * atr
     clusters = _linked_clusters(prices, threshold)
     band = float(cfg.candidate_band_atr) * atr
     min_width = float(cfg.zone_pad_atr) * atr
+    max_span = float(cfg.max_zone_width_atr) * atr
+    clearance = float(cfg.min_clearance_atr) * atr
     drafted: list[tuple[float, float, tuple[str, ...]]] = []
     for members in clusters:
-        member_prices = prices[members]
-        low = float(member_prices.min())
-        high = float(member_prices.max())
-        if high - low < min_width:
-            mid = 0.5 * (low + high)
-            low = mid - 0.5 * min_width
-            high = mid + 0.5 * min_width
-        mid = 0.5 * (low + high)
-        if abs(mid - last_close) > band or low <= last_close <= high:
-            continue
-        kinds = tuple(sorted({levels[index].kind for index in members}))
-        drafted.append((low, high, kinds))
+        for part in _split_max_width(members, prices, max_span):
+            for piece in _split_straddle(part, prices, last_close):
+                piece = _trim_clearance(piece, prices, last_close, clearance)
+                if not piece:
+                    continue
+                member_prices = prices[piece]
+                raw_low = float(member_prices.min())
+                raw_high = float(member_prices.max())
+                low, high = _pad_zone(raw_low, raw_high, last_close, min_width)
+                if not _edge_clears(low, high, last_close, clearance):
+                    continue
+                mid = 0.5 * (low + high)
+                if abs(mid - last_close) > band:
+                    continue
+                kinds = _shared_kinds(tuple(sorted({levels[index].kind for index in piece})))
+                drafted.append((low, high, kinds))
     if not drafted:
         return []
     zlow = np.array([item[0] for item in drafted])
@@ -224,6 +244,117 @@ def _linked_clusters(prices: np.ndarray, threshold: float) -> list[list[int]]:
     return list(clusters.values())
 
 
+def _zone_levels(levels: list[Level], pivot_not_before: date | None, today: date) -> list[Level]:
+    """Drop swing pivots outside the prior ``touch_sessions`` plus today.
+
+    ``available_at`` is the clock. PDH, opening range, HVN, VWAP, and rounds
+    are kept whatever their age. SPEC v1.3.3 lock 1.
+    """
+    if pivot_not_before is None:
+        return levels
+    kept: list[Level] = []
+    for level in levels:
+        if str(level.kind).startswith("pivot_"):
+            day = session_day(level.available_at)
+            if day < pivot_not_before or day > today:
+                continue
+        kept.append(level)
+    return kept
+
+
+def _split_max_width(members: list[int], prices: np.ndarray, max_span: float) -> list[list[int]]:
+    """Split until every part's raw price span is at most ``max_span``.
+
+    The cut is the largest gap between consecutive sorted prices. Equal gaps
+    split at the lowest price. SPEC v1.3.3 lock 2.
+    """
+    if len(members) <= 1:
+        return [list(members)]
+    idx = np.asarray(members, dtype=np.int64)
+    order = np.argsort(prices[idx], kind="mergesort")
+    sorted_idx = idx[order]
+    sorted_px = np.ascontiguousarray(prices[sorted_idx])
+    n = int(sorted_px.shape[0])
+    pending = [(0, n - 1)]
+    done: list[list[int]] = []
+    while pending:
+        lo, hi = pending.pop()
+        if hi <= lo:
+            done.append([int(sorted_idx[lo])])
+            continue
+        if float(sorted_px[hi] - sorted_px[lo]) <= max_span:
+            done.append([int(value) for value in sorted_idx[lo : hi + 1]])
+            continue
+        gaps = np.diff(sorted_px[lo : hi + 1])
+        cut = lo + int(np.argmax(gaps))
+        pending.append((cut + 1, hi))
+        pending.append((lo, cut))
+    return done
+
+
+def _split_straddle(members: list[int], prices: np.ndarray, last_close: float) -> list[list[int]]:
+    """Split a cluster that contains last close. Never drop it.
+
+    Prices strictly below last close are support. Prices at or above it are
+    resistance. SPEC v1.3.3 lock 3.
+    """
+    if not members:
+        return []
+    vals = prices[np.asarray(members, dtype=np.int64)]
+    if not (float(vals.min()) <= last_close <= float(vals.max())):
+        return [members]
+    below = [index for index in members if float(prices[index]) < last_close]
+    above = [index for index in members if float(prices[index]) >= last_close]
+    parts: list[list[int]] = []
+    if below:
+        parts.append(below)
+    if above:
+        parts.append(above)
+    return parts
+
+
+def _trim_clearance(members: list[int], prices: np.ndarray, last_close: float, clearance: float) -> list[int]:
+    """Drop members sitting closer than ``clearance`` to last close.
+
+    A member exactly ``clearance`` away stays. SPEC v1.3.3 lock (a).
+    """
+    if clearance <= 0.0 or not members:
+        return members
+    return [index for index in members if abs(float(prices[index]) - last_close) >= clearance]
+
+
+def _edge_clears(low: float, high: float, last_close: float, clearance: float) -> bool:
+    """Price-facing edge must be at least ``clearance`` from last close.
+
+    Support uses ``last_close - high``. Resistance uses ``low - last_close``.
+    A gap of exactly ``clearance`` is kept. SPEC v1.3.3 lock (a).
+    """
+    if high < last_close:
+        return last_close - high >= clearance
+    if low >= last_close:
+        return low - last_close >= clearance
+    return False
+
+
+def _pad_zone(low: float, high: float, last_close: float, min_width: float) -> tuple[float, float]:
+    """Widen a thin cluster to ``min_width`` without crossing last close.
+
+    A centered pad that would push support's high to last close, or
+    resistance's low through it, anchors that edge and extends the other way.
+    """
+    if min_width <= 0.0 or high - low >= min_width:
+        return low, high
+    mid = 0.5 * (low + high)
+    half = 0.5 * min_width
+    pad_low = mid - half
+    pad_high = mid + half
+    if high < last_close and pad_high >= last_close:
+        return high - min_width, high
+    if low >= last_close and pad_low < last_close:
+        return low, low + min_width
+    return pad_low, pad_high
+
+
 def _cluster_symbol(
     symbol: str,
     levels: list[Level],
@@ -248,6 +379,7 @@ def _cluster_symbol(
     day_index = {day: index for index, day in enumerate(unique_days)}
     window_days = [session_day(value) for value in window["session"]]
     ages = np.array([day_index[current] - day_index[day] for day in window_days], dtype=np.float64)
+    earliest = prior_days[0] if prior_days else current
     return fast_zones(
         levels,
         symbol=symbol,
@@ -261,6 +393,7 @@ def _cluster_symbol(
         atr=atr,
         stamp=stamp,
         cfg=cfg,
+        pivot_not_before=earliest,
     )
 
 
@@ -435,5 +568,22 @@ def _percentile_rank(values: np.ndarray) -> np.ndarray:
     return ranks
 
 
+_KIND_TUPLES: dict[tuple[str, ...], tuple[str, ...]] = {}
+_CFG_IDS: dict[tuple[int, float], str] = {}
+
+
+def _shared_kinds(kinds: tuple[str, ...]) -> tuple[str, ...]:
+    found = _KIND_TUPLES.get(kinds)
+    if found is None:
+        _KIND_TUPLES[kinds] = kinds
+        return kinds
+    return found
+
+
 def _cfg_id(cfg: EngineCfg) -> str:
-    return f"K{cfg.k_zones}|kc{cfg.k_cluster}"
+    key = (int(cfg.k_zones), float(cfg.k_cluster))
+    found = _CFG_IDS.get(key)
+    if found is None:
+        found = f"K{key[0]}|kc{key[1]}"
+        _CFG_IDS[key] = found
+    return found

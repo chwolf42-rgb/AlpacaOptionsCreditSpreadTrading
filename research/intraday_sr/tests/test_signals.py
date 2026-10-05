@@ -12,7 +12,16 @@ import pytest
 
 from research.intraday_sr.engine import levels_at, signals, signals_funnel
 from research.intraday_sr.engine.levels import _LevelTape, _levels_at_stamp, _pivot_tape
-from research.intraday_sr.engine.signals import SignalFunnel, _build, _entry_prices, _step
+from research.intraday_sr.engine.signals import (
+    SignalFunnel,
+    _StableZone,
+    _ZoneSetup,
+    _book_for_recompute,
+    _build,
+    _entry_prices,
+    _match_stable_ids,
+    _step,
+)
 from research.intraday_sr.engine.zone_cache import (
     clear_zone_cache,
     level_cfg_token,
@@ -235,7 +244,7 @@ def _arm_step(zones: list[Zone], target: str) -> tuple[list, SignalFunnel]:
         cfg=EngineCfg(),
         sig=_arm_cfg(target),
         width=timedelta(minutes=5),
-        armed_until={},
+        setups={},
         funnel=funnel,
     )
     return found, funnel
@@ -341,3 +350,191 @@ def test_prefix_hash_changes_when_ohlc_is_swapped_or_volume_changes():
     assert prefix_digest(prefix_hashes(louder), len(louder) - 1) != original
     short = frame.iloc[:17].reset_index(drop=True)
     assert prefix_digest(prefix_hashes(short), len(short) - 1) == prefix_digest(prefix_hashes(frame), len(short) - 1)
+
+
+def _id_zone(low: float, high: float, score: float, *, side: str = "support", minute: int = 0) -> Zone:
+    stamp = datetime(2024, 6, 3, 10, minute, tzinfo=ET)
+    return Zone(
+        symbol="SPY",
+        low=low,
+        high=high,
+        side=side,  # type: ignore[arg-type]
+        score=score,
+        components={"touches": score},
+        kinds=("hvn",),
+        as_of_ts=stamp,
+        valid_from_ts=stamp,
+        available_at=stamp,
+        engine_cfg="cfg-a",
+        tf="5m",
+        atr_d=2.0,
+    )
+
+
+def test_overlap_of_exactly_half_the_narrower_width_matches():
+    previous = [_StableZone(_id_zone(0.0, 100.0, 0.4), "keep")]
+    exact = _id_zone(50.0, 150.0, 0.4)
+    missed = _id_zone(51.0, 151.0, 0.4)
+    assert _match_stable_ids(previous, [exact])[0].stable_id == "keep"
+    fresh = _match_stable_ids(previous, [missed])[0]
+    assert fresh.stable_id == missed.zone_id
+    assert fresh.stable_id != "keep"
+
+
+def test_stable_match_is_one_to_one_and_deterministic():
+    shared = _StableZone(_id_zone(0.0, 100.0, 0.5), "only")
+    wide = _id_zone(0.0, 100.0, 0.1)
+    partial = _id_zone(40.0, 140.0, 0.9)
+    first = _match_stable_ids([shared], [wide, partial])
+    second = _match_stable_ids([shared], [wide, partial])
+    assert [item.stable_id for item in first] == [item.stable_id for item in second]
+    assert first[0].stable_id == "only"
+    assert first[1].stable_id == partial.zone_id
+
+    # Equal overlap: the higher previous score wins, then the lower low.
+    low_score = _StableZone(_id_zone(0.0, 100.0, 0.2), "low-score")
+    high_score = _StableZone(_id_zone(0.0, 100.0, 0.9), "high-score")
+    scored = _match_stable_ids([low_score, high_score], [_id_zone(0.0, 100.0, 0.3)])
+    assert scored[0].stable_id == "high-score"
+    higher_low = _StableZone(_id_zone(1.0, 101.0, 0.5), "higher-low")
+    lower_low = _StableZone(_id_zone(0.0, 100.0, 0.5), "lower-low")
+    tied = _match_stable_ids([higher_low, lower_low], [_id_zone(0.5, 100.5, 0.5)])
+    assert tied[0].stable_id == "lower-low"
+
+
+def test_identity_resets_at_the_session_boundary():
+    day = date(2024, 6, 3)
+    nxt = date(2024, 6, 4)
+    zone = _id_zone(98.0, 99.0, 0.5)
+    shifted = _id_zone(98.2, 99.2, 0.6, minute=15)
+    tracked, previous, setups, ids = _book_for_recompute(day, None, [], {}, [zone])
+    assert ids == [zone.zone_id]
+    setups[ids[0]] = _ZoneSetup()
+    setups[ids[0]].block_until = 4
+    tracked, previous, setups, ids = _book_for_recompute(day, tracked, previous, setups, [shifted])
+    assert ids == [zone.zone_id]
+    kept = ids[0]
+    assert setups[kept].block_until == 4
+    _tracked, _previous, cleared, fresh = _book_for_recompute(nxt, tracked, previous, setups, [shifted])
+    assert fresh[0] != kept
+    assert cleared == {}
+
+
+def test_shifted_zone_emits_once_and_a_later_touch_can_emit_again():
+    """A small shift keeps the armed setup. After the order expires, a new touch emits."""
+    first = _id_zone(98.0, 99.0, 0.8)
+    shifted = _id_zone(97.9, 98.7, 0.7, minute=15)
+    matched = _match_stable_ids([_StableZone(first, first.zone_id)], [shifted])
+    assert matched[0].stable_id == first.zone_id
+    assert shifted.zone_id != first.zone_id
+
+    n = 12
+    opens = np.full(n, 99.2)
+    highs = np.full(n, 99.6)
+    lows = np.full(n, 99.3)
+    closes = np.full(n, 99.4)
+    lows[0] = 98.5
+    closes[0] = 99.5
+    lows[1] = 99.0
+    lows[4] = 98.8
+    lows[7] = 98.5
+    closes[7] = 99.5
+    highs[8] = 99.4
+    available = [datetime(2024, 6, 3, 10, 5 * i, tzinfo=ET) for i in range(n)]
+    zeros = np.zeros(n)
+    cfg = EngineCfg()
+    sig = _arm_cfg("1R")
+    book: dict[str, _ZoneSetup] = {}
+
+    def run(index: int, zone: Zone, stable: str) -> list:
+        return _step(
+            index=index,
+            zones=[zone],
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            available=available,
+            osc=zeros,
+            hist=zeros,
+            macd_line=zeros,
+            macd_signal=zeros,
+            volume_ratio=zeros,
+            factors=np.ones(n),
+            oversold=30.0,
+            overbought=70.0,
+            cfg=cfg,
+            sig=sig,
+            width=timedelta(minutes=5),
+            setups=book,
+            stable_ids=[stable],
+        )
+
+    first_emit = run(1, first, first.zone_id)
+    assert len(first_emit) == 1
+    assert first_emit[0].zone.low == first.low
+    assert first_emit[0].zone.high == first.high
+    # The shifted zone would arm this same touch again on bar 4 if the id were new.
+    assert run(4, shifted, matched[0].stable_id) == []
+    later = _id_zone(97.9, 98.7, 0.7, minute=30)
+    again = _match_stable_ids([matched[0]], [later])
+    assert again[0].stable_id == first.zone_id
+    second = run(8, later, again[0].stable_id)
+    assert len(second) == 1
+    assert second[0].zone.as_of_ts == later.as_of_ts
+    assert second[0].available_at == available[8]
+
+
+def test_a_close_beyond_the_zone_cancels_and_a_new_touch_can_emit():
+    original = _id_zone(98.0, 99.0, 0.6)
+    tightened = _id_zone(98.5, 99.4, 0.6, minute=15)
+    matched = _match_stable_ids([_StableZone(original, original.zone_id)], [tightened])
+    assert matched[0].stable_id == original.zone_id
+    n = 8
+    opens = np.full(n, 99.3)
+    highs = np.full(n, 99.8)
+    lows = np.full(n, 99.5)
+    closes = np.full(n, 99.6)
+    lows[0] = 98.5
+    closes[0] = 99.5
+    lows[3] = 99.0
+    closes[2] = 98.4
+    lows[5] = 98.6
+    closes[5] = 99.6
+    highs[6] = 99.5
+    closes[6] = 99.5
+    available = [datetime(2024, 6, 3, 11, 5 * i, tzinfo=ET) for i in range(n)]
+    zeros = np.zeros(n)
+    book: dict[str, _ZoneSetup] = {}
+
+    def run(index: int, zone: Zone) -> list:
+        return _step(
+            index=index,
+            zones=[zone],
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            available=available,
+            osc=zeros,
+            hist=zeros,
+            macd_line=zeros,
+            macd_signal=zeros,
+            volume_ratio=zeros,
+            factors=np.ones(n),
+            oversold=30.0,
+            overbought=70.0,
+            cfg=EngineCfg(),
+            sig=_arm_cfg("1R"),
+            width=timedelta(minutes=5),
+            setups=book,
+            stable_ids=[original.zone_id],
+        )
+
+    assert run(1, original) == []
+    assert (0, 0) in book[original.zone_id].arm_for
+    assert run(2, tightened) == []
+    assert (0, 0) in book[original.zone_id].consumed
+    emitted = run(6, tightened)
+    assert len(emitted) == 1
+    assert emitted[0].zone.high == tightened.high

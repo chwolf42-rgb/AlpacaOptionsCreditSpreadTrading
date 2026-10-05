@@ -8,6 +8,13 @@ hold. Test B and the formation-only tests stay empty until D2-4 fills
 Stops are derived from the clamped zone and the pullback. Whether a later
 bar trades through that stop is the harness's job, and it uses the
 unclamped high and low.
+
+SPEC v1.3.3 lock (c): within a session, a new zone inherits a previous
+zone's setup when the two are on the same side and the overlap of their
+padded ranges is at least half the narrower width. The inherited id keeps
+the touch, the rejection close, the armed bar, and the emitted-order
+block. Identity resets at the session boundary. ``Signal.zone`` stays the
+snapshot at ``as_of``; the stable id is internal.
 """
 
 from __future__ import annotations
@@ -36,12 +43,134 @@ from research.intraday_sr.engine.zone_cache import (
     level_cfg_token,
     prefix_digest,
     register_cache_clear,
+    release_oversized_signals,
     store_signals,
     tape_token,
     zone_cfg_token,
 )
 from research.intraday_sr.engine.zones import fast_zones
 from research.intraday_sr.types import ET, BarSet, EngineCfg, Signal, SignalCfg, Zone, as_et
+
+
+class _ZoneSetup:
+    """Per stable zone, for one session.
+
+    ``arm_for`` freezes the arm bar of a (touch, rc) pair the first time it
+    is known, so a later 15m snapshot cannot retarget the same setup.
+    ``consumed`` is a pair that already emitted, was cancelled, or expired.
+    ``block_until`` is the last bar index of an emitted order.
+    """
+
+    __slots__ = ("arm_for", "consumed", "block_until")
+
+    def __init__(self) -> None:
+        self.arm_for: dict[tuple[int, int], int | None] = {}
+        self.consumed: set[tuple[int, int]] = set()
+        self.block_until: int = -1
+
+
+class _StableZone:
+    """A snapshot zone plus the id its setup state is keyed by."""
+
+    __slots__ = ("zone", "stable_id")
+
+    def __init__(self, zone: Zone, stable_id: str) -> None:
+        self.zone = zone
+        self.stable_id = stable_id
+
+
+def _overlap_width(left: Zone, right: Zone) -> float:
+    return max(0.0, min(left.high, right.high) - max(left.low, right.low))
+
+
+def _ranges_qualify(left: Zone, right: Zone) -> bool:
+    """Same side and overlap at least half the narrower padded width.
+
+    Exactly half qualifies. A narrower fraction does not, so a zone that
+    drifts a little at every recompute cannot keep one identity forever.
+    """
+    if left.side != right.side:
+        return False
+    overlap = _overlap_width(left, right)
+    smaller = min(left.high - left.low, right.high - right.low)
+    if smaller <= 0.0:
+        return left.low == left.high == right.low == right.high
+    return overlap >= 0.5 * smaller
+
+
+def _fresh_stable_id(zone: Zone, used: set[str]) -> str:
+    base = zone.zone_id
+    if base not in used:
+        return base
+    suffix = 1
+    while f"{base}#{suffix}" in used:
+        suffix += 1
+    return f"{base}#{suffix}"
+
+
+def _match_stable_ids(previous: list[_StableZone], current: list[Zone]) -> list[_StableZone]:
+    """One-to-one match of ``current`` onto ``previous``.
+
+    Qualifying pairs are assigned greedily by widest overlap, then the
+    previous zone's higher score, then its lower low. A current zone with
+    no qualifying previous zone gets a fresh id.
+    """
+    pairs: list[tuple[float, float, float, float, float, int, int]] = []
+    for new_index, zone in enumerate(current):
+        for prev_index, prior in enumerate(previous):
+            if not _ranges_qualify(prior.zone, zone):
+                continue
+            overlap = _overlap_width(prior.zone, zone)
+            pairs.append(
+                (
+                    overlap,
+                    prior.zone.score,
+                    prior.zone.low,
+                    zone.score,
+                    zone.low,
+                    new_index,
+                    prev_index,
+                )
+            )
+    pairs.sort(key=lambda item: (-item[0], -item[1], item[2], -item[3], item[4], item[5], item[6]))
+    assigned: dict[int, str] = {}
+    used_prev: set[int] = set()
+    used_ids: set[str] = set()
+    for _overlap, _prev_score, _prev_low, _score, _low, new_index, prev_index in pairs:
+        if new_index in assigned or prev_index in used_prev:
+            continue
+        assigned[new_index] = previous[prev_index].stable_id
+        used_prev.add(prev_index)
+        used_ids.add(previous[prev_index].stable_id)
+    matched: list[_StableZone] = []
+    for new_index, zone in enumerate(current):
+        stable_id = assigned.get(new_index)
+        if stable_id is None:
+            stable_id = _fresh_stable_id(zone, used_ids)
+            used_ids.add(stable_id)
+        matched.append(_StableZone(zone, stable_id))
+    return matched
+
+
+def _book_for_recompute(
+    day,
+    tracked_day,
+    previous: list[_StableZone],
+    setups: dict[str, _ZoneSetup],
+    zones: list[Zone],
+) -> tuple[object, list[_StableZone], dict[str, _ZoneSetup], list[str]]:
+    """Carry stable ids across a 15m recompute. A new session starts empty."""
+    if day != tracked_day:
+        previous = []
+        setups = {}
+        tracked_day = day
+    if not zones:
+        return tracked_day, previous, setups, []
+    live = _match_stable_ids(previous, zones)
+    ids = [item.stable_id for item in live]
+    keep = set(ids)
+    setups = {key: value for key, value in setups.items() if key in keep}
+    return tracked_day, live, setups, ids
 
 
 @dataclass
@@ -118,6 +247,7 @@ def signals(
         hit = cached_signals(cache_key)
         if hit is not None:
             return iter(hit)
+        release_oversized_signals()
     found: list[Signal] = []
     source_ptr = _open_ptr(clamped) if len(clamped) and "open" in clamped.columns else 0
     raw_groups = {symbol: group for symbol, group in _symbol_frames(raw)}
@@ -502,8 +632,11 @@ def _emit(
     # the compact history, so a full-span walk does not retain every Zone.
     current_key = None
     current_zones: list[Zone] = []
-    # Per zone: touch index, rc index, or None once consumed.
-    armed_until: dict[str, int] = {}
+    current_ids: list[str] = []
+    # Stable ids and setup state reset when the session changes.
+    tracked_day = None
+    previous_book: list[_StableZone] = []
+    setups: dict[str, _ZoneSetup] = {}
     out: list[Signal] = []
     warmup = datetime.fromisoformat(str(cfg.warmup_date)).date()
     cutoff_cursor = 0
@@ -550,6 +683,7 @@ def _emit(
                         ages=ages,
                         level_key=level_key,
                         begin=begin,
+                        origin=origin,
                     ):
                         live = cached_levels(level_key, lambda: plan.pack(plan.levels_at(cutoff, recompute)))
                         touch_low, touch_high = plan.asof_high_low(begin, cutoff, recompute)
@@ -566,9 +700,17 @@ def _emit(
                             atr=float(atr),
                             stamp=recompute,
                             cfg=cfg,
+                            pivot_not_before=origin,
                         )
 
                     current_zones = cached_zones(zone_key, build_zones)
+            tracked_day, previous_book, setups, current_ids = _book_for_recompute(
+                current_day,
+                tracked_day,
+                previous_book,
+                setups,
+                current_zones,
+            )
         zones = current_zones
         if funnel is not None and zones:
             _tally(
@@ -611,7 +753,8 @@ def _emit(
                 cfg=cfg,
                 sig=sig,
                 width=width,
-                armed_until=armed_until,
+                setups=setups,
+                stable_ids=current_ids,
                 funnel=funnel,
             )
         )
@@ -687,14 +830,20 @@ def _step(
     cfg: EngineCfg,
     sig: SignalCfg,
     width: timedelta,
-    armed_until: dict[str, int],
+    setups: dict[str, _ZoneSetup] | None = None,
+    stable_ids: list[str] | None = None,
     funnel: SignalFunnel | None = None,
 ) -> list[Signal]:
     found: list[Signal] = []
     window = int(cfg.touch_window_bars)
-    lookback = window + int(cfg.cancel_bars) + 2
-    for zone in zones:
-        if zone.zone_id in armed_until and index <= armed_until[zone.zone_id]:
+    cancel_bars = int(cfg.cancel_bars)
+    lookback = window + cancel_bars + 2
+    if setups is None:
+        setups = {}
+    for position, zone in enumerate(zones):
+        sid = stable_ids[position] if stable_ids is not None else zone.zone_id
+        state = setups.setdefault(sid, _ZoneSetup())
+        if index <= state.block_until:
             continue
         touch_at = None
         rc_at = None
@@ -704,7 +853,23 @@ def _step(
             rc = _hold_index(touch, zone, opens, highs, lows, closes, window)
             if rc is None or rc >= index:
                 continue
-            arm = _arm_index(rc, zone, highs, lows, closes, cfg)
+            pair = (touch, rc)
+            if pair in state.consumed:
+                continue
+            if index > rc + cancel_bars:
+                state.consumed.add(pair)
+                continue
+            if _path_beyond(rc, index, zone, closes):
+                state.consumed.add(pair)
+                continue
+            if pair in state.arm_for:
+                arm = state.arm_for[pair]
+            else:
+                arm = _arm_index(rc, zone, highs, lows, closes, cfg)
+                state.arm_for[pair] = arm
+            if arm is None:
+                state.consumed.add(pair)
+                continue
             if arm == index:
                 touch_at = touch
                 rc_at = rc
@@ -735,10 +900,22 @@ def _step(
         elif funnel is not None and reason == "zone_lt_1r":
             funnel.build_fail_zone_lt_1R += 1
         if signal is None:
+            state.consumed.add((touch_at, rc_at))
             continue
-        armed_until[zone.zone_id] = index + int(cfg.cancel_bars)
+        state.consumed.add((touch_at, rc_at))
+        state.block_until = index + cancel_bars
         found.append(signal)
     return found
+
+
+def _path_beyond(rc: int, index: int, zone: Zone, closes) -> bool:
+    """True when a close after the rejection has left the current zone."""
+    for cursor in range(rc + 1, index + 1):
+        if zone.side == "support" and closes[cursor] < zone.low:
+            return True
+        if zone.side == "resistance" and closes[cursor] > zone.high:
+            return True
+    return False
 
 
 def _is_touch(index: int, zone: Zone, lows, highs, closes) -> bool:
