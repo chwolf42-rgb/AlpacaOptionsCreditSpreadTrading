@@ -14,6 +14,13 @@ Expiry calendar (verified against Cboe/SEC filings, see EXPIRY_SOURCES):
   IWM  Fri weeklies; Mon/Wed from 2021-10-05 (SR-CBOE-2021-057); Tue from 2024-04-16, Thu from 2024-04-18.
   Single names: Friday weeklies only (Mon/Wed for qualifying stocks were only proposed in Jan 2026; ignored).
   Holidays: a Monday expiry moves to the next business day; Tue-Fri expiries move to the prior business day.
+
+SPEC v1.3.2 O1 (dual-expiry books) is the scaffold in options_overlay.py. Listing dates
+and the Friday-weekly holiday shift are applied from this module; the NYSE session
+calendar and the daily/weekly book choice live in options_calendar.py; Black-Scholes
+quotes, spreads and the stop-wins exit live in options_pricing.py. The DTE-bucket
+helpers below stay until Developer 2 bumps grids.py — the hashed trial count is still
+450, and GRID_SHA256 does not include the 24 O1 rows.
 """
 
 from __future__ import annotations

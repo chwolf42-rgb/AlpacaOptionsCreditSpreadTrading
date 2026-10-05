@@ -84,3 +84,32 @@ def comparison_guardrails() -> tuple[tuple[str, int | None, int | None], ...]:
             raise GridsUnavailable(f"COMPARISON_GUARDRAILS entry without a name: {g!r}")
         out.append((str(g["name"]), _losses(g, "daily_losses"), _losses(g, "weekly_losses")))
     return tuple(out)
+
+
+# O1 scaffold rows. Not part of REQUIRED and not part of GRID_SHA256: Developer 2's grids bump
+# owns the hash. The test stand-in carries them until that bump; a grids.py without them fails here.
+_OVERLAY_ATTRS = ("OPTIONS_BASELINE_O1", "OPTIONS_A2_O1", "N_PROGRAM_O1")
+
+
+def overlay_scaffold() -> tuple[tuple, tuple, int]:
+    """Return (baseline rows, A2 rows, program N) for the dual-expiry overlay.
+
+    SPEC v1.3.2 O1: 3 structures × 2 books = 6 baseline, 9 stop×TP × 2 books = 18 A2,
+    program N = 456. These constants are read from the grids module when it has them.
+    They must not be folded into the hashed grid document by the harness.
+    """
+    g = grids()
+    missing = [name for name in _OVERLAY_ATTRS if not hasattr(g, name)]
+    if missing:
+        raise GridsUnavailable(
+            "O1 overlay constants " + ", ".join(missing) + " are not on this grids module. "
+            "The test stand-in (tests/_grids_standin.py) carries OPTIONS_BASELINE_O1, "
+            "OPTIONS_A2_O1 and N_PROGRAM_O1 until Developer 2 bumps grids.py and GRID_SHA256. "
+            "Do not add them to the hashed document in the harness.")
+    base, a2 = tuple(g.OPTIONS_BASELINE_O1), tuple(g.OPTIONS_A2_O1)
+    n = int(g.N_PROGRAM_O1)
+    if len(base) != 6 or len(a2) != 18:
+        raise GridsUnavailable(f"O1 rows must be 6 baseline + 18 A2, got {len(base)} + {len(a2)}")
+    if n != 456:
+        raise GridsUnavailable(f"N_PROGRAM_O1 must be 456 (192+192+48+24), got {n}")
+    return base, a2, n
