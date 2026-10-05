@@ -100,7 +100,13 @@ def test_nan_atr_d_raises_clear_per_signal_error():
 
 def test_zone_target_missing_raises_per_signal():
     ov = {idx("10:05"): (100.05, 100.30, 100.00, 100.20)}
-    s = sig(); object.__setattr__(s, "targets", {"1R": float("nan"), "2R": float("nan"), "zone": float("nan")})
+    s = sig()
+    # targets is an InitVar/_MapView property after 30c20eb; rewrite the target map slots.
+    from research.intraday_sr.types import _append_map
+    keys, off = _append_map({"1R": float("nan"), "2R": float("nan"), "zone": float("nan")})
+    object.__setattr__(s, "_tk", keys)
+    object.__setattr__(s, "_to", off)
+    object.__setattr__(s, "_tr", None)
     with pytest.raises(SignalContractError, match="targets\\['zone'\\]"):
         run({"AAA": flat_day("AAA", D, overrides=ov)}, [s], risk=RiskCfg(target="zone"))
 
