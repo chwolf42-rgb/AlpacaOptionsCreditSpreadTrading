@@ -177,8 +177,13 @@ def test_spill_file_loads_in_a_fresh_process(tmp_path):
     assert dict(got.targets) == {"1R": 103.0, "2R": 104.5}
     assert dict(got.components) == {"rsi": 1.0}
     assert dict(got.zone.components) == {"touches": 1.0, "recency": 0.5}
-    # After clear_zone_cache / release_frozen_maps the spilled bytes must still load.
+    # After clear_zone_cache the on-disk spill must still reconstruct (clear releases the
+    # process blob without detaching live objects, so do not compare against `s`/`got`).
     from research.intraday_sr.engine.zone_cache import clear_zone_cache
     clear_zone_cache()
     got2 = SP.read(tmp_path, "finite", ["SPY"])[0]
-    assert got2 == s and not math.isnan(got2.targets["1R"])
+    assert dict(got2.targets) == {"1R": 103.0, "2R": 104.5}
+    assert dict(got2.components) == {"rsi": 1.0}
+    assert dict(got2.zone.components) == {"touches": 1.0, "recency": 0.5}
+    assert got2.trigger == 101.5 and got2.zone.zone_id == s.zone.zone_id
+    assert not math.isnan(got2.targets["1R"])

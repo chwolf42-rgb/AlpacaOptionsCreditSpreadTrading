@@ -275,11 +275,17 @@ def chunk_order(variants: list) -> list:
 
 
 def clear_engine_caches() -> None:
-    """Free every engine cache between symbols (Developer 2's public hook on #23 >= 3d782d2)."""
+    """Free every engine cache between symbols (Developer 2's public hook on #23 >= 3d782d2).
+
+    Detach live Signal/Zone map blobs first so any leftover refs from the last variant
+    keep readable floats after ``release_frozen_maps`` inside ``clear_zone_cache``.
+    """
     try:
         from research.intraday_sr.engine.zone_cache import clear_zone_cache
+        from research.intraday_sr.types import detach_live_maps
     except ImportError:          # stub adapters / engines without the cache module
         return
+    detach_live_maps()
     clear_zone_cache()
 
 
