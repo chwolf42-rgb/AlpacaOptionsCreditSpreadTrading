@@ -598,8 +598,9 @@ class EngineCfg:
     profile_percentile: float = _grids.PROFILE_PERCENTILE
     profile_bin_atr: float = _grids.PROFILE_BIN_ATR
     zone_pad_atr: float = _grids.ZONE_PAD_ATR
-    # Class constant so asdict(EngineCfg()) and GRID_SHA256 stay unchanged.
+    # Class constants so asdict(EngineCfg()) and GRID_SHA256 stay unchanged.
     max_zone_width_atr: ClassVar[float] = _grids.MAX_ZONE_WIDTH_ATR
+    min_clearance_atr: ClassVar[float] = _grids.MIN_CLEARANCE_ATR
     candidate_band_atr: float = _grids.CANDIDATE_BAND_ATR
     touch_sessions: int = _grids.TOUCH_SESSIONS
     recency_half_life_sessions: float = _grids.RECENCY_HALF_LIFE_SESSIONS

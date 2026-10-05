@@ -7,11 +7,13 @@ weighted 0.30 / 0.30 / 0.20 / 0.20. Touches use the prior 20 sessions plus
 today on the 5m tape. Volume is that zone's share of the profile (the prior
 5 sessions plus today). The top ``K`` zones per side inside 2·ATR_d are kept.
 
-SPEC v1.3.3 locks 1-3, in order: swing pivots are limited to the prior
+SPEC v1.3.3, in order: swing pivots are limited to the prior
 ``touch_sessions`` plus today, single-linkage clusters wider than
 ``max_zone_width_atr`` split at the largest price gap, and a cluster that
 contains last close splits into support and resistance instead of being
-dropped. Padding anchors the edge nearest price so it cannot cross last close.
+dropped. Members within ``min_clearance_atr`` of last close are removed,
+padding anchors the edge nearest price so it cannot cross last close, and a
+zone whose price-facing edge is still closer than that clearance is dropped.
 """
 
 from __future__ import annotations
@@ -62,14 +64,20 @@ def fast_zones(
     band = float(cfg.candidate_band_atr) * atr
     min_width = float(cfg.zone_pad_atr) * atr
     max_span = float(cfg.max_zone_width_atr) * atr
+    clearance = float(cfg.min_clearance_atr) * atr
     drafted: list[tuple[float, float, tuple[str, ...]]] = []
     for members in clusters:
         for part in _split_max_width(members, prices, max_span):
             for piece in _split_straddle(part, prices, last_close):
+                piece = _trim_clearance(piece, prices, last_close, clearance)
+                if not piece:
+                    continue
                 member_prices = prices[piece]
                 raw_low = float(member_prices.min())
                 raw_high = float(member_prices.max())
                 low, high = _pad_zone(raw_low, raw_high, last_close, min_width)
+                if not _edge_clears(low, high, last_close, clearance):
+                    continue
                 mid = 0.5 * (low + high)
                 if abs(mid - last_close) > band:
                     continue
@@ -303,6 +311,29 @@ def _split_straddle(members: list[int], prices: np.ndarray, last_close: float) -
     if above:
         parts.append(above)
     return parts
+
+
+def _trim_clearance(members: list[int], prices: np.ndarray, last_close: float, clearance: float) -> list[int]:
+    """Drop members sitting closer than ``clearance`` to last close.
+
+    A member exactly ``clearance`` away stays. SPEC v1.3.3 lock (a).
+    """
+    if clearance <= 0.0 or not members:
+        return members
+    return [index for index in members if abs(float(prices[index]) - last_close) >= clearance]
+
+
+def _edge_clears(low: float, high: float, last_close: float, clearance: float) -> bool:
+    """Price-facing edge must be at least ``clearance`` from last close.
+
+    Support uses ``last_close - high``. Resistance uses ``low - last_close``.
+    A gap of exactly ``clearance`` is kept. SPEC v1.3.3 lock (a).
+    """
+    if high < last_close:
+        return last_close - high >= clearance
+    if low >= last_close:
+        return low - last_close >= clearance
+    return False
 
 
 def _pad_zone(low: float, high: float, last_close: float, min_width: float) -> tuple[float, float]:

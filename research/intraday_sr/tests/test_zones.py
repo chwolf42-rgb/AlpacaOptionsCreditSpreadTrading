@@ -11,11 +11,12 @@ from research.intraday_sr.data.badprint import prices_as_of
 from research.intraday_sr.engine.levels import _atr_from_segments, _segments, levels_at
 from research.intraday_sr.engine.tape import floor_15m, session_day
 from research.intraday_sr.engine.zones import (
+    _pad_zone,
     _split_max_width,
     fast_zones,
     zones_at,
 )
-from research.intraday_sr.grids import GRID_SHA256, MAX_ZONE_WIDTH_ATR
+from research.intraday_sr.grids import GRID_SHA256, MAX_ZONE_WIDTH_ATR, MIN_CLEARANCE_ATR
 from research.intraday_sr.tests.fixtures import trend_bars
 from research.intraday_sr.types import ET, BarSet, EngineCfg, Level
 
@@ -59,7 +60,9 @@ def _resistances(zones) -> list:
 
 def test_max_zone_width_is_fixed_and_the_grid_hash_is_unchanged():
     assert MAX_ZONE_WIDTH_ATR == 1.0
+    assert MIN_CLEARANCE_ATR == 0.10
     assert EngineCfg.max_zone_width_atr == 1.0
+    assert EngineCfg.min_clearance_atr == 0.10
     assert GRID_SHA256 == "2ef95123c015d70a1751f559f21fa1249d0b08aea272319e232f2facb120aa22"
 
 
@@ -110,20 +113,22 @@ def test_straddle_keeps_support_and_resistance():
 
 
 def test_padding_does_not_cross_last_close():
-    stamp = datetime(2024, 6, 28, 11, 0, tzinfo=ET)
-    support_levels = [_level("hvn", 99.99, stamp)]
-    support = _zones(support_levels, last_close=100.0, atr=10.0, cfg=EngineCfg(k_zones=3))
-    assert len(support) == 1
-    assert support[0].side == "support"
-    assert support[0].high < 100.0
-    assert support[0].high - support[0].low >= 0.5 - 1e-9
+    """The price-side edge stays put when a centered pad would cross last close."""
+    low, high = _pad_zone(99.99, 99.99, 100.0, 0.5)
+    assert high < 100.0
+    assert high == 99.99
+    assert high - low >= 0.5 - 1e-9
+    low, high = _pad_zone(100.0, 100.0, 100.0, 0.5)
+    assert low >= 100.0
+    assert low == 100.0
+    assert high - low >= 0.5 - 1e-9
 
-    resistance_levels = [_level("round", 100.0, stamp)]
-    resistance = _zones(resistance_levels, last_close=100.0, atr=10.0, cfg=EngineCfg(k_zones=3))
-    assert len(resistance) == 1
-    assert resistance[0].side == "resistance"
-    assert resistance[0].low >= 100.0
-    assert resistance[0].high - resistance[0].low >= 0.5 - 1e-9
+    # A member outside the clearance band still pads without crossing.
+    stamp = datetime(2024, 6, 28, 11, 0, tzinfo=ET)
+    support = _zones([_level("hvn", 98.5, stamp)], last_close=100.0, atr=10.0, cfg=EngineCfg(k_zones=3))
+    assert len(support) == 1
+    assert support[0].high < 100.0
+    assert 100.0 - support[0].high >= 1.0 - 1e-9
 
 
 def test_old_pivot_is_excluded_and_a_recent_one_is_kept():
@@ -135,7 +140,7 @@ def test_old_pivot_is_excluded_and_a_recent_one_is_kept():
     levels = [
         _level("pivot_5m", 80.0, old_when),
         _level("pdh", 85.0, old_when),
-        _level("pivot_15m", 99.0, now),
+        _level("pivot_15m", 97.0, now),
     ]
     zones = _zones(
         levels,
@@ -147,10 +152,38 @@ def test_old_pivot_is_excluded_and_a_recent_one_is_kept():
     mids = [0.5 * (zone.low + zone.high) for zone in zones]
     assert all(abs(mid - 80.0) > 1.0 for mid in mids)
     assert any(abs(mid - 85.0) < 1.0 for mid in mids)
-    assert any(abs(mid - 99.0) < 1.0 for mid in mids)
+    assert any(abs(mid - 97.0) < 1.0 for mid in mids)
     assert any("pdh" in zone.kinds for zone in zones)
     assert any("pivot_15m" in zone.kinds for zone in zones)
     assert all("pivot_5m" not in zone.kinds for zone in zones)
+
+
+def test_clearance_trims_near_members_and_drops_a_zone_left_too_close():
+    """Members inside 0.10 ATR are removed. A pad that leaves the edge closer is dropped."""
+    stamp = datetime(2024, 6, 28, 11, 0, tzinfo=ET)
+    atr = 10.0
+    inside = _zones([_level("hvn", 99.5, stamp)], last_close=100.0, atr=atr, cfg=EngineCfg(k_zones=3))
+    assert inside == []
+
+    # Point at 99 survives the member trim (distance 1.0 ATR) and the centered
+    # pad then pulls the edge to 0.75 ATR, which is inside the band.
+    too_close = _zones([_level("hvn", 99.0, stamp)], last_close=100.0, atr=atr, cfg=EngineCfg(k_zones=3))
+    assert too_close == []
+
+    kept = _zones([_level("hvn", 98.5, stamp)], last_close=100.0, atr=atr, cfg=EngineCfg(k_zones=3))
+    assert len(kept) == 1
+    assert kept[0].side == "support"
+    assert 100.0 - kept[0].high >= 0.10 * atr - 1e-9
+
+    # Far enough that the centered pad still leaves a 0.10 ATR gap.
+    on_edge = _zones([_level("round", 101.5, stamp)], last_close=100.0, atr=atr, cfg=EngineCfg(k_zones=3))
+    assert len(on_edge) == 1
+    assert on_edge[0].side == "resistance"
+    assert on_edge[0].low - 100.0 >= 0.10 * atr - 1e-9
+    inside_resistance = _zones(
+        [_level("round", 100.5, stamp)], last_close=100.0, atr=atr, cfg=EngineCfg(k_zones=3)
+    )
+    assert inside_resistance == []
 
 
 def test_k3_and_k5_differ_when_a_side_has_more_than_five_zones():
@@ -225,3 +258,7 @@ def test_fast_zones_match_zones_at_across_fixture_stamps():
             return (zone.side, zone.low, zone.high, zone.score, zone.kinds, zone.zone_id)
 
         assert sorted(direct, key=key) == sorted(reference, key=key)
+        last_close = float(window["close"].iloc[-1]) if not window.empty else None
+        for zone in reference:
+            gap = (last_close - zone.high) if zone.side == "support" else (zone.low - last_close)
+            assert gap >= MIN_CLEARANCE_ATR * zone.atr_d - 1e-9

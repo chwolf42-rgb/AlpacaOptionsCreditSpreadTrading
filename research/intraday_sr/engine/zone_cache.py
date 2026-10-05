@@ -144,19 +144,21 @@ _LEVELS = _Cache(_LEVEL_BYTES, 200_000)
 _SIGNALS = _Cache(_SIGNAL_BYTES, 64)
 
 
-# Bumped when zone geometry changes and cached snapshots must not be reused.
-_ZONE_PIPELINE = "v1.3.3-locks-1-3"
+# Bumped when zone geometry or stable-identity setup changes.
+_ZONE_PIPELINE = "v1.3.3-a-c"
 
 
 def zone_cfg_token(cfg: EngineCfg) -> str:
     """Hash of every EngineCfg field that can change zones or levels.
 
-    The pipeline tag and ``max_zone_width_atr`` are part of the key so a
-    snapshot from before the v1.3.3 splits cannot be served.
+    The pipeline tag, ``max_zone_width_atr``, and ``min_clearance_atr`` are
+    part of the key so a snapshot from before the v1.3.3 clearance trim
+    cannot be served.
     """
     base = _token(cfg, skip=_NOT_ZONE_SIDE)
     width = float(cfg.max_zone_width_atr)
-    raw = f"{base}|max_zone_width_atr={width:.6f}|{_ZONE_PIPELINE}"
+    clearance = float(cfg.min_clearance_atr)
+    raw = f"{base}|max_zone_width_atr={width:.6f}|min_clearance_atr={clearance:.6f}|{_ZONE_PIPELINE}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -302,9 +304,16 @@ def cached_signals(key: tuple) -> list | None:
     return list(found)
 
 
+# A Signal plus its Zone is several KB. 3072 left a ~9k full-span list
+# under the 32MB budget, and the next variant stacked its own list and
+# zone pack past ~700MB. 4096 puts that list over the budget so the next
+# miss releases it. A few hundred signals still fit.
+_SIGNAL_GRAPH_BYTES = 4096
+
+
 def store_signals(key: tuple, signals: list) -> None:
     """Remember a signal list. Each signal keeps its zone, so the byte count is the object graph."""
-    _SIGNALS.put(key, tuple(signals), 256 + 3072 * len(signals))
+    _SIGNALS.put(key, tuple(signals), 256 + _SIGNAL_GRAPH_BYTES * len(signals))
 
 
 def release_oversized_signals() -> None:
