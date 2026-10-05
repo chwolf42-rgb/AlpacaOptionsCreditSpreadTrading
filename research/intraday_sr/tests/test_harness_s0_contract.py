@@ -64,6 +64,73 @@ def test_riskcfg_and_guardrails_built_from_grids_constants(monkeypatch):
         s0grids.primary_guardrail()
 
 
+def test_options_account_guardrail_comes_from_grids(monkeypatch):
+    """options_account defaults are grids.PRIMARY_GUARDRAIL, bound like RiskCfg, not a local 2/5."""
+    import importlib
+    import inspect
+    from datetime import date, datetime, time
+    from zoneinfo import ZoneInfo
+
+    from research.intraday_sr.harness import options as O
+    from research.intraday_sr.harness import s0grids
+
+    def defaults():
+        p = inspect.signature(O.options_account).parameters
+        return p["max_losses_day"].default, p["max_losses_week"].default
+
+    assert defaults() == s0grids.primary_guardrail() == (2, 5)
+    g = s0grids.grids()
+    monkeypatch.setattr(g, "PRIMARY_GUARDRAIL", {"daily_losses": 1, "weekly_losses": 3})
+    try:
+        importlib.reload(O)
+        assert defaults() == s0grids.primary_guardrail() == (1, 3)
+        et = ZoneInfo("America/New_York")
+        d = date(2024, 4, 22)
+
+        def rec(sym, hour):
+            return dict(symbol=sym, session=d, entry_ts=datetime.combine(d, time(hour, 0), tzinfo=et),
+                        exit_ts=datetime.combine(d, time(hour, 30), tzinfo=et), debit_pc=100.0, credit_pc=50.0)
+
+        _, taken, c, _ = O.options_account([rec("A", 10), rec("B", 11)], [d], 0.002)
+        assert list(taken["symbol"]) == ["A"] and c["signals_arrived_blocked"] == 1
+    finally:
+        monkeypatch.undo()
+        importlib.reload(O)
+    assert defaults() == s0grids.primary_guardrail() == (2, 5)
+
+
+def test_options_account_fails_like_config_without_grids(monkeypatch):
+    """Importing options fails the same way as config.py: GridsUnavailable from the grids single source."""
+    import importlib
+
+    from research.intraday_sr.harness import config as Cfg
+    from research.intraday_sr.harness import options as O
+    from research.intraday_sr.harness import s0grids
+
+    real = importlib.import_module
+
+    def fake(name, *a, **k):
+        if name == "research.intraday_sr.grids":
+            raise ImportError("no grids.py")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(importlib, "import_module", fake)
+    monkeypatch.delenv(s0grids.STANDIN_ENV, raising=False)
+    s0grids.grids.cache_clear()
+    try:
+        with pytest.raises(s0grids.GridsUnavailable, match="single source") as config_raised:
+            importlib.reload(Cfg)
+        with pytest.raises(s0grids.GridsUnavailable, match="single source") as options_raised:
+            importlib.reload(O)
+        assert str(options_raised.value) == str(config_raised.value)
+    finally:
+        monkeypatch.undo()
+        s0grids.grids.cache_clear()
+        s0grids.grids()
+        importlib.reload(Cfg)
+        importlib.reload(O)
+
+
 def test_shim_fails_loudly_without_grids(monkeypatch):
     import importlib
     from research.intraday_sr.harness import s0grids

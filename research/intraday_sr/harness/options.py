@@ -26,6 +26,11 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from research.intraday_sr.harness import s0grids as _G
+
+# Same binding as config.RiskCfg / PRIMARY: grids.PRIMARY_GUARDRAIL via s0grids, not a local 2/5.
+_PG_DAY, _PG_WEEK = _G.primary_guardrail()
+
 ETFS = ("SPY", "QQQ", "IWM")
 EXPIRY_SOURCES = {
     "spy_mon_2018": "https://s202.q4cdn.com/174824971/files/doc_news/2018/02/cboe-global-markets-to-list-spy-monday-expiring-weekly-options-2-15-18-pdf1691636060926.pdf",
@@ -419,15 +424,16 @@ def zero_dte_records(trades, bars, ctx: IVContext, zcfg: ZeroDteCfg = ZeroDteCfg
 
 def options_account(records: list, sessions: Sequence[date], premium_pct: float, *, max_concurrent: int = 4,
                     max_entries_per_day: int = 12, daily_loss_stop: float = -0.015,
-                    max_losses_day: Optional[int] = 2, max_losses_week: Optional[int] = 5,
+                    max_losses_day: Optional[int] = _PG_DAY, max_losses_week: Optional[int] = _PG_WEEK,
                     window_starts: Optional[Iterable[date]] = None, start_equity: float = 100_000.0):
     """Premium-sized options portfolio fed by overlay records (one per equity signal that produced an option trade).
-    SPEC v1.3 G6: the d2+w5 guardrail (default) applies to this portfolio's OWN closed option trades: a loss is an
-    option trade with R < 0 after spread and fees (R = P&L / premium paid). Counts update at each option exit, in
-    exit order (exit time, then symbol), before any entry at or after that time; reaching a limit blocks new entries
-    for the rest of the session / Mon-Fri week. Signals skipped for lack of an expiry never reach here (not trades).
-    Caps: 1 per symbol, max concurrent, entries/day, realized daily loss stop (option marks between records are not
-    modelled). Returns (daily Series, trades DataFrame, counters, sessions DataFrame). daily_loss_stop is signed (-0.015)."""
+    SPEC v1.3 G6: the primary guardrail (grids.PRIMARY_GUARDRAIL, via s0grids.primary_guardrail) applies to this
+    portfolio's OWN closed option trades: a loss is an option trade with R < 0 after spread and fees
+    (R = P&L / premium paid). Counts update at each option exit, in exit order (exit time, then symbol), before any
+    entry at or after that time; reaching a limit blocks new entries for the rest of the session / Mon-Fri week.
+    Signals skipped for lack of an expiry never reach here (not trades). Caps: 1 per symbol, max concurrent,
+    entries/day, realized daily loss stop (option marks between records are not modelled). Returns (daily Series,
+    trades DataFrame, counters, sessions DataFrame). daily_loss_stop is signed (-0.015)."""
     from research.intraday_sr.harness.walkforward import WINDOW_STARTS
     ws = sorted(set(WINDOW_STARTS if window_starts is None else window_starts))
     by = {}
