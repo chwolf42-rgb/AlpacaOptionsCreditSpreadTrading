@@ -90,7 +90,8 @@ SPEC_EQUITY_AXES = {"K": {3, 5}, "oscillator": {"rsi14_30_70", "stoch14_3_3_20_8
                     "entry_tf": {"5m", "15m"}, "target": {"1R", "2R", "zone"}, "k_confirm": {0, 1, 2, 3}}
 # SPEC values the FIXED block must carry (v1.1 A1/A2, v1.3 G1, v1.3.1 C3). Extra FIXED keys (R5 additions) are allowed.
 SPEC_FIXED = {"k_cluster_atr": 0.25, "entries_per_day": 12, "max_concurrent": 4, "max_per_symbol": 1,
-              "daily_loss_stop": -0.015, "pivot_n": {"5m": 3, "15m": 3, "1h": 2, "1d": 2}}
+              "daily_loss_stop": -0.015, "pivot_n": {"5m": 3, "15m": 3, "1h": 2, "1d": 2},
+              "primary_guardrail": {"daily_losses": 2, "weekly_losses": 5}}
 SPEC_PRIMARY_GUARDRAIL = {"daily_losses": 2, "weekly_losses": 5}
 SPEC_COMPARISON_GUARDRAILS = [{"name": "none"}, {"name": "d2+w6", "daily_losses": 2, "weekly_losses": 6}]
 

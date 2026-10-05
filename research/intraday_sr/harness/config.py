@@ -38,14 +38,21 @@ _CONC = int(_G.fixed("max_concurrent"))
 
 # Frozen harness constants that grids.FIXED does not carry YET (CP0 R5 asks Developer 2 to add them). Each is taken
 # from grids.FIXED as soon as the key exists; until then the SPEC value is used and listed in PENDING_R5 (manifest).
+# FIXED key aliases (grids.FIXED names on the left of the SPEC names the RiskCfg fields still use).
+_FIXED_ALIASES = {"risk_pct": "risk_fraction", "max_pos_notional_x": "notional_cap_position",
+                  "max_gross_notional_x": "notional_cap_total", "last_entry": "no_new_entries_after_et",
+                  "forced_exit": "forced_exit_bar_open_et", "start_equity": "model_equity",
+                  "min_stop_atr_d": "stop_floor_atr"}
 _PENDING_SPEC = {"risk_pct": 0.005, "max_pos_notional_x": 1.0, "max_gross_notional_x": 3.0, "last_entry": "15:00",
                  "forced_exit": "15:55", "forced_exit_early": "12:55", "min_stop_atr_d": 0.10,
-                 "zone_target_min_r": 1.0}
-PENDING_R5 = tuple(k for k in _PENDING_SPEC if k not in _G.grids().FIXED)
+                 "zone_target_min_r": 1.0, "start_equity": 100_000.0}
+PENDING_R5 = tuple(k for k in _PENDING_SPEC
+                   if k not in _G.grids().FIXED and _FIXED_ALIASES.get(k, k) not in _G.grids().FIXED)
 
 
 def _fx(key):
-    v = _G.grids().FIXED.get(key, _PENDING_SPEC[key])
+    f = _G.grids().FIXED
+    v = f[key] if key in f else f.get(_FIXED_ALIASES.get(key, key), _PENDING_SPEC[key])
     return time.fromisoformat(v) if isinstance(v, str) and ":" in v else v
 
 
@@ -63,7 +70,7 @@ class RiskCfg:
     forced_exit_early: time = _fx("forced_exit_early")   # half days (13:00 close)
     min_stop_atr_d: float = _fx("min_stop_atr_d")        # stop widened to >= 0.10 ATR_d from the actual fill
     zone_target_min_r: float = _fx("zone_target_min_r")  # zone target < 1R from the fill -> skip
-    start_equity: float = 100_000.0
+    start_equity: float = _fx("start_equity")
     capacity_release: Literal["next_bar"] = "next_bar"   # capacity freed by an exit on bar t is usable from t+1
     fill_bar_target: Literal["not_credited"] = "not_credited"  # on the entry bar only the stop is checked
     # SPEC v1.3 G1/G3: loss guardrail d2+w5 is the PRIMARY configuration and the default (grids.PRIMARY_GUARDRAIL).

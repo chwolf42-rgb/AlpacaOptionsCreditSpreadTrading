@@ -37,7 +37,7 @@ import pandas as pd
 
 from research.intraday_sr.harness import costs as K
 from research.intraday_sr.harness.config import CostCfg, RiskCfg, canonical_target
-from research.intraday_sr.harness.contracts import Fill, Trade
+from research.intraday_sr.types import Fill, Trade
 from research.intraday_sr.harness.fills import STOP, TARGET, exit_on_bar, stop_entry_fill, widen_stop
 from research.intraday_sr.harness.guard import Guard, Guarded
 

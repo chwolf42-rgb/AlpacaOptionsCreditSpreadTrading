@@ -1,13 +1,13 @@
-"""Minimal Signal/Zone stand-ins with the SPEC section 3 field names, for harness unit tests only.
-(The shared synthetic fixtures belong to S0 / Developer 2; these are local and throwaway.)"""
+"""Harness unit-test builders over the REAL S0 types (research.intraday_sr.types.Zone / Signal)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Mapping, Optional
 
 import pandas as pd
+
+from research.intraday_sr.types import Signal, Zone
 
 ET = "America/New_York"
 
@@ -16,38 +16,13 @@ def t(day: str, hhmm: str) -> pd.Timestamp:
     return pd.Timestamp(f"{day} {hhmm}", tz=ET)
 
 
-@dataclass(frozen=True)
-class Z:
-    symbol: str
-    low: float
-    high: float
-    side: str
-    score: float
-    components: Mapping[str, float]
-    kinds: tuple
-    as_of_ts: datetime
-    valid_from_ts: datetime
-    available_at: datetime
-    engine_cfg: str = "test"
-    atr_d: float = 2.0
+def Z(symbol, low, high, side, score, components, kinds, as_of_ts, valid_from_ts, available_at,
+      engine_cfg="test", atr_d=2.0, tf="5m"):
+    return Zone(symbol, low, high, side, score, components, kinds, as_of_ts, valid_from_ts, available_at,
+                engine_cfg, tf=tf, atr_d=float(atr_d))
 
 
-@dataclass(frozen=True)
-class S:
-    symbol: str
-    tf: str
-    direction: int
-    test: str
-    zone: Z
-    formation: Optional[object]
-    trigger: float
-    stop: float
-    targets: Mapping[str, float]
-    expires_at: datetime
-    components: Mapping[str, float]
-    as_of_ts: datetime
-    available_at: datetime
-    variant_id: str = "v0"
+S = Signal
 
 
 def sig(symbol="AAA", day="2024-03-04", at="10:00", direction=1, trigger=100.10, stop=99.50, zlo=99.6, zhi=99.9,
@@ -60,7 +35,6 @@ def sig(symbol="AAA", day="2024-03-04", at="10:00", direction=1, trigger=100.10,
 
 
 def bars(symbol, day, rows, adj=1.0, start="09:30"):
-    """rows: list of (open, high, low, close) for consecutive 5m bars from `start`; volume 1e5."""
     t0 = t(day, start)
     out = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
     out["ts"] = [t0 + pd.Timedelta(minutes=5 * i) for i in range(len(rows))]

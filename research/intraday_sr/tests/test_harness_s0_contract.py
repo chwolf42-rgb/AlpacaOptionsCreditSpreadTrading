@@ -73,8 +73,7 @@ def test_shim_fails_loudly_without_grids(monkeypatch):
             raise ImportError("no grids.py")
         return real(name, *a, **k)
     monkeypatch.setattr(importlib, "import_module", fake)
-    monkeypatch.delenv(s0grids.STANDIN_ENV, raising=False)
-    s0grids.grids.cache_clear()
+        s0grids.grids.cache_clear()
     try:
         with pytest.raises(s0grids.GridsUnavailable, match="single source"):
             s0grids.grids()

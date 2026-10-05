@@ -45,18 +45,116 @@ SPEC_VERSION = "v1.3.1"
 _G: dict = {}          # fork-shared state for workers
 
 
+def engine_cfg_for(variant: dict):
+    """grids row -> EngineCfg: K maps to k_zones; everything else is frozen in EngineCfg / grids.FIXED."""
+    from research.intraday_sr.types import EngineCfg
+    return EngineCfg(k_zones=int(variant["K"]))
+
+
+def signal_cfg_for(variant: dict, test: str | None = None):
+    """grids row -> SignalCfg (oscillator, rvol_min, entry_tf, target, k_confirm, variant_id, test)."""
+    from research.intraday_sr.types import SignalCfg
+    return SignalCfg(oscillator=variant["oscillator"], rvol_min=float(variant["rvol_min"]),
+                     entry_tf=variant["entry_tf"], target=variant["target"], k_confirm=int(variant["k_confirm"]),
+                     variant_id=variant["variant_id"], test=test or variant.get("test") or variant["variant_id"][0])
+
+
+def _engine_cfg_hash(cfg) -> str:
+    import dataclasses
+    import hashlib
+    return hashlib.sha256(json.dumps(dataclasses.asdict(cfg), sort_keys=True).encode()).hexdigest()[:16]
+
+
+def resolve_symbol_parquet(cache_root: Path, symbol: str) -> Path:
+    """Trading stores ``part_NNNN_<SYM>.parquet`` (BRK.B as BRK-B). D2-1 ``symbol_cache_path`` still returns
+    ``<root>/<SYM>.parquet`` (CP0 B3); resolve by glob here so the adapter can load the real cache without
+    patching Developer 2's data layer."""
+    from research.intraday_sr.data.cache import cache_filename, symbol_cache_path
+    direct = symbol_cache_path(cache_root, symbol)
+    if direct.is_file():
+        return direct
+    stem = cache_filename(symbol)
+    hits = sorted(cache_root.glob(f"part_*_{stem}.parquet"))
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise FileNotFoundError(f"no 5m cache file for {symbol} under {cache_root} "
+                                f"(looked for {direct.name} and part_*_{stem}.parquet)")
+    raise FileNotFoundError(f"ambiguous cache files for {symbol}: {hits}")
+
+
 class S0Adapter:
-    """Default adapter over Developer 2's S0 modules (types.py, grids.py, data/, engine/). Wired once S0 lands."""
+    """Adapter over Developer 2's S0/#23 modules: grids, data.cache (+ part_* resolution), engine.signals."""
     smoke = False
 
-    def __init__(self):
-        try:
-            self.grids = importlib.import_module("research.intraday_sr.grids")
-            self.engine = importlib.import_module("research.intraday_sr.engine.signals")
-            self.cache = importlib.import_module("research.intraday_sr.data.cache")
-        except ImportError as e:
-            raise SystemExit(f"S0 engine/grids not available yet ({e}). Pass --adapter module:factory for a smoke run.")
-        raise SystemExit("S0 modules found: wire S0Adapter to their final API (variants/signals/bar_source).")
+    def __init__(self, cache_root: str | Path | None = None, adj_path: str | Path | None = None,
+                 symbols: list[str] | None = None):
+        self.grids = importlib.import_module("research.intraday_sr.grids")
+        self.engine = importlib.import_module("research.intraday_sr.engine")
+        self.types = importlib.import_module("research.intraday_sr.types")
+        self.cache = importlib.import_module("research.intraday_sr.data.cache")
+        self.adjust = importlib.import_module("research.intraday_sr.data.adjust")
+        root_default = Path("/workspace/research2/data/alpaca_intraday/m5rth_fixed33")
+        self.cache_root = Path(cache_root or root_default)
+        self.adj_path = Path(adj_path or (self.cache_root / "adj_factors" / "adj_factors.parquet"))
+        if not self.adj_path.is_file():
+            # fall back to combined / directory handled by our thin adjfactors adapter
+            self.adj_path = self.cache_root / "adj_factors"
+        self._symbols = list(symbols) if symbols is not None else list(
+            getattr(self.grids, "UNIVERSE", None) or self.grids.load_universe_symbols())
+        self._factors = None
+        self._frames: dict = {}
+
+    def symbols(self) -> list:
+        return list(self._symbols)
+
+    def variants(self, test: str) -> list:
+        return [dict(v) for v in {"A": self.grids.TEST_A, "B": self.grids.TEST_B}[test]]
+
+    def engine_cfg(self, v) -> str:
+        return _engine_cfg_hash(engine_cfg_for(v))
+
+    def factors(self):
+        if self._factors is None:
+            if self.adj_path.is_file():
+                self._factors = self.adjust.load_adj_factors(self.adj_path)
+            else:
+                self._factors = AF.load_adj_factors(self.cache_root)
+        return self._factors
+
+    def frame(self, sym: str):
+        if sym not in self._frames:
+            path = resolve_symbol_parquet(self.cache_root, sym)
+            raw = self.cache._read_parquet(path) if hasattr(self.cache, "_read_parquet") else __import__("pandas").read_parquet(path)
+            # normalize via public API by writing a temp? Prefer calling normalize_bars directly.
+            report = self.cache.validate_symbol(raw, sym)
+            if not report.ok:
+                raise self.cache.SymbolValidationError(report)
+            fr, _ = self.cache.normalize_bars(raw, factors=self.factors(), symbol=sym)
+            # float32 already from normalize; keep
+            self._frames[sym] = fr
+        return self._frames[sym]
+
+    def bar_source(self, symbols):
+        from research.intraday_sr.harness.portfolio import FrameBarSource
+        return FrameBarSource({s: self.frame(s) for s in symbols})
+
+    def sessions(self) -> list:
+        # only after frames loaded
+        days = set()
+        for s in self._symbols:
+            if s in self._frames:
+                days.update(self._frames[s]["session"].unique())
+        if not days:
+            # force-load first symbol to discover calendar
+            days.update(self.frame(self._symbols[0])["session"].unique())
+        return sorted(days)
+
+    def signals(self, symbol: str, v: dict) -> list:
+        fr = self.frame(symbol)
+        bars = self.types.BarSet(fr)
+        start, end = fr["available_at"].iloc[0].to_pydatetime(), fr["available_at"].iloc[-1].to_pydatetime()
+        return list(self.engine.signals(bars, start, end, engine_cfg_for(v), signal_cfg_for(v)))
 
 
 def load_adapter(spec: str | None):
