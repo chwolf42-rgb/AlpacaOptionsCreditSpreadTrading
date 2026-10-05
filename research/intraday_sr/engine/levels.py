@@ -9,6 +9,7 @@ that still need the raw high or low read ``high_unclamped`` / ``low_unclamped``.
 from __future__ import annotations
 
 import bisect
+from array import array
 from datetime import datetime, time
 
 import numpy as np
@@ -49,6 +50,8 @@ def _strict_mask(values: np.ndarray, n: int, *, high: bool) -> np.ndarray:
 
 _TF_CACHE: dict[tuple, pd.DataFrame | None] = {}
 _TF_PARENT: dict[tuple, dict] = {}
+_TF_CACHE_MAX = 8
+_TF_PARENT_MAX = 8
 
 
 def _clear_tf_cache() -> None:
@@ -59,11 +62,24 @@ def _clear_tf_cache() -> None:
 register_cache_clear(_clear_tf_cache)
 
 
+def _remember_tf(key: tuple, frame: pd.DataFrame | None) -> None:
+    _TF_CACHE[key] = frame
+    while len(_TF_CACHE) > _TF_CACHE_MAX:
+        _TF_CACHE.pop(next(iter(_TF_CACHE)))
+
+
+def _remember_tf_parent(key: tuple, payload: dict) -> None:
+    _TF_PARENT[key] = payload
+    while len(_TF_PARENT) > _TF_PARENT_MAX:
+        _TF_PARENT.pop(next(iter(_TF_PARENT)))
+
+
 def timeframe_frame(group: pd.DataFrame, tf: str) -> pd.DataFrame | None:
     """Closed ``tf`` bars for the signal stack. ``5m`` returns ``group``.
 
     A prefix of a tape already resampled is the closed buckets whose
-    ``available_at`` is still inside that prefix.
+    ``available_at`` is still inside that prefix. The slice is a view of the
+    parent frame and is not stored again.
     """
     if tf == "5m":
         return group
@@ -81,21 +97,22 @@ def timeframe_frame(group: pd.DataFrame, tf: str) -> pd.DataFrame | None:
         and prefix_digest(parent["hashes"], len(hashes) - 1) == key[2]
     ):
         end_ns = np.int64(pd.Timestamp(_as_dt(group["available_at"].iloc[-1])).value)
-        full = parent["frame"]
-        sliced = full.loc[parent["avail_ns"] <= end_ns].reset_index(drop=True)
-        _TF_CACHE[key] = sliced
-        return sliced
+        cut = int(np.searchsorted(parent["avail_ns"], end_ns, side="right"))
+        return parent["frame"].iloc[:cut]
     built = _bucket_table(group, tf, full=True)
     if built is not None:
         built.pop("_record", None)
     frame = None if built is None or not built["high"] else pd.DataFrame(built)
-    _TF_CACHE[key] = frame
+    _remember_tf(key, frame)
     if frame is not None and (parent is None or len(hashes) >= len(parent["hashes"])):
-        _TF_PARENT[(tf, symbol)] = {
-            "hashes": hashes,
-            "frame": frame,
-            "avail_ns": _epoch_ns(frame["available_at"]),
-        }
+        _remember_tf_parent(
+            (tf, symbol),
+            {
+                "hashes": hashes,
+                "frame": frame,
+                "avail_ns": _epoch_ns(frame["available_at"]),
+            },
+        )
     return frame
 
 
@@ -106,10 +123,18 @@ def levels_at(bars: BarSet, as_of: datetime, cfg: EngineCfg) -> list[Level]:
         return []
     stamp = as_et(as_of, "as_of")
     key = (tape_token(frame), stamp, level_cfg_token(cfg))
-    return cached_levels(key, lambda: _levels_from_frame(frame, stamp, cfg))
+    ptr = _frame_ptr(frame)
+    return cached_levels(key, lambda: _levels_from_frame(frame, stamp, cfg, ptr))
 
 
-def _levels_from_frame(frame: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Level]:
+def _frame_ptr(frame: pd.DataFrame) -> int:
+    if frame.empty or "open" not in frame.columns:
+        return 0
+    values = frame["open"].to_numpy(copy=False)
+    return int(values.__array_interface__["data"][0])
+
+
+def _levels_from_frame(frame: pd.DataFrame, as_of: datetime, cfg: EngineCfg, ptr: int = 0) -> list[Level]:
     found: list[Level] = []
     for symbol, group in frame.groupby("symbol", sort=True):
         group = group.sort_values("ts")
@@ -117,16 +142,145 @@ def _levels_from_frame(frame: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> 
             group = group.loc[group["tf"].astype(str) == "5m"]
         if group.empty:
             continue
-        found.extend(_symbol_levels(str(symbol), group, as_of, cfg))
+        found.extend(_symbol_levels(str(symbol), group, as_of, cfg, ptr))
     found.sort(key=lambda level: (level.symbol, level.available_at, level.kind, level.price))
     return found
 
 
-def _symbol_levels(symbol: str, group: pd.DataFrame, as_of: datetime, cfg: EngineCfg) -> list[Level]:
-    pivots, prices = _pivot_tape(symbol, group, cfg)
-    return _levels_at_stamp(
-        symbol, group, pivots, prices, as_of, cfg, opening=_opening_range_table(group)
-    )
+def _prefix_inputs(symbol: str, group: pd.DataFrame, ptr: int) -> tuple[np.ndarray, dict]:
+    """Hashes and the opening-range table for ``group``.
+
+    A longer tape that shares ``ptr``, or a copy whose OHLCV prefix matches,
+    reuses the work. Opening range for a session does not depend on later
+    sessions, and the hash array is a running digest, so a prefix slice is
+    the same result as hashing that prefix alone.
+    """
+    n = len(group)
+    close = group["close"].to_numpy(copy=False)
+    key = (ptr, symbol) if ptr else None
+    state = _PREFIX_STATE.get(key) if key else None
+    if _prefix_matches(state, close, n):
+        return state["hashes"][:n], state["opening"]
+    for (other_ptr, other_symbol), candidate in _PREFIX_STATE.items():
+        if other_symbol != symbol or other_ptr == ptr:
+            continue
+        if _prefix_matches(candidate, close, n) and _columns_match(candidate, group, n):
+            return candidate["hashes"][:n], candidate["opening"]
+    hashes = prefix_hashes(group)
+    opening = _opening_range_table(group)
+    if key and (state is None or n >= state["n"]):
+        columns = {
+            name: np.array(group[name].to_numpy(copy=False), copy=True)
+            for name in ("open", "high", "low", "close", "volume")
+            if name in group.columns
+        }
+        _PREFIX_STATE[key] = {"n": n, "hashes": hashes, "opening": opening, "close": columns.get("close", np.array(close, copy=True)), "columns": columns}
+        while len(_PREFIX_STATE) > 8:
+            _PREFIX_STATE.pop(next(iter(_PREFIX_STATE)))
+    return hashes, opening
+
+
+def _prefix_matches(state: dict | None, close: np.ndarray, n: int) -> bool:
+    if state is None or n > state["n"] or n == 0:
+        return False
+    stored = state["close"]
+    return bool(stored[0] == close[0] and stored[n - 1] == close[-1])
+
+
+def _columns_match(state: dict, group: pd.DataFrame, n: int) -> bool:
+    columns = state.get("columns") or {}
+    for name, stored in columns.items():
+        if name not in group.columns:
+            return False
+        if not np.array_equal(stored[:n], group[name].to_numpy(copy=False)[:n]):
+            return False
+    return True
+
+
+def _symbol_levels(symbol: str, group: pd.DataFrame, as_of: datetime, cfg: EngineCfg, ptr: int = 0) -> list[Level]:
+    hashes, opening = _prefix_inputs(symbol, group, ptr)
+    pivots, prices = _pivot_tape(symbol, group, cfg, hashes)
+    return _levels_at_stamp(symbol, group, pivots, prices, as_of, cfg, opening=opening)
+
+
+class _PackedLevels:
+    """Pivot indices plus the non-pivot rows for one stamp."""
+
+    __slots__ = ("symbol", "pivots", "codes", "extras", "nbytes")
+
+    def __init__(self, symbol: str, pivots: list[Level], codes, extras: tuple) -> None:
+        self.symbol = symbol
+        self.pivots = pivots
+        self.codes = codes
+        self.extras = extras
+        if isinstance(codes, (bytes, bytearray)):
+            payload = len(codes)
+        else:
+            payload = codes.itemsize * len(codes)
+        self.nbytes = 64 + payload + 48 * len(extras)
+
+    def materialize(self) -> list[Level]:
+        pivots = self.pivots
+        extras = self.extras
+        symbol = self.symbol
+        out: list[Level] = []
+        codes = self.codes
+        if isinstance(codes, (bytes, bytearray)):
+            # Selected pivots are in index order, so the stream stores the gap
+            # since the previous pivot. 0 introduces a 16-bit gap. 255 is a
+            # non-pivot row, consumed from ``extras`` in order.
+            prev = -1
+            extra_at = 0
+            index = 0
+            limit = len(codes)
+            while index < limit:
+                token = codes[index]
+                index += 1
+                if token == 255:
+                    kind, price, stamp = extras[extra_at]
+                    extra_at += 1
+                    out.append(
+                        Level(
+                            symbol=symbol,
+                            kind=kind,
+                            price=price,
+                            weight=1.0,
+                            as_of_ts=stamp,
+                            available_at=stamp,
+                        )
+                    )
+                    continue
+                if token == 0:
+                    delta = (codes[index] << 8) | codes[index + 1]
+                    index += 2
+                else:
+                    delta = token
+                prev += delta
+                out.append(pivots[prev])
+            return out
+        wide = codes.typecode == "i"
+        extra_at = 0
+        for code in codes:
+            pivot_row = (code >= 0) if wide else code != 65535
+            if pivot_row:
+                out.append(pivots[code])
+                continue
+            if wide:
+                kind, price, stamp = extras[-code - 1]
+            else:
+                kind, price, stamp = extras[extra_at]
+                extra_at += 1
+            out.append(
+                Level(
+                    symbol=symbol,
+                    kind=kind,
+                    price=price,
+                    weight=1.0,
+                    as_of_ts=stamp,
+                    available_at=stamp,
+                )
+            )
+        return out
 
 
 class _LevelTape:
@@ -142,9 +296,14 @@ class _LevelTape:
     def __init__(self, symbol: str, frame: pd.DataFrame, cfg: EngineCfg):
         self.symbol = symbol
         self.cfg = cfg
-        self.frame = frame.reset_index(drop=True)
+        if isinstance(frame.index, pd.RangeIndex) and frame.index.start == 0 and getattr(frame.index, "step", 1) == 1:
+            self.frame = frame
+        else:
+            self.frame = frame.reset_index(drop=True)
         self.hashes = prefix_hashes(self.frame)
         self.pivots, self.prices = _pivot_tape(symbol, self.frame, cfg, self.hashes)
+        self._pivot_ids = {id(level): index for index, level in enumerate(self.pivots)}
+        self._clock: dict[int, datetime] = {}
         self.opening = _opening_range_table(self.frame)
         group = self.frame
         self.available = list(group["available_at"])
@@ -189,6 +348,69 @@ class _LevelTape:
         if flags.size == 0:
             return flags
         return flags[self.vis_ns[flags] > stamp_ns]
+
+    def pack(self, levels: list[Level]) -> "_PackedLevels":
+        """Compact a stamp's levels so the cache keeps pivot indices, not a pointer list.
+
+        Order matches ``levels``. Pivot rows stay the shared objects from this
+        tape. The handful of non-pivot rows (prior day, opening range, VWAP,
+        HVN, rounds) are stored as kind, price, and one interned timestamp.
+        """
+        # Pivot rows come out in index order, and almost every gap fits in one
+        # byte. 0 plus two bytes is a larger gap. 255 is a non-pivot row.
+        # A tape with 65535 or more pivots keeps absolute int32 indexes.
+        wide = len(self.pivots) >= 65535
+        extras: list[tuple[str, float, datetime]] = []
+        if wide:
+            codes: array | bytes = array("i")
+            for level in levels:
+                pivot = self._pivot_ids.get(id(level))
+                if pivot is None:
+                    codes.append(-len(extras) - 1)
+                    extras.append((level.kind, float(level.price), self._intern(level.available_at)))
+                else:
+                    codes.append(pivot)
+            return _PackedLevels(self.symbol, self.pivots, codes, tuple(extras))
+        raw = bytearray()
+        prev = -1
+        for level in levels:
+            pivot = self._pivot_ids.get(id(level))
+            if pivot is None:
+                raw.append(255)
+                extras.append((level.kind, float(level.price), self._intern(level.available_at)))
+                continue
+            delta = pivot - prev
+            if delta <= 0 or delta > 65535:
+                return self._pack_absolute(levels)
+            prev = pivot
+            if delta <= 253:
+                raw.append(delta)
+            else:
+                raw.append(0)
+                raw.append((delta >> 8) & 255)
+                raw.append(delta & 255)
+        return _PackedLevels(self.symbol, self.pivots, bytes(raw), tuple(extras))
+
+    def _pack_absolute(self, levels: list[Level]) -> "_PackedLevels":
+        """Absolute indexes when the pivot subsequence is not increasing."""
+        codes = array("i")
+        extras: list[tuple[str, float, datetime]] = []
+        for level in levels:
+            pivot = self._pivot_ids.get(id(level))
+            if pivot is None:
+                codes.append(-len(extras) - 1)
+                extras.append((level.kind, float(level.price), self._intern(level.available_at)))
+            else:
+                codes.append(pivot)
+        return _PackedLevels(self.symbol, self.pivots, codes, tuple(extras))
+
+    def _intern(self, stamp: datetime) -> datetime:
+        ns = int(pd.Timestamp(stamp).value)
+        found = self._clock.get(ns)
+        if found is None:
+            self._clock[ns] = stamp
+            return stamp
+        return found
 
     def levels_at(self, cutoff: int, stamp: datetime) -> list[Level]:
         stamp_ns = int(pd.Timestamp(stamp).value)
@@ -296,14 +518,32 @@ def _vwap_slice(symbol: str, price: np.ndarray, close: np.ndarray, volume: np.nd
 
 _PIVOTS: dict[tuple, tuple[list[Level], np.ndarray]] = {}
 _PIVOT_PARENT: dict[tuple, dict] = {}
+_PIVOT_CACHE_MAX = 8
+_PIVOT_PARENT_MAX = 8
+
+
+_PREFIX_STATE: dict[tuple, dict] = {}
 
 
 def _clear_pivot_cache() -> None:
     _PIVOTS.clear()
     _PIVOT_PARENT.clear()
+    _PREFIX_STATE.clear()
 
 
 register_cache_clear(_clear_pivot_cache)
+
+
+def _remember_pivots(key: tuple, value: tuple[list[Level], np.ndarray]) -> None:
+    _PIVOTS[key] = value
+    while len(_PIVOTS) > _PIVOT_CACHE_MAX:
+        _PIVOTS.pop(next(iter(_PIVOTS)))
+
+
+def _remember_pivot_parent(key: tuple, payload: dict) -> None:
+    _PIVOT_PARENT[key] = payload
+    while len(_PIVOT_PARENT) > _PIVOT_PARENT_MAX:
+        _PIVOT_PARENT.pop(next(iter(_PIVOT_PARENT)))
 
 
 def _pivot_tape(
@@ -330,13 +570,13 @@ def _pivot_tape(
     if parent is not None and len(hashes) <= len(parent["hashes"]) and prefix_digest(parent["hashes"], len(hashes) - 1) == key:
         end = _as_dt(group["available_at"].iloc[-1])
         cut = bisect.bisect_right(parent["pivots"], end, key=lambda level: level.available_at)
-        sliced = (parent["pivots"][:cut], parent["prices"][:cut])
-        _PIVOTS[cache_key] = sliced
-        return sliced
+        # A prefix slice shares the parent objects. It is not cached: each
+        # shorter tape would otherwise keep its own pointer list.
+        return parent["pivots"][:cut], parent["prices"][:cut]
     pivots, prices = _pivot_tape_build(symbol, group, cfg)
-    _PIVOTS[cache_key] = (pivots, prices)
+    _remember_pivots(cache_key, (pivots, prices))
     if parent is None or len(hashes) >= len(parent["hashes"]):
-        _PIVOT_PARENT[cfg_key] = {"hashes": hashes, "pivots": pivots, "prices": prices}
+        _remember_pivot_parent(cfg_key, {"hashes": hashes, "pivots": pivots, "prices": prices})
     return pivots, prices
 
 

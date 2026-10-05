@@ -27,10 +27,19 @@ def prices_as_of(frame: pd.DataFrame, as_of: datetime) -> pd.DataFrame:
     )
     if not bool(np.any(hidden)):
         return frame
-    out = frame.copy()
-    out.loc[hidden, "high"] = out.loc[hidden, "high_unclamped"]
-    out.loc[hidden, "low"] = out.loc[hidden, "low_unclamped"]
-    out.loc[hidden, "bad_print"] = False
+    # A shallow frame plus two replaced columns. The hidden clamps are a few
+    # bars, so this must not deep-copy the rest of the tape.
+    mask = hidden.to_numpy(dtype=bool) if hasattr(hidden, "to_numpy") else np.asarray(hidden, dtype=bool)
+    out = frame.copy(deep=False)
+    high = np.array(frame["high"].to_numpy(copy=False), copy=True)
+    low = np.array(frame["low"].to_numpy(copy=False), copy=True)
+    flags = np.array(frame["bad_print"].to_numpy(copy=False), copy=True)
+    high[mask] = np.asarray(frame["high_unclamped"].to_numpy(copy=False)[mask], dtype=high.dtype)
+    low[mask] = np.asarray(frame["low_unclamped"].to_numpy(copy=False)[mask], dtype=low.dtype)
+    flags[mask] = False
+    out["high"] = high
+    out["low"] = low
+    out["bad_print"] = flags
     return out
 
 

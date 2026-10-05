@@ -83,9 +83,63 @@ _ZONE_ONLY = frozenset(
     }
 )
 
-_MAX_ENTRIES = 100_000
-_ZONES: OrderedDict[tuple, tuple[Zone, ...]] = OrderedDict()
-_LEVELS: OrderedDict[tuple, tuple[Level, ...]] = OrderedDict()
+# One full-span symbol is about 40k level stamps and twice that many zone
+# stamps (5m and 15m). The budgets keep that working set and evict older
+# symbols once a second tape arrives. ``clear_zone_cache`` drops both.
+_LEVEL_BYTES = 320_000_000
+_ZONE_BYTES = 128_000_000
+_SIGNAL_BYTES = 32_000_000
+
+
+class _Cache:
+    """LRU store with a byte budget and an item cap.
+
+    A single entry larger than the budget is kept. Eviction starts once a
+    second entry pushes the store over the limit, so the live symbol is not
+    dropped to satisfy the cap.
+    """
+
+    def __init__(self, max_bytes: int, max_items: int) -> None:
+        self.max_bytes = int(max_bytes)
+        self.max_items = int(max_items)
+        self.data: OrderedDict = OrderedDict()
+        self.sizes: dict = {}
+        self.nbytes = 0
+
+    def get(self, key):
+        found = self.data.get(key)
+        if found is None:
+            return None
+        self.data.move_to_end(key)
+        return found
+
+    def put(self, key, value, nbytes: int) -> None:
+        if key in self.data:
+            self.nbytes -= self.sizes[key]
+        self.data[key] = value
+        size = int(nbytes)
+        self.sizes[key] = size
+        self.nbytes += size
+        self.data.move_to_end(key)
+        self._evict()
+
+    def _evict(self) -> None:
+        while len(self.data) > 1 and (self.nbytes > self.max_bytes or len(self.data) > self.max_items):
+            old, _value = self.data.popitem(last=False)
+            self.nbytes -= self.sizes.pop(old, 0)
+
+    def clear(self) -> None:
+        self.data.clear()
+        self.sizes.clear()
+        self.nbytes = 0
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
+_ZONES = _Cache(_ZONE_BYTES, 200_000)
+_LEVELS = _Cache(_LEVEL_BYTES, 200_000)
+_SIGNALS = _Cache(_SIGNAL_BYTES, 64)
 
 
 def zone_cfg_token(cfg: EngineCfg) -> str:
@@ -127,20 +181,23 @@ def tape_token(frame: pd.DataFrame) -> str:
 def cached_levels(key: tuple, build):
     found = _LEVELS.get(key)
     if found is not None:
-        _LEVELS.move_to_end(key)
-        return list(found)
-    levels = list(build())
-    _remember(_LEVELS, key, tuple(levels))
+        return _as_levels(found)
+    built = build()
+    stored, nbytes, levels = _pack_levels(built)
+    _LEVELS.put(key, stored, nbytes)
     return levels
 
 
 def cached_zones(key: tuple, build):
     found = _ZONES.get(key)
     if found is not None:
-        _ZONES.move_to_end(key)
-        return list(found)
+        return _as_zones(found)
     zones = list(build())
-    _remember(_ZONES, key, tuple(zones))
+    if not zones:
+        _ZONES.put(key, (), 64)
+        return zones
+    packed = _PackedZones(zones)
+    _ZONES.put(key, packed, packed.nbytes)
     return zones
 
 
@@ -224,20 +281,16 @@ def prefix_hashes(frame: pd.DataFrame) -> np.ndarray:
     return out
 
 
-_SIGNALS: OrderedDict[tuple, tuple] = OrderedDict()
-
-
 def cached_signals(key: tuple) -> list | None:
     """Return a stored signal list, or None on a miss."""
     found = _SIGNALS.get(key)
     if found is None:
         return None
-    _SIGNALS.move_to_end(key)
     return list(found)
 
 
 def store_signals(key: tuple, signals: list) -> None:
-    _remember(_SIGNALS, key, tuple(signals))
+    _SIGNALS.put(key, tuple(signals), 256 + 512 * len(signals))
 
 
 _EXTRA_CLEARS: list = []
@@ -249,12 +302,180 @@ def register_cache_clear(fn) -> None:
 
 
 def clear_zone_cache() -> None:
-    """Drop every cached snapshot. Tests use this so cases do not share tapes."""
+    """Drop every cached snapshot, including pivot and resample parents.
+
+    The harness calls this between symbols. Nothing retained here is shared
+    with the next symbol.
+    """
     _ZONES.clear()
     _LEVELS.clear()
     _SIGNALS.clear()
     for fn in _EXTRA_CLEARS:
         fn()
+
+
+def _as_levels(found):
+    materialize = getattr(found, "materialize", None)
+    if materialize is not None:
+        return materialize()
+    return list(found)
+
+
+def _as_zones(found):
+    materialize = getattr(found, "materialize", None)
+    if materialize is not None:
+        return materialize()
+    return list(found)
+
+
+class _PackedZones:
+    """Numeric rows for one stamp. Zone objects are built when a caller reads them."""
+
+    __slots__ = (
+        "symbol",
+        "tf",
+        "engine_cfg",
+        "stamp",
+        "sides",
+        "kinds",
+        "numbers",
+        "keys",
+        "rows",
+        "nbytes",
+    )
+
+    def __init__(self, zones: list[Zone]) -> None:
+        first = zones[0]
+        keys = tuple(first.components)
+        shared = all(tuple(zone.components) == keys for zone in zones) and all(
+            zone.symbol == first.symbol
+            and zone.tf == first.tf
+            and zone.engine_cfg == first.engine_cfg
+            and zone.as_of_ts == zone.available_at == zone.valid_from_ts == first.available_at
+            for zone in zones
+        )
+        self.rows = None
+        if shared:
+            self.symbol = first.symbol
+            self.tf = first.tf
+            self.engine_cfg = first.engine_cfg
+            self.stamp = first.available_at
+            self.keys = keys
+            self.sides = tuple(zone.side for zone in zones)
+            self.kinds = tuple(tuple(zone.kinds) for zone in zones)
+            numbers = np.empty((len(zones), 4 + len(keys)), dtype=np.float64)
+            for index, zone in enumerate(zones):
+                numbers[index, 0] = zone.low
+                numbers[index, 1] = zone.high
+                numbers[index, 2] = zone.score
+                numbers[index, 3] = zone.atr_d
+                for column, key in enumerate(keys):
+                    numbers[index, 4 + column] = zone.components[key]
+            self.numbers = numbers
+            self.nbytes = 160 + int(numbers.nbytes) + 48 * len(zones)
+            return
+        self.symbol = None
+        self.tf = None
+        self.engine_cfg = None
+        self.stamp = None
+        self.sides = None
+        self.kinds = None
+        self.numbers = None
+        self.keys = None
+        self.rows = tuple(
+            (
+                zone.symbol,
+                float(zone.low),
+                float(zone.high),
+                zone.side,
+                float(zone.score),
+                tuple(zone.components.items()),
+                tuple(zone.kinds),
+                zone.as_of_ts,
+                zone.valid_from_ts,
+                zone.available_at,
+                zone.engine_cfg,
+                zone.tf,
+                float(zone.atr_d),
+            )
+            for zone in zones
+        )
+        self.nbytes = 64 + 160 * len(self.rows)
+
+    def materialize(self) -> list[Zone]:
+        if self.rows is not None:
+            return [
+                Zone(
+                    symbol=symbol,
+                    low=low,
+                    high=high,
+                    side=side,
+                    score=score,
+                    components=dict(components),
+                    kinds=kinds,
+                    as_of_ts=as_of_ts,
+                    valid_from_ts=valid_from_ts,
+                    available_at=available_at,
+                    engine_cfg=engine_cfg,
+                    tf=tf,
+                    atr_d=atr_d,
+                )
+                for (
+                    symbol,
+                    low,
+                    high,
+                    side,
+                    score,
+                    components,
+                    kinds,
+                    as_of_ts,
+                    valid_from_ts,
+                    available_at,
+                    engine_cfg,
+                    tf,
+                    atr_d,
+                ) in self.rows
+            ]
+        numbers = self.numbers
+        keys = self.keys
+        stamp = self.stamp
+        out: list[Zone] = []
+        width = len(keys)
+        for index, side in enumerate(self.sides):
+            components = {keys[column]: float(numbers[index, 4 + column]) for column in range(width)}
+            out.append(
+                Zone(
+                    symbol=self.symbol,
+                    low=float(numbers[index, 0]),
+                    high=float(numbers[index, 1]),
+                    side=side,
+                    score=float(numbers[index, 2]),
+                    components=components,
+                    kinds=self.kinds[index],
+                    as_of_ts=stamp,
+                    valid_from_ts=stamp,
+                    available_at=stamp,
+                    engine_cfg=self.engine_cfg,
+                    tf=self.tf,
+                    atr_d=float(numbers[index, 3]),
+                )
+            )
+        return out
+
+
+def _pack_levels(built):
+    """Store a packed level record when the builder made one, else a tuple."""
+    if getattr(built, "materialize", None) is not None and getattr(built, "nbytes", None) is not None:
+        return built, int(built.nbytes), built.materialize()
+    levels = tuple(built)
+    return levels, 64 + 480 * len(levels), list(levels)
+
+
+def _zone_bytes(zones: list) -> int:
+    total = 64
+    for zone in zones:
+        total += 256 + 24 * len(zone.kinds) + 48 * len(zone.components)
+    return total
 
 
 def _token(cfg: EngineCfg, *, skip: frozenset[str]) -> str:
@@ -266,9 +487,3 @@ def _token(cfg: EngineCfg, *, skip: frozenset[str]) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode()).hexdigest()
 
-
-def _remember(store: OrderedDict, key: tuple, value: tuple) -> None:
-    store[key] = value
-    store.move_to_end(key)
-    while len(store) > _MAX_ENTRIES:
-        store.popitem(last=False)
