@@ -10,7 +10,9 @@ Per session, in bar-open order across symbols:
      concurrent (capacity freed this bar is usable next bar), max entries/day, no fills on bars opening at/after
      15:00, daily stop not hit; sizing 0.5% of day-start equity / stop distance, capped at 1x equity per position
      and 3x gross (cap-limited trades counted); zone target < 1R from the fill -> skipped
-  4. at the bar close (guard clock advances): cancel orders whose zone closed through, mark open P&L, and if
+  4. at the bar close (guard clock advances): cancel a pending order on a close beyond formation
+     invalidation when that level is set (F8, and Test B via B1), otherwise on a close through the
+     zone (Test A). Then mark open P&L, and if
      realized + open <= -1.5% of day-start equity flatten at the next open and take no more entries that day.
 Loss guardrail (SPEC v1.3 G3, primary d2+w5, from RiskCfg): a loss is a closed trade with R < 0 after costs,
 counted at its exit fill, portfolio-wide, updated after every exit (also inside one bar, and for an entry stopped
@@ -147,16 +149,50 @@ class SignalContractError(ValueError):
     """A signal violates the harness input contract (e.g. Zone.atr_d NaN). Raised per signal, never swallowed."""
 
 
-def _consume_formation(guard: Guard, sig) -> None:
-    """F/B: signal.formation is an engine object, consumed through Guard.
-
-    The decision bar is the signal's available_at, not the later entry-bar open. A formation
-    whose available_at is after that bar is lookahead and raises LookaheadError.
-    """
+def _formation_clock(sig):
+    """(formation or None, available_at or None). Compact spills carry the timestamp without the object."""
     form = getattr(sig, "formation", None)
-    if form is None:
+    if form is not None:
+        return form, form.available_at
+    return None, getattr(sig, "formation_available_at", None)
+
+
+def _consume_formation(guard: Guard, sig) -> None:
+    """F/B: consume the formation at the signal's decision bar.
+
+    F8's retest prints after the break bar, so formation.available_at must be strictly before
+    signal.available_at. Equality is lookahead. Compact pass 2 has no formation object; it
+    checks the spilled f_avail_us the same way. Test A has neither and is unchanged.
+    """
+    form, avail = _formation_clock(sig)
+    if form is None and avail is None:
         return
-    guard.check(form, decision_ts=sig.available_at)
+    decision = sig.available_at
+    if avail is None or not (avail < decision):
+        raise LookaheadError(
+            f"formation.available_at={None if avail is None else avail.isoformat()} is not strictly "
+            f"before signal.available_at={decision.isoformat()} "
+            "(F8: the retest bar is after the break bar's close)"
+        )
+    if form is not None:
+        guard.check(form, decision_ts=decision)
+
+
+def _cancel_level(sig) -> float | None:
+    """F8 invalidation when the signal carries one. NaN / absent keeps Test A's zone cancel."""
+    level = getattr(sig, "cancel_level", None)
+    if level is None:
+        form = getattr(sig, "formation", None)
+        level = None if form is None else getattr(form, "invalidation", None)
+    if level is None:
+        return None
+    try:
+        value = float(level)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
 
 
 def _sig_name(sig) -> str:
@@ -332,7 +368,7 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
         guard.advance(ts)                                  # decision time = previous bar's close = this open
         while ai < len(inactive) and inactive[ai].available_at <= ts:
             raw = inactive[ai]
-            _consume_formation(guard, raw)             # formation.available_at must be <= the decision bar
+            _consume_formation(guard, raw)             # formation.available_at must be < the decision bar
             g = guard.wrap(raw)
             ai += 1
             if blocked():                                  # arrives while a limit is active: never armed
@@ -448,11 +484,17 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
         keep = []
         for g in pending:
             if g.symbol in here and g.available_at <= close_ts:
-                z = g.zone
                 cl = float(here[g.symbol].close)
-                if (int(g.direction) > 0 and cl < float(z.low)) or (int(g.direction) < 0 and cl > float(z.high)):
-                    c["cancel_zone_close"] += 1
-                    continue
+                level = _cancel_level(g)
+                if level is not None:
+                    if (int(g.direction) > 0 and cl < level) or (int(g.direction) < 0 and cl > level):
+                        c["cancel_invalidation"] += 1
+                        continue
+                else:
+                    z = g.zone
+                    if (int(g.direction) > 0 and cl < float(z.low)) or (int(g.direction) < 0 and cl > float(z.high)):
+                        c["cancel_zone_close"] += 1
+                        continue
             keep.append(g)
         pending = keep
         for s_, b_ in here.items():

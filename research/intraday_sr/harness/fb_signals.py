@@ -19,8 +19,9 @@ target travel on the grid row, not on a new config type::
 
 ``variant`` is one ``grids.FORMATIONS`` row: ``test`` (``F_W`` | ``F_IHS`` | ``F_M`` | ``F_HS``),
 ``kind`` (``W`` | ``IHS`` | ``M`` | ``HS``), ``entry_tf``, ``target``, ``pivot_tol_atr``,
-``variant_id``. ``cfg`` is ``EngineCfg()`` with the default ``k_zones=5``. K is not a formation
-axis, and ``EngineCfg`` has no ``pivot_tol`` field, so the tolerance stays on ``variant``.
+``variant_id``. ``cfg`` is ``EngineCfg(k_zones=5)`` (formations zone target; passed explicitly,
+not left to the dataclass default). K is not a formation axis, and ``EngineCfg`` has no
+``pivot_tol`` field, so the tolerance stays on ``variant``.
 
 Test B (``--test B``)::
 
@@ -46,15 +47,25 @@ Both tests return frozen ``Signal`` objects. The harness does not rebuild trigge
 
 * ``symbol``, ``tf`` (the variant's ``entry_tf``), ``variant_id``, ``direction`` (+1 for W/IHS,
   −1 for M/HS), ``trigger``, ``stop``, ``expires_at``, ``as_of_ts``, ``available_at``.
-* ``targets`` includes ``1R`` and ``2R`` (``zone`` when a zone target exists). The portfolio
-  still applies the Test A target, widen-stop, cap and cost rules to whatever the engine put
-  on the signal.
-* ``zone`` is a ``Zone`` with finite ``atr_d > 0`` (the stop floor reads only that).
+* ``targets`` includes ``1R`` and ``2R``. On a ``target == "zone"`` variant the engine emits a
+  signal only when an opposite zone in the K=5 cache exists and is at least 1R from the
+  trigger (the same rule as ``engine/signals.py`` for Test A). Otherwise it drops the signal.
+  Target values are never ``None``. Pass 1 drops a zone-target signal that has no finite
+  ``targets["zone"]`` so pass 2 does not abort.
+* ``zone.atr_d`` is finite and ``> 0`` (F10 prior-session ATR). Pass 1 checks it.
+* Formations-alone set ``zone.score = 0.0``. Same-bar entry ties then break by symbol A to Z.
+  Test B keeps the stack zone's score, as Test A does.
 * ``formation`` is a ``Formation``, never None. ``formation.kind`` matches the variant on F.
-  ``formation.available_at <= signal.available_at`` (the decision bar). The harness consumes
-  ``signal.formation`` through ``Guard.check`` at that decision time. A later ``available_at``
-  is lookahead and aborts the run.
-* Test B also requires ``formation.zone_id`` set (B2: same zone as the stack touch).
+  ``formation.available_at`` is the break bar's close and must be strictly before
+  ``signal.available_at`` (F8: the retest is after the break). Equality is rejected.
+  ``confirmed_ts <= break_ts <= formation.available_at`` and
+  ``signal.as_of_ts <= signal.available_at < signal.expires_at``.
+* Test B (B2): ``formation.zone_id == signal.zone.zone_id``,
+  ``signal.tf == variant["entry_tf"] == formation.tf``, and
+  ``formation.symbol == signal.symbol``.
+* ``formation.invalidation`` is the pattern extreme for both F and B (min of the pattern lows
+  for longs, max of the highs for shorts). It is not the zone. The compact spill stores it
+  as ``f_inval`` and pass 2 cancels on that level.
 * Formations-alone use ``confluence=0`` and no oscillator/MACD/RVOL flags. Test B confluence
   is the stack's optional-condition count, same as Test A.
 
@@ -65,6 +76,7 @@ nothing continue, and it is for fixtures.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Mapping
 from datetime import datetime
 
@@ -73,6 +85,7 @@ from research.intraday_sr.types import BarSet, EngineCfg, Signal
 FORMATION_SIGNALS = "research.intraday_sr.engine.formations.formation_signals"
 TEST_B_SIGNALS = "research.intraday_sr.engine.signals.test_b_signals"
 FORMATIONS_IN = "research.intraday_sr.engine.formations.formations_in"
+FORMATION_K_ZONES = 5          # formations zone target. Explicit; not EngineCfg's default.
 
 _LONG = frozenset({"W", "IHS"})
 _SHORT = frozenset({"M", "HS"})
@@ -118,10 +131,10 @@ def test_b_signals_fn():
 
 
 def engine_cfg_for_variant(variant: Mapping) -> EngineCfg:
-    """K maps to k_zones for Test A/B. Formations have no K axis: the EngineCfg default (5)."""
+    """K maps to k_zones for Test A/B. Formations pass k_zones=5 explicitly (zone target)."""
     if "K" in variant and variant["K"] not in (None, ""):
         return EngineCfg(k_zones=int(variant["K"]))
-    return EngineCfg()
+    return EngineCfg(k_zones=FORMATION_K_ZONES)
 
 
 def _direction(kind: str) -> int:
@@ -132,13 +145,47 @@ def _direction(kind: str) -> int:
     raise EngineContractError(f"formation kind {kind!r} is not W, IHS, M, or HS")
 
 
+def _finite_zone_target(signal: Signal) -> bool:
+    targets = signal.targets
+    if "zone" not in targets:
+        return False
+    value = targets["zone"]
+    return value is not None and math.isfinite(float(value))
+
+
+def _require_atr(signal: Signal, vid: str) -> None:
+    value = getattr(signal.zone, "atr_d", None)
+    if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise EngineContractError(f"{vid}: zone.atr_d must be finite and > 0, got {value!r}")
+
+
+def _require_stamps(signal: Signal, vid: str) -> None:
+    """F8: the break bar's close is strictly before the signal's decision bar."""
+    form = signal.formation
+    if form is None:
+        raise EngineContractError(f"{vid}: formation is None")
+    if not (form.confirmed_ts <= form.break_ts <= form.available_at):
+        raise EngineContractError(
+            f"{vid}: need confirmed_ts <= break_ts <= formation.available_at, "
+            f"got {form.confirmed_ts}, {form.break_ts}, {form.available_at}"
+        )
+    if not (form.available_at < signal.available_at):
+        raise EngineContractError(
+            f"{vid}: formation.available_at {form.available_at} must be strictly before "
+            f"signal.available_at {signal.available_at} (F8 retest is after the break bar)"
+        )
+    if not (signal.as_of_ts <= signal.available_at < signal.expires_at):
+        raise EngineContractError(
+            f"{vid}: need as_of_ts <= available_at < expires_at, "
+            f"got {signal.as_of_ts}, {signal.available_at}, {signal.expires_at}"
+        )
+
+
 def _reject_late_formation(signal: Signal) -> None:
     """Consume signal.formation through Guard at the signal's decision bar."""
     from research.intraday_sr.harness.guard import Guard
-    form = signal.formation
-    if form is None:
-        raise EngineContractError(f"{signal.variant_id} {signal.symbol}: formation is None")
-    Guard(signal.available_at).check(form, decision_ts=signal.available_at)
+    _require_stamps(signal, signal.variant_id)
+    Guard(signal.available_at).check(signal.formation, decision_ts=signal.available_at)
 
 
 def validate_f_signal(signal: Signal, variant: Mapping) -> None:
@@ -163,6 +210,14 @@ def validate_f_signal(signal: Signal, variant: Mapping) -> None:
         raise EngineContractError(f"{vid}: formation symbol {form.symbol} != {signal.symbol}")
     if int(signal.direction) != _direction(form.kind):
         raise EngineContractError(f"{vid}: direction {signal.direction} does not match kind {form.kind}")
+    if float(signal.zone.score) != 0.0:
+        raise EngineContractError(
+            f"{vid}: formations-alone zone.score must be 0.0 so same-bar ties break by symbol A-Z, "
+            f"got {signal.zone.score!r}"
+        )
+    _require_atr(signal, vid)
+    if str(variant.get("target")) == "zone" and not _finite_zone_target(signal):
+        raise EngineContractError(f"{vid}: zone-target variant signal has no finite targets['zone']")
     _reject_late_formation(signal)
 
 
@@ -177,8 +232,22 @@ def validate_b_signal(signal: Signal, variant: Mapping) -> None:
         raise EngineContractError(f"{vid}: signal test/variant_id {signal.test}/{signal.variant_id} != B/{vid}")
     if not form.zone_id:
         raise EngineContractError(f"{vid}: B2 requires formation.zone_id to be set")
+    if str(form.zone_id) != str(signal.zone.zone_id):
+        raise EngineContractError(
+            f"{vid}: formation.zone_id {form.zone_id} != signal.zone.zone_id {signal.zone.zone_id}"
+        )
+    if signal.tf != variant["entry_tf"] or form.tf != signal.tf:
+        raise EngineContractError(
+            f"{vid}: need signal.tf == entry_tf == formation.tf, "
+            f"got {signal.tf}, {variant['entry_tf']}, {form.tf}"
+        )
+    if form.symbol != signal.symbol:
+        raise EngineContractError(f"{vid}: formation symbol {form.symbol} != {signal.symbol}")
     if int(signal.direction) != _direction(form.kind):
         raise EngineContractError(f"{vid}: direction {signal.direction} does not match kind {form.kind}")
+    _require_atr(signal, vid)
+    if str(variant.get("target")) == "zone" and not _finite_zone_target(signal):
+        raise EngineContractError(f"{vid}: zone-target variant signal has no finite targets['zone']")
     _reject_late_formation(signal)
 
 
@@ -186,9 +255,12 @@ def signals_for_f(bars: BarSet, start: datetime, end: datetime, variant: Mapping
     """Map one formation variant to signals via ``formation_signals``. Empty is allowed here;
     the run aborts later if a whole portfolio is empty, unless ``--allow-empty``."""
     fn = formation_signals_fn()
-    out = list(fn(bars, start, end, engine_cfg_for_variant(variant), variant))
-    for signal in out:
+    out = []
+    for signal in fn(bars, start, end, engine_cfg_for_variant(variant), variant):
+        if str(variant.get("target")) == "zone" and not _finite_zone_target(signal):
+            continue
         validate_f_signal(signal, variant)
+        out.append(signal)
     return out
 
 
@@ -205,9 +277,12 @@ def signals_for_b(bars: BarSet, start: datetime, end: datetime, variant: Mapping
         variant_id=variant["variant_id"],
         test="B",
     )
-    out = list(fn(bars, start, end, engine_cfg_for_variant(variant), sig))
-    for signal in out:
+    out = []
+    for signal in fn(bars, start, end, engine_cfg_for_variant(variant), sig):
+        if str(variant.get("target")) == "zone" and not _finite_zone_target(signal):
+            continue
         validate_b_signal(signal, variant)
+        out.append(signal)
     return out
 
 

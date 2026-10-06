@@ -36,11 +36,26 @@ def _reset_legacy():
     P.set_legacy(False, False)
 
 
+@pytest.fixture(autouse=True)
+def _fb_engine_is_v135(monkeypatch):
+    """This branch has no engine/version.py. F/B tests inject Dev 2's stamp."""
+    real = R.engine_stamp_fields
+
+    def fake(repo):
+        got = real(repo)
+        got["engine_spec"] = "v1.3.5"
+        got["engine_spec_source"] = "engine/version.py"
+        return got
+
+    monkeypatch.setattr(R, "engine_stamp_fields", fake)
+
+
 def _lag(tf: str) -> timedelta:
     return timedelta(minutes=15 if tf == "5m" else 45)
 
 
-def make_formation(symbol: str, kind: str, form_at, tf: str = "5m", zone_id: str | None = None) -> Formation:
+def make_formation(symbol: str, kind: str, form_at, tf: str = "5m", zone_id: str | None = None,
+                  invalidation: float = 99.0) -> Formation:
     last = form_at - _lag(tf)
     if kind in ("W", "IHS"):
         prices = (100.0, 110.0, 100.4)
@@ -51,25 +66,32 @@ def make_formation(symbol: str, kind: str, form_at, tf: str = "5m", zone_id: str
         (form_at - timedelta(minutes=80), prices[1]),
         (last, prices[2]),
     )
-    return Formation(kind, symbol, tf, pivots, (100.5, 0.0), 99.0, form_at, None, form_at, form_at, form_at, zone_id)
+    return Formation(kind, symbol, tf, pivots, (100.5, 0.0), invalidation, form_at, None, form_at, form_at, form_at, zone_id)
 
 
 def fsig(symbol="AAA", day=DAY, at="10:00", kind="W", variant=None, form_at=None, test=None,
-         zone_id="", trigger=100.10, stop=99.50, expires="15:30"):
+         zone_id="", trigger=100.10, stop=99.50, expires="15:30", score=None, zone_target=None,
+         zlo=99.0, zhi=99.4, invalidation: float = 99.0):
     av = t(day, at)
-    formed = av if form_at is None else form_at
+    # Default formation close is one bar before the signal. F8 rejects equality.
+    formed = (av - timedelta(minutes=5)) if form_at is None else form_at
     spec = dict(variant or {})
     test = test or spec.get("test") or f"F_{kind}"
     kind = spec.get("kind") or kind
     tf = spec.get("entry_tf") or "5m"
     vid = spec.get("variant_id") or f"{test}-{tf}-1R-tol0.25"
     side = "support" if kind in ("W", "IHS") else "resistance"
-    z = Z(symbol, 99.0, 99.4, side, 0.8, {"touches": 1.0}, ("pdl",), av, av, av, atr_d=2.0, tf="5m")
+    if score is None:
+        score = 0.8 if test == "B" else 0.0
+    z = Z(symbol, zlo, zhi, side, score, {"touches": 1.0}, ("pdl",), av, av, av, atr_d=2.0, tf="5m")
     zid = z.zone_id if zone_id == "" and test == "B" else (zone_id or None)
-    form = make_formation(symbol, kind, formed, tf=tf, zone_id=zid)
+    form = make_formation(symbol, kind, formed, tf=tf, zone_id=zid, invalidation=invalidation)
     direction = 1 if kind in ("W", "IHS") else -1
+    targets = {"1R": float("nan"), "2R": float("nan")}
+    if zone_target is not None:
+        targets["zone"] = float(zone_target)
     return Signal(symbol, tf, direction, test, z, form, trigger, stop,
-                  {"1R": float("nan"), "2R": float("nan")}, t(day, expires), {}, av, av, vid, confluence=0)
+                  targets, t(day, expires), {}, av, av, vid, confluence=0)
 
 
 def _sim(frames, sigs, target="1R"):
@@ -136,12 +158,17 @@ def test_nonsmoke_readout_stays_interim_and_records_formation_dsr(tmp_path):
             "share_positive": 0.0, "passes": False}
     inp = RO.ReadoutInputs("v1.3.1", "abc", PINNED, {"F_W": 12}, ["AAA"], headlines={"F_W": h},
                            r7={"F_W": block}, fold_83={"F_W": crit}, spec_doc="v1.3.5",
-                           spec_doc_commit=R.SPEC_DOC_COMMIT_FB, engine_spec="v1.3.5", interim=True)
+                           spec_doc_commit=R.SPEC_DOC_COMMIT_FB, engine_spec="v1.3.5", interim=True,
+                           formations_k_zones=5, formation_var_n=48)
     txt = RO.write_readout(inp, tmp_path).read_text()
     assert "INTERIM — 1 of 33" in txt and "informational only" in txt
     assert "DSR N for this test is **48**" in txt and "gross mean R" in txt
     assert "non-positive" in txt and "cannot pass" in txt
     assert "spec_doc v1.3.5" in txt and "engine_spec v1.3.5" in txt
+    assert "grid spec v1.3.1" in txt and "Grid spec v1.3.1" in txt
+    assert "FAIL: OOS trades 1 must be >= 500." in txt
+    assert "FAIL: section 8.3" in txt
+    assert "k_zones **5**" in txt and "formation variants" in txt
 
 
 def test_formation_headline_uses_dsr_n_48():
@@ -173,8 +200,10 @@ def test_guard_rejects_a_formation_later_than_the_decision_bar():
         guard.check(late.formation, decision_ts=late.available_at)
     with pytest.raises(LookaheadError):
         _sim({"AAA": flat_day("AAA", DAY)}, [late])
-    same = fsig()
-    _sim({"AAA": flat_day("AAA", DAY)}, [same])       # formation.available_at == the decision bar
+    same = fsig(form_at=t(DAY, "10:00"))
+    with pytest.raises(LookaheadError, match="strictly before"):
+        _sim({"AAA": flat_day("AAA", DAY)}, [same])
+    _sim({"AAA": flat_day("AAA", DAY)}, [fsig()])     # formation close is one bar before the signal
 
 
 def test_halfday_cutoff_and_subtick_target_gap_apply_to_f_signals():
@@ -330,7 +359,9 @@ def test_end_to_end_test_f_fixture(tmp_path, monkeypatch):
     txt = (out / "READOUT.md").read_text()
     assert "PIPELINE SMOKE TEST" in txt and "informational only" in txt
     assert "gross mean R" in txt and "mean cost R" in txt and "net mean R" in txt
+    assert m["formations_k_zones"] == 5
     assert "DSR N for this test is **48**" in txt and "non-positive" in txt
+    assert "k_zones **5**" in txt and "grid spec v1.3.1" in txt
     assert "FINDING" in txt and "cannot pass" in txt
     for kind in R.FORMATION_TESTS:
         assert f"## Test {kind}:" in txt
@@ -342,6 +373,7 @@ def test_end_to_end_test_f_fixture(tmp_path, monkeypatch):
         for pick in wf["picks"]:
             assert pick["variant"] is None or pick["variant"] in ids
         assert wf["fold_criterion"]["n_unselected"] >= 1
+        assert wf["can_pass"] is False
     parts = sorted((out / "ledger_smoke").glob("part-*.parquet"))
     logged = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
     assert set(logged["test"]) == set(R.FORMATION_TESTS)
@@ -375,6 +407,7 @@ def test_end_to_end_test_b_fixture(tmp_path, monkeypatch):
     assert m["engine_spec"] == "v1.3.5" and m["spec_doc"] == "v1.3.5"
     assert m["spec_version"] == "v1.3.1" and m["dsr_n"] == 456
     assert m["dsr_by_test"]["B"] == 456 and m["dsr_by_test"]["B"] != 48
+    assert "formations_k_zones" not in m
     txt = (out / "READOUT.md").read_text()
     assert "PIPELINE SMOKE TEST" in txt and "informational only" in txt
     trades = pd.read_parquet(out / "trades_B.parquet")
@@ -389,15 +422,23 @@ def _p1_frame():
     rows, forms = [], []
     for d in days:
         touch = t(d.isoformat(), "10:00")
-        rows.append({"session": d, "symbol": "AAA", "direction": 1, "touch_ts": touch, "zone_id": "Z1",
-                     "tf": "5m", "gross_R": -0.4, "net_R": -1.0, "r": -1.0, "path": "oos_exact",
-                     "guardrail": "d2+w5"})
-        forms.append(make_formation("AAA", "W", touch + timedelta(minutes=15), zone_id="Z1"))
+        rows.append({"session": d, "symbol": "AAA", "direction": 1, "touch_ts": touch, "zone_id": "K3",
+                     "tf": "5m", "z_low": 100.0, "z_high": 101.0, "gross_R": -0.4, "net_R": -1.0, "r": -1.0,
+                     "variant_id": "A-main", "path": "oos_exact", "guardrail": "d2+w5"})
+        forms.append(make_formation("AAA", "W", touch + timedelta(minutes=15)))   # no zone_id
     rows.append({"session": days[0], "symbol": "AAA", "direction": 1, "touch_ts": t(days[0].isoformat(), "10:00"),
-                 "zone_id": "Z9", "tf": "5m", "gross_R": 2.0, "net_R": 2.0, "r": 2.0, "path": "oos_exact",
-                 "guardrail": "d2+w5"})
-    rows.append({**rows[0], "path": "dev", "net_R": 3.0, "r": 3.0, "gross_R": 3.0})
-    rows.append({**rows[0], "guardrail": "d2+w6", "net_R": 3.0, "r": 3.0, "gross_R": 3.0})
+                 "zone_id": "K5", "tf": "5m", "z_low": 50.0, "z_high": 51.0, "gross_R": 2.0, "net_R": 2.0,
+                 "r": 2.0, "variant_id": "A-miss", "path": "oos_exact", "guardrail": "d2+w5"})
+    rows.append({**rows[0], "path": "dev", "net_R": 3.0, "r": 3.0, "gross_R": 3.0, "variant_id": "A-dev"})
+    rows.append({**rows[0], "guardrail": "d2+w6", "net_R": 3.0, "r": 3.0, "gross_R": 3.0, "variant_id": "A-cmp"})
+    have = {r["variant_id"] for r in rows if r["path"] == "oos_exact" and r["guardrail"] == "d2+w5"}
+    i = 0
+    while len(have) < 192:
+        vid = f"A-pad{i}"
+        i += 1
+        have.add(vid)
+        rows.append({**rows[0], "symbol": "ZZZ", "variant_id": vid, "z_low": 1.0, "z_high": 2.0,
+                     "zone_id": f"pad{i}"})
     return pd.DataFrame(rows), forms
 
 
@@ -407,7 +448,8 @@ def test_p1_on_synthetic_fixtures(tmp_path):
     b = prescreen(trades, forms)
     assert a == b and a["screened_out"] is True and a["label"] == "screened out by P1"
     assert a["net_mean_r"]["hi"] < 0 and a["gross_mean_r"]["mean"] is not None
-    assert a["n_filtered"] == 30 and a["n_oos"] == 31          # wrong zone stays in the pool, not the filter
+    assert a["n_filtered"] == 30 and a["n_oos"] == 221          # bounds miss and pad rows stay in the pool
+    assert all(f.zone_id is None for f in forms)
     assert a["pivot_tol"] == 0.25 and a["bootstrap"]["seed"] == 20260925
     assert prescreen(trades, []).get("label") == "no filtered trades"
     assert prescreen(trades, []).get("screened_out") is False
@@ -423,9 +465,12 @@ def test_p1_on_synthetic_fixtures(tmp_path):
     blob = tmp_path / "forms.pkl"
     blob.write_bytes(pickle.dumps(forms))
     from research.intraday_sr.harness.p1_prescreen import main
-    got = main([str(pq), "--out", str(tmp_path / "rep"), "--formations", str(blob)])
+    got = main([str(pq), "--out", str(tmp_path / "rep"), "--formations", str(blob),
+                "--a1b-run-id", "interim_A1b"])
     saved = json.loads((tmp_path / "rep" / "p1.json").read_text())
     assert got["label"] == saved["label"] == "screened out by P1"
+    assert saved["a1b_run_id"] == "interim_A1b" and len(saved["trades_sha256"]) == 64
+    assert len(saved["formations_sha256"]) == 64 and saved["engine_spec"]
 
 
 def test_launch_scripts_stamp_v135():
@@ -433,3 +478,8 @@ def test_launch_scripts_stamp_v135():
         txt = (ROOT / "runs" / "smoke_integ" / name).read_text()
         assert "v1.3.5" in txt and R.SPEC_DOC_COMMIT_FB in txt and "engine_spec" in txt
         assert "GRID_SHA256" in txt and "N_PROGRAM" in txt and "--keep-signals" in txt
+        assert "nohup" in txt and "pgrep -f" in txt and "wt_integ" in txt
+        assert "manifest.json" in txt and "run.log" in txt and "merge-base --is-ancestor" in txt
+        assert "AlpacaOptionsCreditSpreadTrading" in txt
+    btxt = (ROOT / "runs" / "smoke_integ" / "FULL_TEST_B_COMMAND.sh").read_text()
+    assert "P1_JSON" in btxt and "--p1-json" in btxt and "not screened out by P1" in btxt

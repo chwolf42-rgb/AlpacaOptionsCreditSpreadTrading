@@ -175,6 +175,15 @@ def pass_bar_words(h: dict, cost_x15_mean_r: Optional[float] = None) -> list[str
     yp = h.get("years_positive", {})
     npos = sum(v > 0 for v in yp.values())
     out.append(f"INFO: mean R positive in {npos} of {len(yp)} calendar years.")
+    n_trades = int(h.get("trades") or 0)
+    out.append(f"{'PASS' if n_trades >= 500 else 'FAIL'}: OOS trades {n_trades} must be >= 500.")
+    fold = h.get("fold_83")
+    if fold:
+        ok = bool(fold.get("passes"))
+        out.append(
+            f"{'PASS' if ok else 'FAIL'}: section 8.3 positive folds {fold.get('n_positive')} of "
+            f"{fold.get('n_folds')} (share {_num(fold.get('share_positive'))}) must be >= 60%."
+        )
     if cost_x15_mean_r is not None:
         out.append(f"{'PASS' if cost_x15_mean_r > 0 else 'FAIL'}: mean R at 1.5x costs {_num(cost_x15_mean_r)} "
                    "must stay > 0.")
@@ -300,6 +309,8 @@ class ReadoutInputs:
     spec_doc: str = ""                 # set on F/B runs: v1.3.5
     spec_doc_commit: str = ""
     engine_spec: str = ""              # F/B stamp; A-only readouts leave this empty
+    formations_k_zones: int = 0        # F runs: zone target k_zones, passed explicitly as 5
+    formation_var_n: int = 0           # how many formation variants fed DSR var_sr
 
 
 def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
@@ -317,7 +328,7 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
     if inp.not_for_cp4:
         L += [f"> **{inp.not_for_cp4}**", ""]
     L += [
-          f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
+          f"- Grid spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
           f"- Trial count: DSR N = max({N_PROGRAM}, program ledger) = **{inp.n_dsr}** (program ledger: {inp.n_program} "
           f"trials cumulative across all tests and runs; {N_PROGRAM} declared = A 192 + B 192 + formations 48 + options "
           "overlay 24 (SPEC v1.3.2 O1.9); the hashed v1.3.1 grid's N_TRIALS stays 450). "
@@ -329,7 +340,7 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
           f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
           "- Model-based research only; holdout 2026-04-01..2026-09-30 not opened; CP4 review before Trading.", ""]
     if inp.spec_doc:
-        line = f"- spec_doc {inp.spec_doc} ({inp.spec_doc_commit})"
+        line = (f"- spec_doc {inp.spec_doc} ({inp.spec_doc_commit}); grid spec {inp.spec_version}")
         if inp.engine_spec:
             line += f"; engine_spec {inp.engine_spec}"
         L += [line, ""]
@@ -349,9 +360,15 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
               f"{_pct(h['worst_day'])} | Sharpe(daily) {_num(h['sharpe_daily'])} | DSR {_num(h['dsr'].get('dsr'))} "
               f"(N {h['dsr'].get('n_trials')}, var source: {h['dsr'].get('var_sr_source', 'n/a')})", "",
               "Pass bar (SPEC section 8)" + (" — informational only in an interim run:" if interim else ":"), ""]
+        fold = dict(inp.fold_83.get(test) or {})
+        h = {**h, "fold_83": fold}
         L += [f"- {x}" for x in pass_bar_words(h)] + [""]
         if h.get("dsr_scope_n"):
-            L += [f"- DSR N for this test is **{int(h['dsr_scope_n'])}** (formations grid, SPEC v1.3.5 S2).", ""]
+            L += [f"- DSR N for this test is **{int(h['dsr_scope_n'])}** (formations grid, SPEC v1.3.5 S2).",
+                  f"- DSR var_sr is pooled across **{int(inp.formation_var_n)}** formation variants in this run "
+                  "(the family is 48; a single-kind run has only that kind's variants).", ""]
+        if inp.formations_k_zones and str(test).startswith("F"):
+            L += [f"- Formations zone target uses k_zones **{int(inp.formations_k_zones)}**.", ""]
         crit = inp.fold_83.get(test) if inp.fold_83 else None
         if crit:
             L += [f"- §8.3: {crit['n_non_positive']} of {crit['n_folds']} folds are non-positive "

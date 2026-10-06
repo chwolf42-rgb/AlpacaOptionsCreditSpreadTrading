@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import importlib
 import json
 import multiprocessing as mp
@@ -45,9 +46,9 @@ from research.intraday_sr.harness import s0grids
 from research.intraday_sr.harness import spill as SP
 from research.intraday_sr.harness.config import COMPARISON, PENDING_R5, PRIMARY, CostCfg, RiskCfg
 from research.intraday_sr.harness.grid_check import check_grids_module, grid_hash
-from research.intraday_sr.harness.fb_signals import (EngineContractError, StubEngineError, engine_cfg_for_variant,
-                                                     formation_signals_fn, signals_for_b, signals_for_f,
-                                                     test_b_signals_fn)
+from research.intraday_sr.harness.fb_signals import (FORMATION_K_ZONES, EngineContractError, StubEngineError,
+                                                     engine_cfg_for_variant, formation_signals_fn, signals_for_b,
+                                                     signals_for_f, test_b_signals_fn)
 from research.intraday_sr.harness.guard import LookaheadError
 from research.intraday_sr.harness.portfolio import SignalContractError, set_legacy, simulate
 from research.intraday_sr.harness.triallog import DEFAULT_LEDGER, TrialLog, TrialRow, git_sha
@@ -161,7 +162,7 @@ def ledger_dir(smoke: bool, attribution: bool, out: Path, program_ledger: Path) 
 
 
 def engine_cfg_for(variant: dict):
-    """grids row -> EngineCfg. K maps to k_zones. Formations have no K axis: EngineCfg's default (5)."""
+    """grids row -> EngineCfg. K maps to k_zones. Formations pass EngineCfg(k_zones=5) explicitly."""
     return engine_cfg_for_variant(variant)
 
 
@@ -410,7 +411,8 @@ def load_adapter(spec: str | None):
 
 TRADE_COLUMNS = ["session", "symbol", "r", "pnl", "exit_kind", "capped", "entry_ts", "exit_ts", "day_losses_before",
                  "week_losses_before", "direction", "signal_available_at", "entry_price", "exit_price", "qty",
-                 "entry_cost", "exit_cost", "gross_R", "cost_R", "net_R"]
+                 "entry_cost", "exit_cost", "gross_R", "cost_R", "net_R", "zone_id", "trigger", "stop",
+                 "expires_at", "formation_id", "invalidation", "formation_available_at"]
 
 
 def _trades_df(res) -> pd.DataFrame:
@@ -425,6 +427,7 @@ def _trades_df(res) -> pd.DataFrame:
     cost_R = np.divide(entry_cost + exit_cost, risk, out=np.full(net_R.shape, np.nan), where=risk > 0)
     # R7: gross = net + cost, with net_R the after-cost R the portfolio already stored on Trade.r.
     gross_R = net_R + cost_R
+    audit = [_trade_audit(t.signal) for t in T]
     return pd.DataFrame({"session": m["session"], "symbol": m["symbol"], "r": net_R,
                          "pnl": [t.pnl for t in T], "exit_kind": m["exit_kind"], "capped": m["capped"],
                          "entry_ts": m["entry_ts"], "exit_ts": m["exit_ts"],
@@ -434,7 +437,30 @@ def _trades_df(res) -> pd.DataFrame:
                          "signal_available_at": [t.signal.available_at for t in T],
                          "entry_price": [float(t.entry.price) for t in T], "exit_price": [float(t.exit.price) for t in T],
                          "qty": [float(t.entry.qty) for t in T], "entry_cost": entry_cost, "exit_cost": exit_cost,
-                         "gross_R": gross_R, "cost_R": cost_R, "net_R": net_R})
+                         "gross_R": gross_R, "cost_R": cost_R, "net_R": net_R,
+                         "zone_id": [a["zone_id"] for a in audit], "trigger": [a["trigger"] for a in audit],
+                         "stop": [a["stop"] for a in audit], "expires_at": [a["expires_at"] for a in audit],
+                         "formation_id": [a["formation_id"] for a in audit],
+                         "invalidation": [a["invalidation"] for a in audit],
+                         "formation_available_at": [a["formation_available_at"] for a in audit]})
+
+
+def _trade_audit(sig) -> dict:
+    """CP4 / later screens: join keys that the compact spill also carries."""
+    zone = getattr(sig, "zone", None)
+    form = getattr(sig, "formation", None)
+    if form is not None:
+        formation_id = form.formation_id
+        invalidation = float(form.invalidation)
+        formed = form.available_at
+    else:
+        formation_id = getattr(sig, "formation_id", "") or ""
+        level = getattr(sig, "cancel_level", None)
+        invalidation = None if level is None or not np.isfinite(float(level)) else float(level)
+        formed = getattr(sig, "formation_available_at", None)
+    return {"zone_id": None if zone is None else zone.zone_id, "trigger": float(sig.trigger),
+            "stop": float(sig.stop), "expires_at": sig.expires_at, "formation_id": formation_id or "",
+            "invalidation": invalidation, "formation_available_at": formed}
 
 
 class TradesFile:
@@ -455,8 +481,10 @@ class TradesFile:
         for k, v in const.items():
             d[k] = v
         d = d.reindex(columns=cols)
-        for c in ("session", "signal_available_at", "entry_ts", "exit_ts"):
-            d[c] = d[c].astype(str)
+        for c in ("session", "signal_available_at", "entry_ts", "exit_ts", "expires_at",
+                  "formation_available_at"):
+            if c in d.columns:
+                d[c] = d[c].astype(str)
         d["fold"] = pd.to_numeric(d["fold"], errors="coerce").fillna(-1).astype("int32")
         for c in ("r", "pnl", "entry_price", "exit_price", "qty", "entry_cost", "exit_cost",
                   "gross_R", "cost_R", "net_R"):
@@ -464,9 +492,13 @@ class TradesFile:
         for c in ("direction", "day_losses_before", "week_losses_before"):
             d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0).astype("int32")
         d["capped"] = d["capped"].fillna(False).astype(bool)
-        for c in ("path", "variant_id", "guardrail", "symbol", "exit_kind"):
-            d[c] = d[c].astype(str)
-        t = pa.Table.from_pandas(d, preserve_index=False)
+        for c in ("path", "variant_id", "guardrail", "symbol", "exit_kind", "zone_id", "formation_id"):
+            d[c] = ["" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v) for v in d[c]]
+        for c in ("trigger", "stop", "invalidation"):
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype("float64")
+        # An empty first variant must not freeze a null schema. Later rows carry
+        # strings (zone_id, formation_id) and a finite invalidation.
+        t = _trades_arrow(d)
         if self._w is None:
             self._w = pq.ParquetWriter(self.path, t.schema, compression="zstd")
         self._w.write_table(t.cast(self._w.schema))
@@ -475,6 +507,37 @@ class TradesFile:
     def close(self) -> None:
         if self._w is not None:
             self._w.close()
+
+
+def _trades_arrow(d: pd.DataFrame):
+    """Stable column types. A zero-row batch is the same schema as a filled one."""
+    import pyarrow as pa
+
+    def strings(col: str):
+        return pa.array(["" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+                         for v in d[col].tolist()], type=pa.string())
+
+    def floats(col: str):
+        return pa.array(pd.to_numeric(d[col], errors="coerce").to_numpy(dtype="float64"), type=pa.float64())
+
+    def ints(col: str):
+        return pa.array(pd.to_numeric(d[col], errors="coerce").fillna(0).to_numpy(dtype="int32"), type=pa.int32())
+
+    cols = ["path", "variant_id", "guardrail", "fold"] + TRADE_COLUMNS
+    string_cols = {"path", "variant_id", "guardrail", "session", "symbol", "exit_kind", "entry_ts", "exit_ts",
+                   "signal_available_at", "expires_at", "zone_id", "formation_id", "formation_available_at"}
+    int_cols = {"fold", "day_losses_before", "week_losses_before", "direction"}
+    arrays = []
+    for name in cols:
+        if name in string_cols:
+            arrays.append(strings(name))
+        elif name in int_cols:
+            arrays.append(ints(name))
+        elif name == "capped":
+            arrays.append(pa.array(d["capped"].fillna(False).astype(bool).tolist(), type=pa.bool_()))
+        else:
+            arrays.append(floats(name))
+    return pa.table(dict(zip(cols, arrays)))
 
 
 def _sig_day(s) -> date:
@@ -740,21 +803,62 @@ def _r7_block(runs: dict, selected: pd.DataFrame) -> dict:
     return {"selected": _r7_means(selected), "pooled": _r7_means(pooled)}
 
 
-def _empty_portfolio(test: str, results) -> None:
-    """A live F/B entry point that found nothing must not look like a finished zero-trade study."""
-    runs = [vr for vr, _, _ in results]
-    if not runs or any(vr.status != "ok" for vr in runs) or sum(vr.n_signals for vr in runs) != 0:
-        return
+def _fb_zero_message(test: str) -> str:
     if test in FORMATION_TESTS:
-        raise SystemExit(
-            f"Test {test}: zero formations from formation_signals across every variant and symbol. "
-            "Refusing a silent zero-trade run. Pass --allow-empty only for fixtures."
+        return (
+            f"Test {test}: zero formations from formation_signals across every ok variant and symbol. "
+            "Refusing a silent zero-trade run. Pass --allow-empty only for smoke fixtures."
         )
-    if test == "B":
+    return (
+        f"Test {test}: zero signals from test_b_signals across every ok variant and symbol. "
+        "Refusing a silent zero-trade run. Pass --allow-empty only for smoke fixtures."
+    )
+
+
+def _abort_errored_or_empty(test: str, runs, *, allow_empty: bool) -> None:
+    """F/B: every variant errored, or ok variants produced no signals. Errors do not bypass this."""
+    if test not in FORMATION_TESTS and test != "B":
+        return
+    if not runs:
+        return
+    errored = [vr for vr in runs if vr.status != "ok"]
+    ok = [vr for vr in runs if vr.status == "ok"]
+    if len(errored) == len(runs):
+        first = errored[0].error
         raise SystemExit(
-            f"Test {test}: zero signals from test_b_signals across every variant and symbol. "
-            "Refusing a silent zero-trade run. Pass --allow-empty only for fixtures."
+            f"Test {test}: every variant errored in pass 1 ({len(errored)}). "
+            f"Refusing to log them as a finished run. First error: {first}"
         )
+    if sum(int(getattr(vr, "n_signals", 0) or 0) for vr in ok) == 0 and not allow_empty:
+        raise SystemExit(_fb_zero_message(test))
+
+
+def _abort_pass1(plan, recs: dict, *, allow_empty: bool) -> None:
+    """Same F/B checks from pass-1 spill counts, before pass 2."""
+    totals: dict[str, int] = {}
+    for rec in recs.values():
+        for vid, n in rec.get("n_signals", {}).items():
+            totals[vid] = totals.get(vid, 0) + int(n)
+    for test, variants, _gsha in plan:
+        if test not in FORMATION_TESTS and test != "B":
+            continue
+        vids = [v["variant_id"] for v in variants]
+        if not vids:
+            continue
+        errored = [vid for vid in vids if vid in _SIGERR]
+        if len(errored) == len(vids):
+            raise SystemExit(
+                f"Test {test}: every variant errored in pass 1 ({len(errored)}). "
+                f"Refusing to start pass 2. First error: {_SIGERR[errored[0]]}"
+            )
+        n_sig = sum(totals.get(vid, 0) for vid in vids if vid not in _SIGERR)
+        if n_sig == 0 and not allow_empty:
+            raise SystemExit(_fb_zero_message(test))
+
+
+def _empty_portfolio(test: str, results) -> None:
+    """Backstop after pass 2. The pass-1 check is the one that saves the long run."""
+    _abort_errored_or_empty(test, [vr for vr, _, _ in results], allow_empty=False)
 
 
 def oos_from_picks(picks, runs) -> tuple[pd.DataFrame, pd.Series]:
@@ -810,6 +914,8 @@ def main(argv=None):
     ap.add_argument("--legacy-halfday", action="store_true",
                     help="ATTRIBUTION CHECK ONLY: pre-A1b entry cutoff (last_entry only, entries allowed at/after a "
                          "half day's forced-exit bar). Never writes the PROGRAM ledger; NOT FOR CP4/SELECTION")
+    ap.add_argument("--p1-json", type=Path, default=None,
+                    help="Test B only: P1 report. A non-smoke B run refuses unless screened_out is false.")
     a = ap.parse_args(argv)
     t0 = time.time()
     started_ct = pd.Timestamp.now(tz="America/Chicago").isoformat()     # true launch (same instant as t0)
@@ -819,6 +925,8 @@ def main(argv=None):
     _SIGERR.clear()
     _G.clear()
     ad = load_adapter(a.adapter)
+    if a.allow_empty and not getattr(ad, "smoke", False):
+        raise SystemExit("--allow-empty is for smoke/fixture adapters only")
     avail = ad.symbols()
     syms = avail if a.symbols == "available" else [x.strip() for x in a.symbols.split(",") if x.strip()]
     unknown = [x for x in syms if x not in avail]
@@ -832,7 +940,23 @@ def main(argv=None):
         if errs:
             raise SystemExit("grids.py does not match SPEC v1.3.1: " + "; ".join(errs))
     plan = []
-    for test in parse_test_args(a.tests, a.test):
+    selected_tests = parse_test_args(a.tests, a.test)
+    if "A" in selected_tests and any(t == "B" or t in FORMATION_TESTS for t in selected_tests):
+        raise SystemExit("refusing to mix Test A with F or B in one invocation")
+    # GB4 before the grid compare: a non-smoke B run must show a clear P1 report
+    # even when the adapter's variant list is not yet the canonical grid.
+    p1_sha = ""
+    if "B" in selected_tests and not ad.smoke:
+        if a.p1_json is None:
+            raise SystemExit("Test B requires --p1-json. GB4: P1 must exist and not screen Test B out.")
+        report = json.loads(Path(a.p1_json).read_text())
+        if report.get("label") != "not screened out by P1" or report.get("screened_out") is not False:
+            raise SystemExit(
+                "Test B refused: P1 report must have label 'not screened out by P1' and screened_out false. "
+                f"Got label={report.get('label')!r} screened_out={report.get('screened_out')!r}."
+            )
+        p1_sha = hashlib.sha256(Path(a.p1_json).read_bytes()).hexdigest()
+    for test in selected_tests:
         variants = ad.variants(test)
         if a.max_variants:
             variants = variants[:a.max_variants]
@@ -848,6 +972,13 @@ def main(argv=None):
             gsha = s0grids.grid_sha256()
         plan.append((test, variants, gsha))
     fb_stamp = _plan_is_fb(plan)
+    stamp = engine_stamp_fields(Path(__file__).resolve().parents[3])
+    if fb_stamp and (stamp.get("engine_spec") != "v1.3.5" or stamp.get("engine_spec_source") != "engine/version.py"):
+        raise SystemExit(
+            "Refusing to start F/B: engine_stamp() must return engine_spec v1.3.5 from engine/version.py "
+            f"(PR #23, bb1b472 onward). Got engine_spec={stamp.get('engine_spec')!r} "
+            f"source={stamp.get('engine_spec_source')!r}."
+        )
     p2w = a.pass2_workers or a.workers
     timing = {"run_id": a.tag, "started_at_ct": started_ct, "legacy": legacy, "symbols": syms, "workers": a.workers, "pass2_workers": p2w,
               "spill_format": a.spill_format, "pass2_loader": a.pass2_loader, "chunked": not a.no_chunk,
@@ -862,6 +993,7 @@ def main(argv=None):
             shutil.rmtree(out / "_frames")
         _G["frame_dir"] = str(out / "_frames")
         recs = run_symbol_passes(ad, syms, [v for _, vs, _ in plan for v in vs], a.workers, spill)
+        _abort_pass1(plan, recs, allow_empty=a.allow_empty)
         timing["pass1"] = {"wall_s": time.time() - tp, "per_symbol": recs,
                            "spill_bytes": sum(f.stat().st_size for f in spill.rglob("*")
                                               if f.is_file() and f.suffix in (".pkl", ".npz"))}
@@ -899,32 +1031,34 @@ def main(argv=None):
                     "OOS-fold and holdout paths are exact: counters and equity ($100k) start at each window start"],
                 "adj_factors": adj_note, "started_at_ct": started_ct,
                 "pass2_started_at_ct": pd.Timestamp.now(tz="America/Chicago").isoformat(),   # after pass 1 + bars
-                **engine_stamp_fields(Path(__file__).resolve().parents[3]),
+                **stamp,
                 "legacy_target_gap": legacy["target_gap"], "legacy_halfday": legacy["halfday"]}
+    if p1_sha:
+        manifest["p1_json"] = str(a.p1_json)
+        manifest["p1_json_sha256"] = p1_sha
     if fb_stamp:
-        # F/B only. An A-only manifest keeps engine_spec from engine_stamp_fields (v1.3.3 fallback on this tree).
+        # F/B only. engine_spec stays the verified engine/version.py stamp (v1.3.5). spec_doc is the pinned doc.
         manifest["spec_doc"] = SPEC_DOC_FB
         manifest["spec_doc_commit"] = SPEC_DOC_COMMIT_FB
-        manifest["engine_spec"] = ENGINE_SPEC_FB
-        manifest["engine_spec_source"] = (
-            "F/B stamp spec_doc v1.3.5 (8504fd7c19136141a32746234b63dd084106369d); "
-            "engine_spec v1.3.5. engine_commit stays the git tree of research/intraday_sr/engine."
-        )
         manifest["dsr_by_test"] = {}
         inp.spec_doc = SPEC_DOC_FB
         inp.spec_doc_commit = SPEC_DOC_COMMIT_FB
-        inp.engine_spec = ENGINE_SPEC_FB
+        inp.engine_spec = stamp["engine_spec"]
+    if any(test in FORMATION_TESTS for test, _, _ in plan):
+        manifest["formations_k_zones"] = FORMATION_K_ZONES
+        inp.formations_k_zones = FORMATION_K_ZONES
     if attribution:
         manifest["not_for_cp4"] = NOT_FOR_CP4
     mode = "per-symbol chunks" if not a.no_chunk else "per-variant (no-chunk)"
     frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers} (pass 2: {p2w}); {mode}", adj_note]
+    formation_src: dict = {}
+    formation_runs: dict = {}
     for test, variants, gsha in plan:
         inp.grid_sha = gsha
         tp = time.time()
         timed = _par(_timed_run_variant, variants, p2w)
         results = [r for r, _, _ in timed]
-        if not a.allow_empty:
-            _empty_portfolio(test, results)
+        _abort_errored_or_empty(test, [vr for vr, _, _ in results], allow_empty=a.allow_empty)
         timing["pass2"][test] = {"wall_s": time.time() - tp,
                                  "per_variant": {r[0].variant_id: {"secs": sec, "maxrss_mb": mx}
                                                  for r, sec, mx in timed}}
@@ -968,10 +1102,13 @@ def main(argv=None):
         inp.n_program = TrialLog.program_trial_count(df)
         inp.n_dsr = log.dsr_n()
         dsr_floor = FORMATION_DSR_N if test in FORMATION_TESTS else None
-        h = RO.headline(wf.oos_trades if len(wf.oos_trades) else pd.DataFrame(columns=["session", "r", "pnl"]),
-                        wf.oos_daily, inp.n_dsr, var_sr=_trial_sr_var(runs), dsr_floor=dsr_floor)
+        oos_trades = wf.oos_trades if len(wf.oos_trades) else pd.DataFrame(columns=["session", "r", "pnl"])
+        h = RO.headline(oos_trades, wf.oos_daily, inp.n_dsr, var_sr=_trial_sr_var(runs), dsr_floor=dsr_floor)
         if fb_stamp:
             manifest["dsr_by_test"][test] = FORMATION_DSR_N if test in FORMATION_TESTS else inp.n_dsr
+        if test in FORMATION_TESTS:
+            formation_src[test] = (oos_trades, wf.oos_daily, inp.n_dsr)
+            formation_runs.update(runs)
         ec, eflag = exact_finalist_check(runs, wf.fold_table, wf.finalists, exact_window)
         inp.exact_checks = {**inp.exact_checks, test: (ec, eflag)}
         manifest.setdefault("exact_finalist_check", {})[test] = {"cp4_flag": bool(eflag), "rows": int(len(ec))}
@@ -1021,9 +1158,16 @@ def main(argv=None):
         manifest.setdefault("trades_files", {})[test] = {"file": tf.path.name, "rows": int(tf.rows)}
         inp.guardrails = {**inp.guardrails, f"Test {test} selected path":
                           (RO.guardrail_rows(gstats), RO.trades_per_month_words(gstats))}
+        can_pass = bool(fc.get("passes")) and int(h.get("trades") or 0) >= 500
         (out / f"wf_{test}.json").write_text(json.dumps(
-            {"picks": wf.picks, "finalists": wf.finalists, "fold_criterion": wf.fold_criterion},
+            {"picks": wf.picks, "finalists": wf.finalists, "fold_criterion": wf.fold_criterion,
+             "can_pass": can_pass},
             default=str, indent=1))
+    if formation_runs:
+        pooled_var = _trial_sr_var(formation_runs)
+        inp.formation_var_n = sum(1 for vr in formation_runs.values() if vr.status == "ok")
+        for test, (tr, daily, n) in formation_src.items():
+            inp.headlines[test] = RO.headline(tr, daily, n, var_sr=pooled_var, dsr_floor=FORMATION_DSR_N)
     timing["total_wall_s"] = time.time() - t0
     timing["parent_maxrss_mb"] = _maxrss_mb()
     timing["children_maxrss_mb"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024

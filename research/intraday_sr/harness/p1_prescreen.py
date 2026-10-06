@@ -9,14 +9,37 @@ Filter: a trade whose touch bar is the last pivot of an F1–F7 formation at piv
 the same symbol, zone_id, side and TF. Long (W/IHS): that pivot is the last low (2nd bottom or
 right shoulder). Short (M/HS): it is the last high (2nd top or right shoulder). The harness
 takes the latest ``Formation.pivots`` timestamp as that point (F7's last pivot). ``touch_ts`` is
-the touch bar's open. ``zone_id`` and ``tf`` must already be on the trades table: the Test A
-trades file this harness writes does not carry the stack touch bar, so P1 reads an extract that
-does. A missing column is an error, not a silent pass.
+the touch bar's open.
 
-Metric: pooled net mean R (column ``net_R``, else ``r``) with a 95% day-block bootstrap CI,
-seed 20260925, 5,000 resamples (``stats.day_block_mean_r``). Gross mean R (``gross_R``) is
-reported beside it. Rule: CI upper < 0 means ``screened out by P1``. No filtered trades does
-not screen Test B out (there is no CI). N stays 456 either way.
+The A1b trades file does not store ``touch_ts``, ``zone_id``, ``tf``, or ``gross_R``.
+``resolve_stack_touches`` fills the touch and the spilled zone bounds. Nothing is dropped
+silently. ``path`` and ``guardrail`` are required. The OOS pool must contain 192 variant ids.
+
+1. Join each OOS trade to ``<out>/_signals/<variant_id>/<symbol>.npz`` on
+   ``(variant_id, symbol, signal_available_at, direction)``. Zone bounds are ``z_low`` and
+   ``z_high``. Entry tf is the single ``5m`` or ``15m`` token on ``variant_id``. A key with
+   zero signals fails. A key with several signals is kept only when every candidate resolves
+   to the same ``(touch_ts, z_low, z_high)``. Otherwise the run fails with the count.
+
+2. ``stack_touch(bars, signal, cfg, sig) -> (touch_ts, rc_ts)``. Missing raises
+   ``StubEngineError``. Tests pass a fake. This module does not open a market-data cache.
+
+3. Both timestamps are strictly before ``signal.available_at``. The touch bar can be the RC::
+
+       touch_ts <= rc_ts <= touch_ts + cfg.touch_window_bars bars
+
+   on the entry tf (0 through ``touch_window_bars``, 3 today).
+
+A trade matches a formation when the touch bar is the formation's last pivot bar, on the
+same symbol, tf and side, and the pivot price lies inside ``[z_low, z_high]``. Formations
+with no ``zone_id`` are not skipped. ``zone_id`` is not the match key (it hashes K).
+
+``gross_R`` is derived when absent: ``risk_usd = pnl / r``, ``cost_R = (entry_cost + exit_cost) / risk_usd``,
+``gross_R = r + cost_R``. ``r == 0`` or ``pnl == 0`` fails. A non-finite CI upper bound, or
+zero matched trades when formations were supplied, fails loudly. It is never "not screened".
+
+Metric: pooled net mean R with a 95% day-block bootstrap CI, seed 20260925, 5,000 resamples.
+Rule: CI upper < 0 means ``screened out by P1``. N stays 456 either way.
 
 The entry is the RC trigger, not F8. This is a proxy. It can only stop a run. It can never
 count toward a pass.
@@ -41,7 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -49,6 +72,10 @@ import pandas as pd
 from research.intraday_sr.harness import stats as S
 from research.intraday_sr.harness.fb_signals import FORMATIONS_IN, StubEngineError
 from research.intraday_sr.types import ET, Formation
+
+STACK_TOUCH = "research.intraday_sr.engine.signals.stack_touch"
+_ENTRY_TF = ("5m", "15m")
+_EXAMPLES = 3
 
 PIVOT_TOL = 0.25
 PRIMARY = "d2+w5"
@@ -98,26 +125,251 @@ def _same_bar(touch, tf: str, pivot) -> bool:
     return touch <= pivot < touch + width
 
 
-def oos_pool(trades: pd.DataFrame) -> pd.DataFrame:
-    """25 OOS test quarters, all variants, primary d2+w5."""
-    need = ["session", "symbol", "direction", "touch_ts", "zone_id", "tf", "gross_R"]
+def _require_columns(trades: pd.DataFrame, need: list[str]) -> None:
     missing = [c for c in need if c not in trades.columns]
-    if "net_R" not in trades.columns and "r" not in trades.columns:
-        missing.append("net_R|r")
     if missing:
-        raise P1InputError(
-            "P1 trades extract is missing "
-            + ", ".join(missing)
-            + ". The harness trades file does not store the Test A stack touch bar; "
-            "touch_ts (bar open), zone_id and tf have to be on the extract."
-        )
+        raise P1InputError("P1 trades are missing " + ", ".join(missing) + ". Rows are not dropped.")
+
+
+def oos_pool(trades: pd.DataFrame) -> pd.DataFrame:
+    """25 OOS test quarters, all 192 Test A variants, primary d2+w5."""
+    frame = _with_gross(trades)
+    _require_columns(frame, ["session", "symbol", "direction", "variant_id", "touch_ts", "tf",
+                             "z_low", "z_high", "gross_R", "path", "guardrail"])
+    if "net_R" not in frame.columns and "r" not in frame.columns:
+        raise P1InputError("P1 trades need net_R or r.")
+    pooled = _guarded_oos(frame)
+    _require_finite_pool(pooled)
+    n_var = int(pooled["variant_id"].astype(str).nunique())
+    if n_var != 192:
+        raise P1InputError(f"P1 OOS pool has {n_var} distinct variant_id values; the Test A grid has 192.")
+    return pooled
+
+
+def _with_gross(trades: pd.DataFrame) -> pd.DataFrame:
+    if "gross_R" in trades.columns:
+        return trades
+    from research.intraday_sr.harness.cp4 import GrossRError, attach_gross_r
+    try:
+        return attach_gross_r(trades)
+    except GrossRError as exc:
+        raise P1InputError(str(exc)) from exc
+
+
+def _guarded_oos(trades: pd.DataFrame) -> pd.DataFrame:
+    """Exactly path oos_exact, guardrail d2+w5, sessions in the 25 OOS quarters."""
+    _require_columns(trades, ["session", "path", "guardrail"])
     df = trades
-    if "path" in df.columns:
-        df = df[df["path"].astype(str) == "oos_exact"]
-    if "guardrail" in df.columns:
-        df = df[df["guardrail"].astype(str) == PRIMARY]
+    df = df[df["path"].astype(str) == "oos_exact"]
+    df = df[df["guardrail"].astype(str) == PRIMARY]
     sess = pd.to_datetime(df["session"]).dt.date
     return df[(sess >= OOS_START) & (sess <= OOS_END)].copy()
+
+
+def _require_finite_pool(df: pd.DataFrame) -> None:
+    import math
+    if df.empty:
+        raise P1InputError("P1 OOS pool is empty. Refusing to screen on no rows.")
+    for col in ("touch_ts", "tf", "z_low", "z_high"):
+        if df[col].isna().any():
+            raise P1InputError(f"P1 pooled column {col} has a null. Rows are not dropped.")
+    net = _net(df)
+    gross = pd.to_numeric(df["gross_R"], errors="coerce")
+    lo = pd.to_numeric(df["z_low"], errors="coerce")
+    hi = pd.to_numeric(df["z_high"], errors="coerce")
+    for name, series in (("net_R", net), ("gross_R", gross), ("z_low", lo), ("z_high", hi)):
+        vals = series.to_numpy(float)
+        if not len(vals) or not all(math.isfinite(float(v)) for v in vals):
+            raise P1InputError(f"P1 pooled {name} is not finite on every row. Refusing to drop or to call that not screened.")
+
+
+def stack_touch_fn():
+    """Developer 2's read-only touch helper. Missing raises StubEngineError, not an invented bar."""
+    import importlib
+    try:
+        return getattr(importlib.import_module("research.intraday_sr.engine.signals"), "stack_touch")
+    except (ImportError, AttributeError) as exc:
+        raise StubEngineError(
+            "engine.signals.stack_touch is not defined. Expected "
+            f"{STACK_TOUCH}(bars: BarSet, signal: Signal, cfg: EngineCfg, sig: SignalCfg) "
+            "-> tuple[datetime, datetime]  # (touch_ts, rc_ts) for that Test A signal's (touch, rc) pair. "
+            "Refusing to invent touch bars."
+        ) from exc
+
+
+def _entry_tf(variant_id: str) -> str:
+    hits = [part for part in str(variant_id).split("-") if part in _ENTRY_TF]
+    if len(hits) != 1:
+        raise P1InputError(
+            f"variant_id {variant_id!r} does not carry exactly one entry tf (5m or 15m). "
+            "Compact spills do not store Signal.tf; P1 reads the token on variant_id."
+        )
+    return hits[0]
+
+
+def _join_key(variant_id, symbol, available_at, direction) -> tuple:
+    from research.intraday_sr.harness.spill import _us
+    return (str(variant_id), str(symbol), _us(_et(available_at, "signal_available_at")), int(direction))
+
+
+def _key_text(key: tuple, matches: int) -> str:
+    vid, sym, us, direction = key
+    return f"{vid} {sym} ts_us={us} dir={direction} matches={matches}"
+
+
+def _spill_index(spill_dir: Path) -> dict[tuple, list]:
+    from research.intraday_sr.harness.spill import read_compact
+    root = Path(spill_dir)
+    if not root.is_dir():
+        raise P1InputError(f"signal spill directory does not exist: {root}")
+    index: dict[tuple, list] = {}
+    n_files = 0
+    for vid_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for npz in sorted(vid_dir.glob("*.npz")):
+            n_files += 1
+            for signal in read_compact(root, vid_dir.name, [npz.stem]):
+                tf = _entry_tf(signal.variant_id)
+                key = _join_key(signal.variant_id, signal.symbol, signal.available_at, signal.direction)
+                index.setdefault(key, []).append((signal, tf, str(signal.zone.zone_id)))
+    if n_files == 0:
+        raise P1InputError(f"no compact signal spills (*.npz) under {root}")
+    return index
+
+
+def _test_a_cfg(variant_id: str, tf: str):
+    from research.intraday_sr.grids import TEST_A
+    from research.intraday_sr.types import EngineCfg, SignalCfg
+    row = next((v for v in TEST_A if v["variant_id"] == variant_id), None)
+    if row is None:
+        raise P1InputError(f"variant_id {variant_id!r} is not on grids.TEST_A")
+    if str(row["entry_tf"]) != tf:
+        raise P1InputError(
+            f"{variant_id}: spill entry tf {tf} != grids.TEST_A entry_tf {row['entry_tf']}"
+        )
+    cfg = EngineCfg(k_zones=int(row["K"]))
+    sig = SignalCfg(
+        oscillator=row["oscillator"], rvol_min=float(row["rvol_min"]), entry_tf=row["entry_tf"],
+        target=row["target"], k_confirm=int(row["k_confirm"]), variant_id=row["variant_id"], test="A",
+    )
+    return cfg, sig
+
+
+def _bar_steps(touch: datetime, rc: datetime, tf: str) -> int:
+    width = _WIDTH[str(tf)]
+    seconds = (rc - touch).total_seconds()
+    step = width.total_seconds()
+    if step <= 0 or seconds % step != 0:
+        raise P1InputError(f"rc_ts - touch_ts is {rc - touch}, not a whole number of {tf} bars")
+    return int(seconds // step)
+
+
+def _touch_reasons(touch: datetime, rc: datetime, available: datetime, tf: str, window: int) -> list[str]:
+    reasons = []
+    if not touch < available:
+        reasons.append("touch_ts is not strictly before signal.available_at")
+    if not rc < available:
+        reasons.append("rc_ts is not strictly before signal.available_at")
+    try:
+        steps = _bar_steps(touch, rc, tf)
+    except P1InputError as exc:
+        reasons.append(str(exc))
+        return reasons
+    if steps < 0:
+        reasons.append("rc_ts is before touch_ts")
+    elif steps > window:
+        reasons.append(f"{steps} bars between touch and rc, allowed 0..{window} on {tf}")
+    return reasons
+
+
+def _candidates(trades: pd.DataFrame, spill_dir: Path) -> tuple[pd.DataFrame, list]:
+    """OOS rows plus the spill hits for each. Zero hits fail. Several hits stay for the touch check."""
+    _require_columns(trades, ["symbol", "direction", "variant_id", "signal_available_at", "path", "guardrail"])
+    df = _guarded_oos(trades).reset_index(drop=True)
+    index = _spill_index(spill_dir)
+    groups: list = []
+    missing_rows: list[str] = []
+    for row in df.itertuples(index=False):
+        key = _join_key(row.variant_id, row.symbol, row.signal_available_at, row.direction)
+        hits = index.get(key, [])
+        if len(hits) == 0:
+            missing_rows.append(_key_text(key, 0))
+        groups.append(hits)
+    if missing_rows:
+        raise P1InputError(
+            f"P1 spill join: {len(missing_rows)} of {len(df)} OOS trades matched no signal. "
+            f"missing examples: {missing_rows[:_EXAMPLES]}"
+        )
+    return df, groups
+
+
+def resolve_stack_touches(trades: pd.DataFrame, spill_dir: Path, *, stack_touch=None, bars=None) -> pd.DataFrame:
+    """Join the spill and call stack_touch. Several signals are kept only when touch and zone agree."""
+    from research.intraday_sr.harness.spill import _us
+    fn = stack_touch if stack_touch is not None else stack_touch_fn()
+    joined, groups = _candidates(trades, spill_dir)
+    if bars is None:
+        from research.intraday_sr.types import BarSet
+        bars = BarSet(pd.DataFrame())
+    touches: list[datetime] = []
+    rcs: list[datetime] = []
+    zone_ids: list[str] = []
+    tfs: list[str] = []
+    lows: list[float] = []
+    highs: list[float] = []
+    violations: list[str] = []
+    for row, hits in zip(joined.itertuples(index=False), groups):
+        resolved = []
+        row_bad = False
+        for signal, tf, zone_id in hits:
+            cfg, sig = _test_a_cfg(str(signal.variant_id), tf)
+            pair = fn(bars, signal, cfg, sig)
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                violations.append(f"{_key_text(_join_key(row.variant_id, row.symbol, row.signal_available_at, row.direction), len(hits))}: stack_touch did not return one pair")
+                row_bad = True
+                break
+            touch = _et(pair[0], "touch_ts")
+            rc = _et(pair[1], "rc_ts")
+            available = _et(row.signal_available_at, "signal_available_at")
+            reasons = _touch_reasons(touch, rc, available, tf, int(cfg.touch_window_bars))
+            if reasons:
+                violations.append(
+                    f"{row.variant_id} {row.symbol} touch_ts={touch.isoformat()} rc_ts={rc.isoformat()}: "
+                    + "; ".join(reasons)
+                )
+                row_bad = True
+                break
+            resolved.append((touch, rc, float(signal.z_low), float(signal.z_high), tf, zone_id))
+        if row_bad:
+            continue
+        keys = {(_us(touch), lo, hi) for touch, _rc, lo, hi, _tf, _zid in resolved}
+        if len(keys) != 1:
+            violations.append(
+                f"{row.variant_id} {row.symbol} matches={len(resolved)} resolved to {len(keys)} "
+                "(touch_ts, z_low, z_high) values"
+            )
+            continue
+        touch, rc, lo, hi, tf, zone_id = resolved[0]
+        touches.append(touch)
+        rcs.append(rc)
+        lows.append(lo)
+        highs.append(hi)
+        tfs.append(tf)
+        zone_ids.append(zone_id)
+    if violations:
+        raise P1InputError(
+            f"P1 touch contract failed on {len(violations)} of {len(joined)} OOS trades. "
+            f"Examples: {violations[:_EXAMPLES]}"
+        )
+    if len(touches) != len(joined):
+        raise P1InputError(f"P1 resolved {len(touches)} touches for {len(joined)} OOS trades.")
+    out = joined.copy()
+    out["touch_ts"] = touches
+    out["rc_ts"] = rcs
+    out["z_low"] = lows
+    out["z_high"] = highs
+    out["tf"] = tfs
+    out["zone_id"] = zone_ids
+    return out
 
 
 def _net(df: pd.DataFrame) -> pd.Series:
@@ -127,21 +379,23 @@ def _net(df: pd.DataFrame) -> pd.Series:
 
 
 def filter_formation_touches(trades: pd.DataFrame, formations: list[Formation]) -> pd.DataFrame:
-    """Keep trades whose touch bar is the formation's last pivot on the same zone, side and TF."""
+    """Last pivot on the touch bar, same symbol, tf and side, pivot price inside [z_low, z_high].
+
+    ``formation.zone_id`` is not used. A standalone detector has no zone, and zone_id hashes K.
+    """
     buckets: dict[tuple, list] = {}
     for form in formations:
-        if not form.zone_id:
-            continue
-        key = (form.symbol, form.tf, str(form.zone_id), formation_direction(form.kind))
+        key = (form.symbol, form.tf, formation_direction(form.kind))
         buckets.setdefault(key, []).append(form)
     keep = []
     for row in trades.itertuples(index=False):
-        key = (row.symbol, str(row.tf), str(row.zone_id), int(row.direction))
+        key = (row.symbol, str(row.tf), int(row.direction))
         touch = _et(row.touch_ts, "touch_ts")
+        lo, hi = float(row.z_low), float(row.z_high)
         hit = False
         for form in buckets.get(key, ()):
-            pivot_ts, _px = last_touch_pivot(form)
-            if _same_bar(touch, row.tf, pivot_ts):
+            pivot_ts, px = last_touch_pivot(form)
+            if _same_bar(touch, row.tf, pivot_ts) and lo <= float(px) <= hi:
                 hit = True
                 break
         keep.append(hit)
@@ -168,18 +422,28 @@ def prescreen(trades: pd.DataFrame, formations: list[Formation], *, pivot_tol: f
         "n_note": "Screening Test B out does not lower N. N_PROGRAM stays 456.",
     }
     if filtered.empty:
+        if len(formations) > 0:
+            raise P1InputError(
+                f"P1 matched 0 of {len(pooled)} OOS trades to {len(formations)} formations. "
+                "Refusing to report not screened. This is a join or matching fault for Architect review."
+            )
         return {
             **base,
             "screened_out": False,
             "label": "no filtered trades",
             "net_mean_r": {"mean": None, "lo": None, "hi": None},
             "gross_mean_r": {"mean": None, "lo": None, "hi": None},
-            "note": "No CI, so P1 does not screen Test B out.",
+            "note": "No formations were supplied, so there is no CI.",
         }
     day = pd.to_datetime(filtered["session"]).dt.date.to_numpy()
     net = S.day_block_mean_r(_net(filtered).to_numpy(float), day)
     gross = S.day_block_mean_r(pd.to_numeric(filtered["gross_R"], errors="coerce").to_numpy(float), day)
-    screened = net.get("hi") is not None and float(net["hi"]) < 0.0
+    hi = net.get("hi")
+    if hi is None or hi != hi:          # None or NaN
+        raise P1InputError(
+            f"P1 net mean R CI upper bound is {hi!r}. Refusing to treat a non-finite bound as not screened."
+        )
+    screened = float(hi) < 0.0
     return {
         **base,
         "screened_out": bool(screened),
@@ -247,16 +511,38 @@ def write_report(result: dict, out: Path) -> tuple[Path, Path]:
 
 def main(argv=None) -> dict:
     ap = argparse.ArgumentParser(description="P1 Test B pre-screen (SPEC v1.3.5). Proxy only.")
-    ap.add_argument("trades", type=Path, help="A1b trades parquet extract (OOS quarters, touch_ts, zone_id, tf)")
+    ap.add_argument("trades", type=Path, help="A1b trades parquet (OOS quarters). touch_ts/zone_id/tf come from --signals when absent.")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--formations", type=Path, default=None,
                     help="pickle of list[Formation] from the pivot_tol 0.25 detector (fixtures)")
+    ap.add_argument("--signals", type=Path, default=None,
+                    help="pass-1 compact spill dir <out>/_signals. Required when trades lack touch_ts, zone_id, or tf.")
+    ap.add_argument("--a1b-run-id", default="", help="A1b run_id recorded in p1.json")
     args = ap.parse_args(argv)
     try:
         formations = load_formations(args.formations)
     except StubEngineError as exc:
         raise SystemExit(str(exc)) from exc
-    result = prescreen(pd.read_parquet(args.trades), formations)
+    frame = pd.read_parquet(args.trades)
+    if any(col not in frame.columns for col in ("touch_ts", "zone_id", "tf")):
+        if args.signals is None:
+            raise SystemExit(
+                "P1 trades have no touch_ts, zone_id, or tf. "
+                "Pass --signals <out>/_signals (kept pass-1 compact spills)."
+            )
+        try:
+            frame = resolve_stack_touches(frame, args.signals)
+        except StubEngineError as exc:
+            raise SystemExit(str(exc)) from exc
+    result = prescreen(frame, formations)
+    import hashlib
+    from research.intraday_sr.harness.run import engine_stamp_fields
+    stamp = engine_stamp_fields(Path(__file__).resolve().parents[3])
+    result["a1b_run_id"] = args.a1b_run_id
+    result["trades_sha256"] = hashlib.sha256(Path(args.trades).read_bytes()).hexdigest()
+    result["formations_sha256"] = hashlib.sha256(Path(args.formations).read_bytes()).hexdigest()
+    result["engine_commit"] = stamp.get("engine_commit")
+    result["engine_spec"] = stamp.get("engine_spec")
     write_report(result, args.out)
     print(result["label"])
     return result

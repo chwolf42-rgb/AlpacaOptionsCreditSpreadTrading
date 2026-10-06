@@ -118,7 +118,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-COMPACT_VERSION = 1
+COMPACT_VERSION = 2
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _US = timedelta(microseconds=1)
 _TKEYS = ("1R", "2R", "zone")
@@ -183,7 +183,8 @@ class LiteSignal:
     view over the z_* slots and ``targets`` / ``zone_id`` are rebuilt on access from the per-file columns with
     exactly the keys and values the original had."""
     __slots__ = ("symbol", "available_at", "expires_at", "direction", "trigger", "stop", "variant_id",
-                 "z_low", "z_high", "z_score", "z_atr_d", "z_available_at", "_tab", "_row")
+                 "z_low", "z_high", "z_score", "z_atr_d", "z_available_at", "cancel_level",
+                 "formation_available_at", "formation_id", "_tab", "_row")
 
     @property
     def zone(self) -> LiteZone:
@@ -217,6 +218,9 @@ def to_columns(sigs: list) -> dict:
     tg = np.full((n, 3), np.nan, np.float64)
     tm = np.zeros(n, np.uint8)
     zi = np.empty(n, np.int32)
+    fi = np.full(n, np.nan, np.float64)
+    fa = np.full(n, np.int64(-1))
+    fid = np.empty(n, dtype="U64")
     for i, s in enumerate(sigs):
         z = s.zone
         j = zrow.get(id(z))
@@ -243,6 +247,13 @@ def to_columns(sigs: list) -> dict:
             tg[i, q] = float(v)
             tm[i] |= 1 << q
         zi[i] = j
+        form = getattr(s, "formation", None)
+        if form is None:
+            fid[i] = ""
+        else:
+            fi[i] = float(form.invalidation)
+            fa[i] = _us(form.available_at)
+            fid[i] = str(form.formation_id)
     if zsym - syms and syms:
         raise ValueError(f"zone symbol {zsym} differs from signal symbol {syms}")
     zid_arr = np.array(zid, dtype="S64") if zid else np.empty(0, "S64")
@@ -253,7 +264,8 @@ def to_columns(sigs: list) -> dict:
             "trigger": tr, "stop": sp, "targets": tg, "tmask": tm, "zone_idx": zi,
             "z_low": np.array(zl, np.float64), "z_high": np.array(zh, np.float64),
             "z_score": np.array(zs, np.float64), "z_atr_d": np.array(za, np.float64),
-            "z_avail_us": np.array(zav, np.int64), "z_id": zid_arr}
+            "z_avail_us": np.array(zav, np.int64), "z_id": zid_arr,
+            "f_inval": fi, "f_avail_us": fa, "f_id": fid}
 
 
 def write_compact(spill: Path, vid: str, sym: str, sigs: list) -> None:
@@ -296,6 +308,11 @@ def from_columns(cols, cache: dict | None = None, symbol: str | None = None, pat
         s.direction, s.trigger, s.stop = drl[i], trl[i], spl[i]
         s.z_low, s.z_high, s.z_score, s.z_atr_d = zlo[i], zhi[i], zsc[i], zat[i]
         s.z_available_at = _dt(zav[i], cache)
+        s.cancel_level = float(cols["f_inval"][i])
+        fus = int(cols["f_avail_us"][i])
+        s.formation_available_at = None if fus < 0 else _dt(fus, cache)
+        raw_id = cols["f_id"][i]
+        s.formation_id = raw_id if isinstance(raw_id, str) else str(raw_id)
         s._tab, s._row = tab, i
         out.append(s)
     return out
