@@ -28,15 +28,21 @@ class ExitHit:
 
 
 def exit_on_bar(direction: int, stop: float, target: float, o: float, h: float, l: float, tick: float,
-                entry_bar: bool) -> Optional[ExitHit]:
-    """Stop/target for one bar. Gap beyond the stop -> open. Limit target needs a trade-through by one tick;
-    a gap beyond the target fills at the (better) open. Both touched -> stop. On the entry bar only the stop is
-    checked (intrabar order unknown), but an also-touched target is flagged ambiguous."""
+                entry_bar: bool, legacy_target_gap: bool = False) -> Optional[ExitHit]:
+    """Stop/target for one bar. Gap beyond the stop -> open. An open beyond the target by ANY amount (even less
+    than one tick) is a gap and fills at the (better) open; a target touched from inside the bar (open on the near
+    side) needs a trade-through by one tick and fills at the target. Both touched -> stop. On the entry bar only the
+    stop is checked (intrabar order unknown), but an also-touched target is flagged ambiguous.
+
+    Every fill lies inside [l, h] (given an entry-bar stop on the loss side of an entry fill inside the bar). Before
+    the A1b fix the target gap needed `d*(o-target) >= tick`, so a bar opening past the target by less than a tick
+    with the whole bar past it filled at `target`, outside the bar (FillOutsideBar; 51 errored variants in A1).
+    legacy_target_gap=True restores that pre-A1b rule; attribution checks only (harness --legacy-target-gap)."""
     d = direction
     if not entry_bar:
         if d * (o - stop) <= 0:
             return ExitHit(o, STOP, True, False)
-        if d * (o - target) >= tick:
+        if (d * (o - target) >= tick) if legacy_target_gap else (d * (o - target) > 0):
             return ExitHit(o, TARGET, True, False)
     if d > 0:
         hit_stop = l <= stop

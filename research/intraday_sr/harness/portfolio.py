@@ -62,6 +62,16 @@ class _Bar:
         self.open, self.high, self.low, self.close, self.adj_factor = float(o), float(h), float(l), float(c), float(a)
 
 
+# Pre-A1b behaviours, OFF by default; switched on only by harness.run --legacy-target-gap / --legacy-halfday for the
+# post-run attribution check (such a run never writes the PROGRAM ledger). Set before pass-2 workers fork.
+LEGACY = {"target_gap": False, "halfday": False}
+
+
+def set_legacy(target_gap: bool = False, halfday: bool = False) -> dict:
+    LEGACY.update(target_gap=bool(target_gap), halfday=bool(halfday))
+    return dict(LEGACY)
+
+
 def _check_fill(px: float, b: _Bar, what: str, sym, ts) -> None:
     if not (b.low - 1e-9 <= px <= b.high + 1e-9):
         raise FillOutsideBar(f"{what} fill {px} outside bar [{b.low}, {b.high}]: {sym} {ts}")
@@ -337,7 +347,8 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
                 del pos[sym]
                 continue
             tick = 0.01 / p.adj
-            hit = exit_on_bar(p.direction, p.stop, p.target, float(b.open), float(b.high), float(b.low), tick, False)
+            hit = exit_on_bar(p.direction, p.stop, p.target, float(b.open), float(b.high), float(b.low), tick, False,
+                              legacy_target_gap=LEGACY["target_gap"])
             if hit is not None:
                 close_pos(sym, p, hit.price, hit.kind, ts, K.STOP if hit.kind == STOP else K.TARGET, hit.ambiguous,
                           bar=b)
@@ -353,7 +364,10 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
                 continue
             live.append(g)
         pending = live
-        if not halted and not blocked() and ts.time() < risk.last_entry:
+        # A1b half-day rule: no entry fill at or after the session's forced-exit bar (12:55 on half days); a normal
+        # day's cutoff stays last_entry (15:00 < 15:55). LEGACY["halfday"] restores the pre-A1b last_entry-only rule.
+        entry_cut = risk.last_entry if LEGACY["halfday"] else min(risk.last_entry, forced_t)
+        if not halted and not blocked() and ts.time() < entry_cut:
             cands = sorted((g for g in pending if g.symbol in here and g.symbol not in pos),
                            key=lambda g: (-float(g.zone.score), g.symbol))
             for g in cands:
@@ -409,7 +423,8 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
                 entries += 1
                 occupied += 1
                 c["cap_limited"] += int(capped)
-                hit = exit_on_bar(dirn, stop, tgt, float(b.open), float(b.high), float(b.low), 0.01 / adj, True)
+                hit = exit_on_bar(dirn, stop, tgt, float(b.open), float(b.high), float(b.low), 0.01 / adj, True,
+                                  legacy_target_gap=LEGACY["target_gap"])
                 if hit is not None:                        # (iii) fill-bar stop counts before the next entry
                     close_pos(g.symbol, p, hit.price, hit.kind, ts, K.STOP, hit.ambiguous, bar=b)
                     del pos[g.symbol]

@@ -86,7 +86,7 @@ def test_program_ledger_append_only_cumulative_and_rerun_adds_trials(tmp_path):
     for v in ("A-1", "A-2"):
         for fold in (1, 2):                                        # several rows per trial: still one trial
             log.add(_row("r1", "gA", "A", v, fold=fold))
-    log.add(_row("r1", "gA", "A", "A-1|d2", overlay="d2"))         # overlay rows never count
+    log.add(_row("r1", "gA", "A", "A-1|d2", overlay="d2"))         # guardrail-configuration rows never count (G2)
     log.add(_row("smoke1", "gS", "A", "S-1", kind="smoke"))       # smoke never counts
     log.flush()
     p1 = log.parts()
@@ -99,7 +99,7 @@ def test_program_ledger_append_only_cumulative_and_rerun_adds_trials(tmp_path):
     log.flush()
     assert TrialLog.program_trial_count(log.read()) == 6
     assert [p.read_bytes() for p in p1] == [p.read_bytes() for p in log.parts()[:1]]   # earlier parts untouched
-    assert len(log.parts()) == 3 and log.dsr_n() == 450
+    assert len(log.parts()) == 3 and log.dsr_n() == 456
     cut = log.read()["created_at_ct"].iloc[0]
     assert TrialLog.program_trial_count(log.read(), as_of_ct="2000-01-01T00:00:00-06:00") == 0
     with pytest.raises(Exception):
@@ -117,7 +117,24 @@ def test_dsr_n_exceeds_450_when_ledger_grows(tmp_path):
     from research.intraday_sr.harness import walkforward as W
     W.write_freeze(tmp_path / "FREEZE.md", {}, log, "sha", "grid", "v1.3")
     txt = (tmp_path / "FREEZE.md").read_text()
-    assert "DSR N = max(450, 460) = 460" in txt and log.sha256() in txt
+    assert "DSR N = max(456, 460) = 460" in txt and log.sha256() in txt
+
+
+def test_options_overlay_rows_count_guardrail_rows_do_not(tmp_path):
+    """SPEC v1.3.2 O1.9: options overlay rows are logged and feed DSR N; guardrail comparisons stay 0 trials."""
+    log = TrialLog(tmp_path / "ledger")
+    log.add(_row("r1", "gA", "A", "A-1"))
+    for lab in ("none", "d2+w5", "d2+w6", "d3+w6", "D2"):
+        log.add(_row("r1", "gA", "A", "A-1", overlay=lab))
+    for book in ("daily", "weekly"):
+        log.add(_row("r1", "gA", "A", "A-1", overlay=f"baseline:long_atm:{book}"))
+        log.add(_row("r1", "gA", "A", "A-1", overlay=f"baseline:long_atm:{book}", fold=2))   # same trial, 2nd fold
+        log.add(_row("r1", "gA", "A", "A-1", overlay=f"a2:sl30_tp50:{book}"))
+    log.add(_row("s", "gS", "A", "A-1", overlay="baseline:long_atm:daily", kind="smoke"))     # smoke never counts
+    log.flush()
+    assert TrialLog.program_trial_count(log.read()) == 1 + 4
+    assert log.dsr_n() == 456
+    assert not TrialLog.is_guardrail_overlay("") and TrialLog.is_guardrail_overlay("d2+w5")
 
 
 def test_selection_is_r_only():
@@ -191,7 +208,7 @@ def test_readout_renders_interim_with_frontier_flag(tmp_path):
                            frontier=rows, n_program=512, n_dsr=512, exact_checks={"A": (ex, True)})
     p = RO.write_readout(inp, tmp_path)
     txt = p.read_text()
-    assert "DSR N = max(450, program ledger) = **512**" in txt and "program ledger: 512 trials" in txt
+    assert "DSR N = max(456, program ledger) = **512**" in txt and "program ledger: 512 trials" in txt
     assert "Exact finalist check, Test A" in txt and "CP4 FLAG" in txt and "-0.02" in txt
     assert "INTERIM — 1 of 33 symbols — not a pass/fail result" in txt
     assert "trades/day" in txt and "1 setting(s) flagged" in txt and "A = 192" in txt

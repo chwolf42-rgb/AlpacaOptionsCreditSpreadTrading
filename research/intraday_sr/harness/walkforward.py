@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from research.intraday_sr.harness.config import PRIMARY_LABEL, Fold
+from research.intraday_sr.harness.config import N_PROGRAM as N_FLOOR, PRIMARY_LABEL, Fold
 
 CT = ZoneInfo("America/Chicago")
 DEV_START, DEV_END = date(2019, 1, 2), date(2026, 3, 31)
@@ -269,7 +269,7 @@ def sha256_file(path: Path) -> str:
 
 def write_freeze(path: Path, finalists_by_test: dict, ledger, git_sha: str, grid_sha: str,
                  spec_version: str, config: str = PRIMARY_LABEL) -> str:
-    """ledger: the program TrialLog. N = max(450, cumulative program trials at this freeze)."""
+    """ledger: the program TrialLog. N = max(456, cumulative program trials at this freeze) (SPEC v1.3.2 O1.9)."""
     if config != PRIMARY_LABEL:
         raise ComparisonConfigInSelection(f"FREEZE must use the primary configuration {PRIMARY_LABEL}, got {config}")
     now = datetime.now(CT).isoformat(timespec="microseconds")
@@ -278,7 +278,7 @@ def write_freeze(path: Path, finalists_by_test: dict, ledger, git_sha: str, grid
              f"- Written: {now}",
              f"- Spec version: {spec_version}", f"- Configuration: {PRIMARY_LABEL} (primary loss guardrail, G1)", f"- Grid sha256: `{grid_sha}`", f"- Git sha: `{git_sha}`",
              f"- Program ledger: `{ledger.path}` ({len(ledger.parts())} parts) sha256 `{ledger.sha256()}`",
-             f"- Program trials at freeze: {n_prog}; DSR N = max(450, {n_prog}) = {max(450, n_prog)}", "",
+             f"- Program trials at freeze: {n_prog}; DSR N = max({N_FLOOR}, {n_prog}) = {max(N_FLOOR, n_prog)}", "",
              "```json", json.dumps(finalists_by_test, indent=1, default=str), "```", ""]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text("\n".join(lines))

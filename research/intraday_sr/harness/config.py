@@ -149,3 +149,12 @@ N_DECLARED = {"A": len(_g.TEST_A), "B": len(_g.TEST_B), "F": len(_g.FORMATIONS),
               "options": len(_g.OPTIONS) + len(_g.OPTIONS_0DTE)}
 N_TOTAL = int(_g.N_TRIALS)
 assert sum(N_DECLARED.values()) == N_TOTAL == 450
+
+# SPEC v1.3.2 O1.9 (unchanged through v1.3.4): the options overlay is 6 baseline + 18 A2 = 24 rows (dual books), so the
+# declared PROGRAM floor is 192 (A) + 192 (B) + 48 (formations) + 24 = 456. This is a harness constant, deliberately
+# NOT in grids.py / grid_document(): grids.N_TRIALS (450) and GRID_SHA256 stay pinned to the v1.3.1 grid. A grids
+# module that already carries N_PROGRAM_O1 (Developer 2's later bump) must agree.
+N_OVERLAY_O1 = 6 + 18
+N_PROGRAM = N_DECLARED["A"] + N_DECLARED["B"] + N_DECLARED["F"] + N_OVERLAY_O1
+assert N_PROGRAM == 456
+assert int(getattr(_g, "N_PROGRAM_O1", N_PROGRAM)) == N_PROGRAM

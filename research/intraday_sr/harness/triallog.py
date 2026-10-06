@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -66,7 +67,10 @@ def git_sha(repo: Path | str = ".") -> str:
 
 
 DEFAULT_LEDGER = Path("/workspace/research4/runs/PROGRAM_LEDGER")    # box-wide program ledger (all runs)
-from research.intraday_sr.harness.config import N_TOTAL as N_FLOOR   # grids.N_TRIALS (450), SPEC v1.3 G2 declared trials
+from research.intraday_sr.harness.config import N_PROGRAM as N_FLOOR  # 456: SPEC v1.3.2 O1.9 declared program trials
+
+
+_GUARDRAIL_LABEL = re.compile(r"none|d\d+(\+w\d+)?|w\d+", re.I)   # guardrail configs (0 trials), never options rows
 
 
 class LedgerError(RuntimeError):
@@ -76,9 +80,10 @@ class LedgerError(RuntimeError):
 class TrialLog:
     """Append-only PROGRAM ledger (R1 ruling). `path` is a directory of immutable part files; each flush creates a
     new part (exclusive create) and never rewrites or deletes an existing one. A trial is a distinct
-    (grid_sha256, run_id, test, variant_id) among non-smoke, non-overlay rows: re-running the same grid hash under a
-    new run id adds trials; re-flushing the same run id does not double count. The DSR N, FREEZE.md and the readout
-    header read N = max(450, program_trial_count) from here, cumulative at the candidate's freeze time.
+    (grid_sha256, run_id, test, variant_id, overlay) among non-smoke rows; options overlay rows count (SPEC O1.9),
+    guardrail-configuration rows do not (G2: 0 trials). Re-running the same grid hash under a new run id adds trials;
+    re-flushing the same run id does not double count. The DSR N, FREEZE.md and the readout header read
+    N = max(456, program_trial_count) from here, cumulative at the candidate's freeze time.
     """
 
     def __init__(self, path: Path | str = DEFAULT_LEDGER):
@@ -132,16 +137,25 @@ class TrialLog:
         return int(d["variant_id"].nunique())
 
     @staticmethod
+    def is_guardrail_overlay(label) -> bool:
+        """Guardrail-configuration labels (none, d2, d2+w5, d2+w6, d3+w6, w5, ...): comparison rows, 0 trials (G2)."""
+        return bool(_GUARDRAIL_LABEL.fullmatch(str(label or "").strip()))
+
+    @staticmethod
     def program_trial_count(df: pd.DataFrame, as_of_ct: Optional[str] = None) -> int:
-        """Cumulative program trials: distinct (grid_sha256, run_id, test, variant_id), all tests, all runs,
-        excluding smoke runs and overlay rows, created at or before `as_of_ct` (ISO CT; e.g. the freeze time)."""
+        """Cumulative program trials: distinct (grid_sha256, run_id, test, variant_id, overlay), all tests, all runs,
+        excluding smoke runs and guardrail-configuration rows, created at or before `as_of_ct` (ISO CT; e.g. the
+        freeze time). Options overlay rows (non-empty `overlay`, e.g. a (scenario, book) label) COUNT: SPEC v1.3.2
+        O1.9 says overlay rows are logged and feed DSR N."""
         if df is None or not len(df):
             return 0
-        d = df[(df["run_kind"].fillna("") != "smoke") & (df["overlay"].fillna("") == "")]
+        ov = df["overlay"].fillna("").astype(str)
+        d = df[(df["run_kind"].fillna("") != "smoke") & ~ov.map(TrialLog.is_guardrail_overlay)].copy()
+        d["overlay"] = d["overlay"].fillna("")
         if as_of_ct is not None:
             ts = pd.to_datetime(d["created_at_ct"], utc=True, format="ISO8601")
             d = d[ts <= pd.Timestamp(as_of_ct).tz_convert("UTC")]
-        return int(len(d.drop_duplicates(["grid_sha256", "run_id", "test", "variant_id"])))
+        return int(len(d.drop_duplicates(["grid_sha256", "run_id", "test", "variant_id", "overlay"])))
 
     def dsr_n(self, as_of_ct: Optional[str] = None) -> int:
         return max(N_FLOOR, self.program_trial_count(self.read(), as_of_ct))

@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from research.intraday_sr.harness import stats as S
-from research.intraday_sr.harness.config import N_TOTAL
+from research.intraday_sr.harness.config import N_PROGRAM
 
 OOS_START, OOS_END = date(2020, 1, 1), date(2026, 3, 31)
 FLAG_LO, FLAG_HI = 150, 250
@@ -136,8 +136,8 @@ def frontier_png(rows: Sequence[dict], path: Path) -> Optional[Path]:
 # ------------------------------------------------------------------ headline / pass bar
 def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: Optional[int] = None,
              var_sr: Optional[float] = None) -> dict:
-    """Primary-configuration headline. DSR N = max(declared 450, trials logged) (SPEC v1.3 G2)."""
-    n_trials = max(int(n_trials or 0), N_TOTAL)
+    """Primary-configuration headline. DSR N = max(declared program N 456, trials logged) (SPEC v1.3.2 O1.9)."""
+    n_trials = max(int(n_trials or 0), N_PROGRAM)
     n_sessions = len(daily)
     day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if len(trades) else np.array([])
     s = S.trade_summary(trades["r"].to_numpy(float) if len(trades) else np.array([]),
@@ -269,22 +269,32 @@ class ReadoutInputs:
     notes: Sequence[str] = ()
     smoke: bool = False
     n_program: int = 0                                                 # cumulative program-ledger trials
-    n_dsr: int = 450                                                   # max(450, n_program)
+    n_dsr: int = N_PROGRAM                                             # max(456, n_program)
     exact_checks: Mapping[str, tuple] = field(default_factory=dict)    # test -> (exact_finalist_check df, cp4 flag)
+    interim: bool = True               # A1b ruling: dev-window runs stay INTERIM / informational even at 33/33 (to CP4)
+    errored: Mapping[str, pd.DataFrame] = field(default_factory=dict)  # test -> errored variants (variant_id, error)
+    not_for_cp4: str = ""              # attribution checks (legacy flags): banner, never a CP4/selection input
 
 
 def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     L = []
-    interim = len(inp.symbols) < inp.n_universe
+    interim = inp.interim or len(inp.symbols) < inp.n_universe
     title = "PIPELINE SMOKE TEST — NOT A STRATEGY RESULT" if inp.smoke else (
-        f"INTERIM — {len(inp.symbols)} of {inp.n_universe} symbols — not a pass/fail result" if interim
+        f"INTERIM — {len(inp.symbols)} of {inp.n_universe} symbols — not a pass/fail result (development window, "
+        "informational only until CP4)" if interim
         else "Full universe, development window (holdout untouched)")
-    L += [f"# Intraday S/R readout: {title}", "",
+    if inp.not_for_cp4:
+        title = f"{inp.not_for_cp4.split(':')[0]} — {title}"
+    L += [f"# Intraday S/R readout: {title}", ""]
+    if inp.not_for_cp4:
+        L += [f"> **{inp.not_for_cp4}**", ""]
+    L += [
           f"- Spec {inp.spec_version}; git {inp.git_sha[:12]}; grid sha256 {inp.grid_sha[:16]}",
-          f"- Trial count: DSR N = max(450, program ledger) = **{inp.n_dsr}** (program ledger: {inp.n_program} trials "
-          "cumulative across all tests and runs; 450 declared = A 192 + B 192 + formations 48 + options 18). "
+          f"- Trial count: DSR N = max({N_PROGRAM}, program ledger) = **{inp.n_dsr}** (program ledger: {inp.n_program} "
+          f"trials cumulative across all tests and runs; {N_PROGRAM} declared = A 192 + B 192 + formations 48 + options "
+          "overlay 24 (SPEC v1.3.2 O1.9); the hashed v1.3.1 grid's N_TRIALS stays 450). "
           f"Grid hash (grids.GRID_SHA256): `{inp.grid_sha}`. This run "
           "logged: " + (", ".join(f"{k} = {v}" for k, v in inp.trial_counts.items()) or "none")
           + ". Guardrail configurations add 0 trials.",
@@ -292,6 +302,13 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
           "every result, selection, pass-bar item and the DSR. 'none' and 'd2+w6' are comparison rows only.",
           f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
           "- Model-based research only; holdout 2026-04-01..2026-09-30 not opened; CP4 review before Trading.", ""]
+    for test, er in inp.errored.items():
+        n_er = 0 if er is None else len(er)
+        L += [f"## Test {test}: errored variants ({n_er})", "",
+              "Errored variants are logged program trials that produced no result; they are never eligible for "
+              "selection." if n_er else "None: every variant ran.", ""]
+        if n_er:
+            L += [_md(er.assign(error=er["error"].astype(str).str.slice(0, 300).str.replace("|", "\\|", regex=False))), ""]
     for test, h in inp.headlines.items():
         L += [f"## Test {test}: walk-forward OOS (2020Q1-2026Q1, selected variant per fold)", "",
               f"- Trades {h['trades']} | **trades/day {_num(h['trades_per_day'], 2)}** | trades/mo "

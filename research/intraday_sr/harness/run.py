@@ -45,13 +45,60 @@ from research.intraday_sr.harness import s0grids
 from research.intraday_sr.harness import spill as SP
 from research.intraday_sr.harness.config import COMPARISON, PENDING_R5, PRIMARY, CostCfg, RiskCfg
 from research.intraday_sr.harness.grid_check import check_grids_module, grid_hash
-from research.intraday_sr.harness.portfolio import SignalContractError, simulate
+from research.intraday_sr.harness.portfolio import SignalContractError, set_legacy, simulate
 from research.intraday_sr.harness.triallog import DEFAULT_LEDGER, TrialLog, TrialRow, git_sha
 from research.intraday_sr.harness.walkforward import (DEV_END, VariantRun, exact_finalist_check, make_folds,
                                                       walk_forward)
 
-SPEC_VERSION = "v1.3.1"
+SPEC_VERSION = "v1.3.1"     # grid spec stamp: grids.py / GRID_SHA256 are pinned to v1.3.1 (never the engine version)
+# Engine spec when research/intraday_sr/engine/version.py (Developer 2's engine_stamp(), lands on #23 after 30c20eb)
+# is absent, as on the A1b head (engine frozen at 30c20eb = SPEC v1.3.3 engine). Kept out of grid_document().
+ENGINE_SPEC_FALLBACK = "v1.3.3"
 _G: dict = {}          # fork-shared state for workers
+
+
+def _git(repo: Path, *args: str) -> str:
+    import subprocess
+    try:
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def engine_stamp_fields(repo: Path) -> dict:
+    """Run-time provenance for the manifest, outside grid_document()/GRID_SHA256: harness_commit (git HEAD),
+    engine_commit (last commit touching research/intraday_sr/engine), engine_tree (that directory's tree hash) and
+    engine_spec (engine/version.py's engine_stamp() when present, else ENGINE_SPEC_FALLBACK)."""
+    spec, src = ENGINE_SPEC_FALLBACK, "harness fallback (engine/version.py absent)"
+    try:
+        ver = importlib.import_module("research.intraday_sr.engine.version")
+        st = ver.engine_stamp() if hasattr(ver, "engine_stamp") else {}
+        got = st.get("engine_spec") if isinstance(st, dict) else getattr(ver, "ENGINE_SPEC", None)
+        if got:
+            spec, src = str(got), "engine/version.py"
+    except ImportError:
+        pass
+    return {"harness_commit": _git(repo, "rev-parse", "HEAD"),
+            "engine_commit": _git(repo, "log", "-1", "--format=%H", "--", "research/intraday_sr/engine"),
+            "engine_tree": _git(repo, "rev-parse", "HEAD:research/intraday_sr/engine"),
+            "engine_spec": spec, "engine_spec_source": src}
+
+
+NOT_FOR_CP4 = ("NOT FOR CP4/SELECTION: attribution check with legacy (pre-A1b) fill rules on; results are not "
+               "program trials and are written to a scratch ledger, never PROGRAM_LEDGER")
+
+
+def ledger_dir(smoke: bool, attribution: bool, out: Path, program_ledger: Path) -> Path:
+    """R1: one append-only PROGRAM ledger for real runs. Smoke runs and legacy-flag attribution checks get their own
+    scratch ledger under the run dir and can never append to the PROGRAM ledger."""
+    if smoke:
+        return out / "ledger_smoke"
+    if attribution:
+        p = out / "ledger_attribution"
+        if Path(p).resolve() == Path(program_ledger).resolve():
+            raise SystemExit("attribution ledger must not be the PROGRAM ledger")
+        return p
+    return program_ledger
 
 
 def engine_cfg_for(variant: dict):
@@ -279,14 +326,65 @@ def load_adapter(spec: str | None):
     return getattr(importlib.import_module(mod), attr or "make_adapter")()
 
 
+TRADE_COLUMNS = ["session", "symbol", "r", "pnl", "exit_kind", "capped", "entry_ts", "exit_ts", "day_losses_before",
+                 "week_losses_before", "direction", "signal_available_at", "entry_price", "exit_price", "qty",
+                 "entry_cost", "exit_cost"]
+
+
 def _trades_df(res) -> pd.DataFrame:
     if not res.trades:
-        return pd.DataFrame(columns=["session", "symbol", "r", "pnl", "exit_kind", "capped"])
+        return pd.DataFrame(columns=TRADE_COLUMNS)
     m = pd.DataFrame(res.meta)
-    return pd.DataFrame({"session": m["session"], "symbol": m["symbol"], "r": [t.r for t in res.trades],
-                         "pnl": [t.pnl for t in res.trades], "exit_kind": m["exit_kind"], "capped": m["capped"],
+    T = res.trades
+    return pd.DataFrame({"session": m["session"], "symbol": m["symbol"], "r": [t.r for t in T],
+                         "pnl": [t.pnl for t in T], "exit_kind": m["exit_kind"], "capped": m["capped"],
                          "entry_ts": m["entry_ts"], "exit_ts": m["exit_ts"],
-                         "day_losses_before": m["day_losses_before"], "week_losses_before": m["week_losses_before"]})
+                         "day_losses_before": m["day_losses_before"], "week_losses_before": m["week_losses_before"],
+                         # per-trade fills (A1b trades file, CP4 trade-by-trade reconciliation)
+                         "direction": [int(t.entry.side) for t in T],
+                         "signal_available_at": [t.signal.available_at for t in T],
+                         "entry_price": [float(t.entry.price) for t in T], "exit_price": [float(t.exit.price) for t in T],
+                         "qty": [float(t.entry.qty) for t in T], "entry_cost": [float(t.entry.cost) for t in T],
+                         "exit_cost": [float(t.exit.cost) for t in T]})
+
+
+class TradesFile:
+    """<out>/trades_<test>.parquet, one row group per (path, variant): every variant's continuous development path
+    ('dev') and exact OOS fold paths ('oos_exact', with fold), plus the walk-forward selected path under each
+    guardrail configuration ('selected'). Written incrementally so the parent never builds one big frame."""
+
+    def __init__(self, path: Path):
+        self.path, self._w, self.rows = Path(path), None, 0
+
+    def add(self, df: pd.DataFrame, **const) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        cols = ["path", "variant_id", "guardrail", "fold"] + TRADE_COLUMNS
+        d = pd.DataFrame(df if df is not None and len(df) else [], columns=[c for c in cols if c not in const])
+        if "fold" not in d.columns or d["fold"].isna().all():
+            d["fold"] = const.pop("fold", -1)
+        for k, v in const.items():
+            d[k] = v
+        d = d.reindex(columns=cols)
+        for c in ("session", "signal_available_at", "entry_ts", "exit_ts"):
+            d[c] = d[c].astype(str)
+        d["fold"] = pd.to_numeric(d["fold"], errors="coerce").fillna(-1).astype("int32")
+        for c in ("r", "pnl", "entry_price", "exit_price", "qty", "entry_cost", "exit_cost"):
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype("float64")
+        for c in ("direction", "day_losses_before", "week_losses_before"):
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0).astype("int32")
+        d["capped"] = d["capped"].fillna(False).astype(bool)
+        for c in ("path", "variant_id", "guardrail", "symbol", "exit_kind"):
+            d[c] = d[c].astype(str)
+        t = pa.Table.from_pandas(d, preserve_index=False)
+        if self._w is None:
+            self._w = pq.ParquetWriter(self.path, t.schema, compression="zstd")
+        self._w.write_table(t.cast(self._w.schema))
+        self.rows += len(d)
+
+    def close(self) -> None:
+        if self._w is not None:
+            self._w.close()
 
 
 def _sig_day(s) -> date:
@@ -527,7 +625,7 @@ def selected_path(picks, vmap, guardrail=PRIMARY, cost_mult: float = 1.0):
             continue
         a_, b_ = (date.fromisoformat(x) for x in p["test"])
         w, wc = sim_window(vmap[p["variant"]], a_, b_, guardrail, cost_mult, _signals(vmap[p["variant"]]))
-        tp.append(w.trades)
+        tp.append(w.trades.assign(fold=p.get("fold", -1), variant_id=p["variant"]))
         dp.append(w.daily)
         for k, v in wc.items():
             cnt[k] = cnt.get(k, 0) + v
@@ -577,8 +675,17 @@ def main(argv=None):
                     help="pass-2 signal loader: compact records (default) or full pickled Signals (legacy check)")
     ap.add_argument("--timing-only", action="store_true",
                     help="pass 1 + pass 2 only, then write timing.json; no walk-forward, ledger, manifest or readout")
+    ap.add_argument("--legacy-target-gap", action="store_true",
+                    help="ATTRIBUTION CHECK ONLY: pre-A1b target gap rule (open past target by >= 1 tick). Never "
+                         "writes the PROGRAM ledger; manifest/readout marked NOT FOR CP4/SELECTION")
+    ap.add_argument("--legacy-halfday", action="store_true",
+                    help="ATTRIBUTION CHECK ONLY: pre-A1b entry cutoff (last_entry only, entries allowed at/after a "
+                         "half day's forced-exit bar). Never writes the PROGRAM ledger; NOT FOR CP4/SELECTION")
     a = ap.parse_args(argv)
     t0 = time.time()
+    started_ct = pd.Timestamp.now(tz="America/Chicago").isoformat()     # true launch (same instant as t0)
+    legacy = set_legacy(a.legacy_target_gap, a.legacy_halfday)         # before any worker forks
+    attribution = any(legacy.values())
     _SIGCACHE.clear()
     _SIGERR.clear()
     _G.clear()
@@ -611,7 +718,7 @@ def main(argv=None):
             gsha = s0grids.grid_sha256()
         plan.append((test, variants, gsha))
     p2w = a.pass2_workers or a.workers
-    timing = {"run_id": a.tag, "symbols": syms, "workers": a.workers, "pass2_workers": p2w,
+    timing = {"run_id": a.tag, "started_at_ct": started_ct, "legacy": legacy, "symbols": syms, "workers": a.workers, "pass2_workers": p2w,
               "spill_format": a.spill_format, "pass2_loader": a.pass2_loader, "chunked": not a.no_chunk,
               "grid_sha256": s0grids.grid_sha256(), "pass1": None, "pass2": {}}
     _G.update(adapter=ad, symbols=syms, spill_format=a.spill_format, pass2_loader=a.pass2_loader)
@@ -645,9 +752,11 @@ def main(argv=None):
             raise SystemExit("bar source carries approximate (1.0) adj factors; real runs need Trading's factors")
     sha = git_sha(Path(__file__).resolve().parents[3])
     kind = "smoke" if ad.smoke else ("interim" if len(syms) < 33 else "full")
-    # R1: one append-only PROGRAM ledger for all real runs (smoke runs get their own, never counted)
-    log = TrialLog(out / "ledger_smoke") if ad.smoke else TrialLog(Path(a.ledger))
-    inp = RO.ReadoutInputs(SPEC_VERSION, sha, "", {}, syms, smoke=ad.smoke)
+    if attribution:
+        kind = "attribution"
+    log = TrialLog(ledger_dir(ad.smoke, attribution, out, Path(a.ledger)))
+    inp = RO.ReadoutInputs(SPEC_VERSION, sha, "", {}, syms, smoke=ad.smoke,
+                           not_for_cp4=NOT_FOR_CP4 if attribution else "")
     manifest = {"run_id": a.tag, "run_kind": kind, "spec_version": SPEC_VERSION, "git_sha": sha,
                 "guardrail": PRIMARY.name, "symbols": syms, "ledger": str(log.path), "grids": {},
                 "grid_sha256": s0grids.grid_sha256(), "grids_source": s0grids.source(),
@@ -657,7 +766,12 @@ def main(argv=None):
                     "guardrail counters reset at internal quarter starts in train windows (continuous selection "
                     "path; accepted by the R1 ruling for R-based selection only; finalists re-checked exactly)",
                     "OOS-fold and holdout paths are exact: counters and equity ($100k) start at each window start"],
-                "adj_factors": adj_note, "started_at_ct": pd.Timestamp.now(tz="America/Chicago").isoformat()}
+                "adj_factors": adj_note, "started_at_ct": started_ct,
+                "pass2_started_at_ct": pd.Timestamp.now(tz="America/Chicago").isoformat(),   # after pass 1 + bars
+                **engine_stamp_fields(Path(__file__).resolve().parents[3]),
+                "legacy_target_gap": legacy["target_gap"], "legacy_halfday": legacy["halfday"]}
+    if attribution:
+        manifest["not_for_cp4"] = NOT_FOR_CP4
     mode = "per-symbol chunks" if not a.no_chunk else "per-variant (no-chunk)"
     frontier, notes = [], [f"adapter: {type(ad).__name__}; workers {a.workers} (pass 2: {p2w}); {mode}", adj_note]
     for test, variants, gsha in plan:
@@ -672,6 +786,13 @@ def main(argv=None):
             continue
         runs = {vr.variant_id: vr for vr, _, _ in results}
         manifest["grids"][test] = gsha
+        tf = TradesFile(out / f"trades_{test}.parquet")
+        for vid, vr in runs.items():                      # every variant: dev path + exact OOS fold paths
+            tf.add(vr.trades, path="dev", variant_id=vid, guardrail=vr.config)
+            tf.add(vr.exact_oos_trades, path="oos_exact", variant_id=vid, guardrail=vr.config)
+        inp.errored = {**inp.errored, test: pd.DataFrame([{"variant_id": vid, "error": vr.error}
+                                                          for vid, vr in sorted(runs.items()) if vr.status != "ok"],
+                                                         columns=["variant_id", "error"])}
 
         def exact_window(vid, a_, b_, _runs=runs, _vmap={v["variant_id"]: v for v in variants}):
             r = _runs[vid]
@@ -725,10 +846,12 @@ def main(argv=None):
              "monthly": RO._pct(float(S.monthly_returns(d2).mean()) if len(d2) else None)}])}
         # G2: comparison configurations AFTER selection, same picks, only RiskCfg changed -> guardrail_compare.parquet
         tp_, dp_, prim_cnt = selected_path(wf.picks, vmap, PRIMARY)
+        tf.add(tp_, path="selected", guardrail=PRIMARY.name)
         gstats = [RO.guardrail_stats(PRIMARY.name, tp_, dp_, prim_cnt)]
         crow = []
         for gcfg in COMPARISON:
             tg, dg, cnt = selected_path(wf.picks, vmap, gcfg)
+            tf.add(tg, path="selected", guardrail=gcfg.name)
             gs = RO.guardrail_stats(gcfg.name, tg, dg, cnt)
             crow.append({"run_id": a.tag, "test": test, "scope": "selected_path", "guardrail": gcfg.name,
                          "trades": gs["trades"], "trades_per_mo": gs["trades_per_mo"], "win_rate": gs["win_rate"],
@@ -741,6 +864,8 @@ def main(argv=None):
                          "signals_arrived_blocked": gs["signals_arrived_blocked"]})
             gstats.append(gs)
         write_compare(out, crow)
+        tf.close()
+        manifest.setdefault("trades_files", {})[test] = {"file": tf.path.name, "rows": int(tf.rows)}
         inp.guardrails = {**inp.guardrails, f"Test {test} selected path":
                           (RO.guardrail_rows(gstats), RO.trades_per_month_words(gstats))}
         (out / f"wf_{test}.json").write_text(json.dumps({"picks": wf.picks, "finalists": wf.finalists}, default=str, indent=1))
