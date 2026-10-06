@@ -229,6 +229,7 @@ def signals(
     cfg: EngineCfg,
     sig: SignalCfg,
     funnel: SignalFunnel | None = None,
+    _touch_log: list | None = None,
 ) -> Iterator[Signal]:
     """Armed entries whose ``available_at`` is inside ``[start, end]``.
 
@@ -250,7 +251,7 @@ def signals(
     start_at = as_et(start, "start")
     end_at = as_et(end, "end")
     cache_key = None
-    if funnel is None:
+    if funnel is None and _touch_log is None:
         cache_key = (
             tape_token(clamped),
             start_at,
@@ -287,8 +288,12 @@ def signals(
     # walk fills the level cache. The prepared arrays already own the numbers.
     del raw, raw_groups, clamped, group, entry
     for prep in prepared:
-        found.extend(_emit(prep, start_at, end_at, cfg, sig, funnel))
-    found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
+        found.extend(_emit(prep, start_at, end_at, cfg, sig, funnel, touch_log=_touch_log))
+    if _touch_log is None:
+        found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
+    else:
+        _touch_log.sort(key=lambda row: (row[0].available_at, row[0].symbol, -row[0].zone.score, row[0].zone.zone_id))
+        found = [row[0] for row in _touch_log]
     if funnel is not None:
         funnel.emits += len(found)
     elif cache_key is not None:
@@ -336,6 +341,7 @@ _SLICED = (
     "volume",
     "factors",
     "available",
+    "bar_ts",
     "sessions",
     "osc",
     "hist",
@@ -386,6 +392,7 @@ class _Prepared:
         "volume",
         "factors",
         "available",
+        "bar_ts",
         "sessions",
         "osc",
         "hist",
@@ -563,6 +570,7 @@ def _build_prep(
     else:
         prep.factors = np.ones(len(tape), dtype=np.float64)
     prep.available = [_as_dt(value) for value in tape["available_at"]]
+    prep.bar_ts = [as_et(_as_dt(value), "ts") for value in tape["ts"]]
     if "session" in tape.columns:
         prep.sessions = [session_day(value) for value in tape["session"]]
     else:
@@ -614,6 +622,7 @@ def _emit(
     cfg: EngineCfg,
     sig: SignalCfg,
     funnel: SignalFunnel | None,
+    touch_log: list | None = None,
 ) -> list[Signal]:
     symbol = prep.symbol
     plan = prep.plan
@@ -753,31 +762,37 @@ def _emit(
             )
         if not zones:
             continue
-        out.extend(
-            _step(
-                index=index,
-                zones=zones,
-                opens=opens,
-                highs=highs,
-                lows=lows,
-                closes=closes,
-                available=available,
-                osc=osc,
-                hist=hist,
-                macd_line=_line,
-                macd_signal=_signal,
-                volume_ratio=volume_ratio,
-                factors=factors,
-                oversold=oversold,
-                overbought=overbought,
-                cfg=cfg,
-                sig=sig,
-                width=width,
-                setups=setups,
-                stable_ids=current_ids,
-                funnel=funnel,
-            )
+        step_idx: list[tuple[int, int]] | None = [] if touch_log is not None else None
+        batch = _step(
+            index=index,
+            zones=zones,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            available=available,
+            osc=osc,
+            hist=hist,
+            macd_line=_line,
+            macd_signal=_signal,
+            volume_ratio=volume_ratio,
+            factors=factors,
+            oversold=oversold,
+            overbought=overbought,
+            cfg=cfg,
+            sig=sig,
+            width=width,
+            setups=setups,
+            stable_ids=current_ids,
+            funnel=funnel,
+            index_log=step_idx,
         )
+        out.extend(batch)
+        if touch_log is not None and step_idx is not None:
+            if len(batch) != len(step_idx):
+                raise RuntimeError("touch index log does not match the signals just emitted")
+            for made, (touch_i, rc_i) in zip(batch, step_idx):
+                touch_log.append((made, prep.bar_ts[touch_i], prep.bar_ts[rc_i]))
     return out
 
 
@@ -853,6 +868,7 @@ def _step(
     setups: dict[str, _ZoneSetup] | None = None,
     stable_ids: list[str] | None = None,
     funnel: SignalFunnel | None = None,
+    index_log: list | None = None,
 ) -> list[Signal]:
     found: list[Signal] = []
     window = int(cfg.touch_window_bars)
@@ -925,6 +941,8 @@ def _step(
         state.consumed.add((touch_at, rc_at))
         state.block_until = index + cancel_bars
         found.append(signal)
+        if index_log is not None:
+            index_log.append((touch_at, rc_at))
     return found
 
 
@@ -1598,3 +1616,96 @@ def _formation_signal(
         confluence=count,
     )
     return signal, None
+
+
+def test_b_signals(
+    bars: BarSet,
+    start: datetime,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+) -> Iterator[Signal]:
+    """Test B entries. ``sig.test`` must be ``\"B\"``.
+
+    The harness loads this name and does not call ``signals()`` for Test B.
+    ``signals()`` already dispatches ``test == \"B\"``; this wrapper is the
+    entry point that dispatch goes through.
+    """
+    if sig.test != "B":
+        raise ValueError("test_b_signals requires sig.test == 'B'")
+    return signals(bars, start, end, cfg, sig)
+
+
+_TOUCH: dict[tuple, list[tuple[Signal, datetime, datetime]]] = {}
+_TOUCH_MAX = 64
+
+
+def _clear_touch_cache() -> None:
+    _TOUCH.clear()
+
+
+register_cache_clear(_clear_touch_cache)
+
+
+def _touch_key(frame: pd.DataFrame, start: datetime, end: datetime, cfg: EngineCfg, sig: SignalCfg) -> tuple:
+    symbols = ()
+    if "symbol" in frame.columns and len(frame):
+        symbols = tuple(str(item) for item in pd.unique(frame["symbol"]))
+    return (
+        tape_token(frame),
+        symbols,
+        start,
+        end,
+        zone_cfg_token(cfg),
+        sig.variant_id,
+        sig.target,
+        int(sig.k_confirm),
+        sig.entry_tf,
+        sig.oscillator,
+        float(sig.rvol_min),
+        sig.test,
+    )
+
+
+def stack_touch(
+    bars: BarSet,
+    signal: Signal,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+) -> tuple[datetime, datetime]:
+    """Return ``(touch_ts, rc_ts)`` for one Test A signal.
+
+    Both stamps are the entry-timeframe bar's open (the tape's ``ts``).
+    SPEC §5 step 4 lets the touch bar itself be the rejection close: a
+    close beyond the zone, or a wick of at least half the bar that closes
+    in the upper half (lower half for resistance). The arm search starts
+    on the next bar, and ``Signal.available_at`` is that arm bar's close,
+    so the rejection bar's close is strictly before ``available_at``.
+
+    Only bars with ``available_at <= signal.as_of_ts`` are read. The replay
+    is cached by that truncated tape, not by a longer one.
+    """
+    if sig.test != "A" or signal.test != "A":
+        raise ValueError("stack_touch requires a Test A signal and sig.test == 'A'")
+    as_of = as_et(signal.as_of_ts, "signal.as_of_ts")
+    visible = bars.visible(as_of)
+    if visible.empty:
+        raise LookupError("stack_touch: no bars at or before signal.as_of_ts")
+    start = as_et(_as_dt(visible["available_at"].iloc[0]), "start")
+    key = _touch_key(visible, start, as_of, cfg, sig)
+    cached = _TOUCH.get(key)
+    if cached is None:
+        clipped = BarSet(visible.copy())
+        log: list = []
+        list(signals(clipped, start, as_of, cfg, sig, _touch_log=log))
+        cached = [(item, touch, rc) for item, touch, rc in log]
+        _TOUCH[key] = cached
+        while len(_TOUCH) > _TOUCH_MAX:
+            _TOUCH.pop(next(iter(_TOUCH)))
+    hits = [(touch, rc) for item, touch, rc in cached if item == signal]
+    if len(hits) != 1:
+        raise LookupError(
+            f"stack_touch found {len(hits)} Test A touches for {signal.variant_id} "
+            f"{signal.symbol} at {signal.available_at.isoformat()}"
+        )
+    return hits[0]

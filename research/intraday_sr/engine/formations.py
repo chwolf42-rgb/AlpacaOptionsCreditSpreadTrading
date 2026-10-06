@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, time
+from typing import Iterator, Mapping
 
 import numpy as np
 import pandas as pd
@@ -34,7 +35,7 @@ from research.intraday_sr.engine.levels import (
 )
 from research.intraday_sr.engine.tape import at_time, session_day
 from research.intraday_sr.engine.zone_cache import prefix_digest, prefix_hashes, register_cache_clear
-from research.intraday_sr.types import BarSet, EngineCfg, Formation, as_et
+from research.intraday_sr.types import BarSet, EngineCfg, Formation, Signal, as_et
 
 
 @dataclass
@@ -858,3 +859,118 @@ def _retest_index(
 def _pivot_tuples(ts, pivot_px: np.ndarray, points: list[int]) -> tuple[tuple[datetime, float], ...]:
     ordered = sorted(points)
     return tuple((_as_dt(ts.iloc[index]), float(pivot_px[index])) for index in ordered)
+
+
+_FORMATION_TEST = {"F_W": "W", "F_IHS": "IHS", "F_M": "M", "F_HS": "HS"}
+
+
+def formation_signals(
+    bars: BarSet,
+    start: datetime,
+    end: datetime,
+    cfg: EngineCfg,
+    variant: Mapping,
+) -> Iterator[Signal]:
+    """Signals for one FORMATIONS-grid row.
+
+    The zone target for formations is locked at ``k_zones=5``. The harness
+    passes ``EngineCfg()`` or ``EngineCfg(k_zones=5)``. This function uses
+    ``cfg`` as given and does not override ``k_zones``.
+    """
+    # Imported here: signals.py already imports this module.
+    from research.intraday_sr.engine.signals import signals
+    from research.intraday_sr.types import SignalCfg
+
+    test = str(variant["test"])
+    kind = _FORMATION_TEST.get(test)
+    if kind is None or str(variant["kind"]) != kind:
+        raise ValueError(f"formation_signals variant must be an F_* row, got {test!r}/{variant.get('kind')!r}")
+    sig = SignalCfg(
+        oscillator="rsi14_30_70",
+        rvol_min=1.5,
+        entry_tf=variant["entry_tf"],
+        target=variant["target"],
+        k_confirm=0,
+        variant_id=str(variant["variant_id"]),
+        test=test,  # type: ignore[arg-type]
+        pivot_tol_atr=float(variant["pivot_tol_atr"]),
+    )
+    return signals(bars, start, end, cfg, sig)
+
+
+def formations_in(
+    bars: BarSet,
+    start: datetime,
+    end: datetime,
+    cfg: EngineCfg,
+    pivot_tol: float,
+) -> Iterator[Formation]:
+    """Formations whose break has closed inside ``[start, end]``.
+
+    Both entry timeframes and every kind are included. Each object is the
+    one ``formations_at`` would return at that formation's own
+    ``available_at``, so ``retest_ts`` is None (the retest bar is later).
+    With no delayed bad-print clamp, one scan at ``end`` plus clearing
+    ``retest_ts`` is that object. A clamp whose bar has closed by the break
+    but whose ``bad_print_visible_at`` is still after the break can change
+    the prefix, so those break stamps are rescanned.
+    """
+    start_at = as_et(start, "start")
+    end_at = as_et(end, "end")
+    affected = set(_clamp_break_stamps(bars, start_at, end_at))
+    chosen: dict[str, Formation] = {}
+
+    def keep(item: Formation) -> None:
+        if item.retest_ts is not None:
+            item = replace(item, retest_ts=None)
+        previous = chosen.get(item.formation_id)
+        if previous is None or item.available_at < previous.available_at:
+            chosen[item.formation_id] = item
+
+    for item in formations_at(bars, end_at, cfg, pivot_tol):
+        if item.available_at < start_at or item.available_at > end_at:
+            continue
+        if item.available_at in affected:
+            continue
+        keep(item)
+    for stamp in sorted(affected):
+        for item in formations_at(bars, stamp, cfg, pivot_tol):
+            if item.available_at == stamp:
+                keep(item)
+    ordered = sorted(chosen.values(), key=lambda item: (item.available_at, item.formation_id))
+    return iter(ordered)
+
+
+def _clamp_break_stamps(bars: BarSet, start: datetime, end: datetime) -> list[datetime]:
+    """Bar closes in ``[start, end]`` whose prefix a not-yet-visible clamp can change."""
+    visible = bars.visible(end)
+    if (
+        visible.empty
+        or "bad_print" not in visible.columns
+        or "bad_print_visible_at" not in visible.columns
+        or "available_at" not in visible.columns
+    ):
+        return []
+    bad = visible["bad_print"].to_numpy(dtype=bool)
+    if not bool(np.any(bad)):
+        return []
+    avail = visible["available_at"]
+    vis = visible["bad_print_visible_at"]
+    windows: list[tuple[datetime, datetime]] = []
+    for idx in np.flatnonzero(bad):
+        bar_at = as_et(_as_dt(avail.iloc[int(idx)]), "available_at")
+        vis_at = as_et(_as_dt(vis.iloc[int(idx)]), "bad_print_visible_at")
+        if vis_at > bar_at:
+            windows.append((bar_at, vis_at))
+    if not windows:
+        return []
+    stamps: list[datetime] = []
+    seen: set[datetime] = set()
+    for value in avail:
+        stamp = as_et(_as_dt(value), "available_at")
+        if stamp < start or stamp > end or stamp in seen:
+            continue
+        if any(bar_at <= stamp < vis_at for bar_at, vis_at in windows):
+            seen.add(stamp)
+            stamps.append(stamp)
+    return stamps
