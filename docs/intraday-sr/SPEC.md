@@ -1,7 +1,7 @@
-# Intraday S/R confluence research: spec v1.3.4 (frozen before any run)
+# Intraday S/R confluence research: spec v1.3.5 (frozen before any run)
 
 Owner: Architect. Engine: Developer 2. Harness, walk-forward, costs, options overlay, readout: Developer 1.
-Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2, v1.3.3 and v1.3.4 Mon 2026-10-05 (CT). Values marked
+Status: **research only, model-based, no live code.** Written Sun 2026-10-04 (CT); v1.3.2, v1.3.3 and v1.3.4 Mon 2026-10-05 (CT); v1.3.5 Tue 2026-10-06 (CT). Values marked
 **[P]** are provisional and may change only through a new spec version committed *before* the run
 that uses them. Anything not marked is frozen.
 v1.3 (Sun 2026-10-04 CT, before any run): the loss guardrail d2+w5 is binding and is the primary configuration for
@@ -17,6 +17,11 @@ v1.3.4 (Mon 2026-10-05 CT, before any 33×192 result is read): rulings R1–R5 o
 whole-day over-cap ranking (lookahead) and adds a cap-binding report row; R2–R5 are report-only side studies run after
 selection (zone sensitivity, d3+w6 guardrail row, IEX re-check, real option bars). No new trials; N stays 456;
 `GRID_SHA256` unchanged; launch head stays `30c20eb`; none of R1–R5 holds the 33×192 launch.
+
+v1.3.5 (Tue 2026-10-06 CT, before any formation or Test B code freeze or result): formation and Test B semantics
+F1–F10, B1–B3, selection/stats S1–S4, report row R7, the Test B pre-screen P1, and the Test B/F gate list GB0–GB6.
+FORMATIONS (48) runs before Test B (192). No new trials; N stays 456; `GRID_SHA256` unchanged; new constants are engine
+ClassVars stamped `ENGINE_SPEC = v1.3.5`.
 
 ## v1.1 amendments (Sun 2026-10-04 CT; these supersede v1.0 wherever they conflict)
 
@@ -46,6 +51,65 @@ binding and primary. Text kept for the record only.]*
 - Promoting a guardrail into the selected configuration requires a new spec version before the holdout opens.
 
 **A4. Ordering is unchanged.** CP4 review happens before any result goes to Trading. Developer 1 pings the Architect as soon as Test A has a first OOS read. After CP4 clears, the interim note goes to Trading, labeled INTERIM, holdout untouched.
+
+## v1.3.5 amendments (F/B/S/R7/P1/GB) (Tue 2026-10-06 CT; these supersede §5 formation and Test B text wherever they conflict)
+
+Source: Architect rulings in the Engineering room, Tue 2026-10-06 CT, after Christian decided A1b keeps running to formally close
+Test A and Test B work starts now. Ruled before any formation or Test B result exists. The A1 CP4 finding (costs ≈ the size of
+the gross edge) motivates R7 and P1.
+
+**No new trials. N stays 456. `GRID_SHA256` unchanged:** `2ef95123c015d70a1751f559f21fa1249d0b08aea272319e232f2facb120aa22`.
+
+
+### Order
+1. FORMATIONS (48 = 4 kinds x TF 2 x target 3 x pivot_tol 2) runs first. It's an independent signal source.
+2. Test B (192) runs second, and only if the pre-registered pre-screen (P1) does not screen it out.
+Both stay in N whether or not they run. Not running a test never lowers N.
+
+### Formation semantics (Dev 2's defaults, with these edits)
+F1 Pivots: the swing pivots used for levels, on the entry TF with PIVOT_N[tf] and clamped high/low (C1). A pivot is usable only at its confirmation bar (PIVOT_N bars later), and the C1 clamp only from bar t+2's close.
+F2 Spacing: W/M means pivot 1 to pivot 2 is 5-60 bars. IHS/HS means left shoulder to right shoulder is 5-60 bars, with the head strictly between them.
+F3 Tolerance: pivot_tol {0.15, 0.25}·ATR_d applies to the W/M bottoms (tops) and the IHS/HS shoulders. The head margin is fixed at >= 0.10·ATR_d. Test B uses 0.25 fixed.
+F4 Neckline:
+   W: the max clamped high strictly between the two pivots (slope 0). M: the mirror.
+   IHS: the line through the max clamped high in each of the two spans (LS to head, head to RS), extended per bar. HS: the mirror.
+F5 Break: the first bar t with a close beyond neckline(t), where t >= the confirmation bar of the last pivot and t <= last pivot + 60 bars. Otherwise the pattern expires. available_at is the break bar's close.
+F6 Invalidation: a close below min(pattern lows) before or after the break kills the pattern (mirror for M/HS). A pattern killed before its break is never emitted.
+F7 Dedupe: one formation per last pivot. When several first pivots (or LS/head combinations) qualify, take the nearest in time, then the closest price.
+F8 Retest and entry (formations alone): the retest bar is the first bar within 6 bars after the break with low <= neckline(t) + 0.10·ATR_d and close >= neckline(t) - 0.10·ATR_d (long). Entry is a buy-stop at retest.high + $0.01. It cancels after 6 bars or on a close beyond invalidation. Mirror for shorts.
+F9 Risk: stop = pattern low - 0.05·ATR_d, at least 0.10·ATR_d from entry (§5). The zone target is the next opposite zone from the same zone cache, and the trade is skipped if it's < 1R away. Every other §5 rule applies: the 15:00 entry cutoff, no entry at or after the forced-exit bar, the caps, and d2+w5.
+F10 ATR_d is the prior completed session. Bad-print handling is per-stamp as-of, as in F2 of the #23 review.
+
+### Test B
+B1 Stack conditions 1-5 must all hold. Stack step 6 (the RC pullback and entry) is replaced by the F8 neckline trigger.
+B2 The formation's last low (2nd bottom or right shoulder) is the stack touch bar on the same zone, side and TF, with zone_id set. pivot_tol is fixed at 0.25.
+B3 Stop = min(zone.low, pattern low) - 0.05·ATR_d (§5).
+
+### Selection and stats for formations
+S1 Each kind (F_W, F_IHS, F_M, F_HS) is its own test and portfolio. Per-fold selection happens within that kind's 12 variants.
+S2 DSR for each kind uses N = 48, the formations family count in G2. This is conservative and can only make a pass harder.
+S3 If no variant in a fold has >= 200 train trades, that fold has no selection and no OOS trades. It counts as a non-positive fold for §8.3.
+S4 Underpowered results are a finding and can't pass (G5).
+
+### Required report rows (0 trials)
+R7 Gross mean R, mean cost R and net mean R per test, selected path and pooled. This follows the A1 CP4 finding that costs are about the size of the gross edge.
+
+### P1 Test B pre-screen (decision rule fixed now, before anyone looks)
+- Input: A1b trades file, the 25 OOS test quarters only (dev window), all 192 Test A variants pooled, primary d2+w5.
+- Filter: trades whose touch bar is the last low of an F1-F7 formation (pivot_tol 0.25, frozen detector head) on the same zone, side and TF.
+- Metric: pooled net mean R with a 95% day-block bootstrap CI (seed 20260925, 5,000 resamples). Gross is reported beside it.
+- Rule: if the CI upper bound is < 0, Test B is screened out. It is not run, it is reported as "screened out by P1", and it stays in N.
+- Caveat stated in the readout: the entry is the RC trigger, not F8, so this is a proxy. P1 can only stop a run. It can never count toward a pass.
+
+### Gate list to CP4
+GB0 SPEC v1.3.5 (this document) is published to PR #18 before any freeze. Architect.
+GB1 Detector head on #23 (cloud agent). Fixtures W/IHS/M/HS emit at the expected confirmed_ts and break. Lookahead tests on available_at. A property test that pivot confirmation <= break <= available_at. A mirror-symmetry test. GRID_SHA256 unchanged, ENGINE_SPEC v1.3.5. Then CP2 Architect review.
+GB2 Harness --test F and --test B off 712994d (cloud agent). S1-S3, the R7 rows, the trades file, the INTERIM readout and a fixture run. Then Architect review.
+GB3 After A1b exits and is verified: a real-cache SPY timing and density check on the frozen heads (formations per day by kind and TF, and the share of Test A touches that are formation last lows). Architect GO on the frozen heads.
+GB4 P1 pre-screen posted, giving the Test B run or no-run decision.
+GB5 FORMATIONS interim 33 x 48 launch, then Test B 33 x 192 if it passed P1.
+GB6 CP4 on each run: a hand audit, G8 checks and the §8 bar. Nothing goes to Trading until CP4 clears. No tuning.
+
 
 ## v1.3.4 amendments (R1–R5) (Mon 2026-10-05 CT; these supersede earlier text wherever they conflict)
 
@@ -631,12 +695,12 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 
 **Test definitions:**
 - **Test A:** the stack alone.
-- **Test B:** the stack, plus a formation at the same zone on the entry TF.
+- **Test B:** the stack, plus a formation at the same zone on the entry TF. *(v1.3.5 B1–B3, F8: stack conditions 1–5 hold; step 6 replaced by the neckline retest trigger.)*
   - The pattern's last low (2nd bottom or right shoulder) must be the stack's touch bar.
   - Entry is the formation's neckline retest trigger: after a close beyond the neckline, a retest within
     6 bars that does not close more than 0.10 ATR_d back through it. Entry is a buy-stop above the retest
     bar's high.
-- **Formations alone (F_W, F_IHS, F_M, F_HS):** the formation trigger with no stack conditions.
+- **Formations alone (F_W, F_IHS, F_M, F_HS):** the formation trigger with no stack conditions. *(v1.3.5 F1–F10: pivots, spacing, tolerance, neckline, break, invalidation, dedupe, retest, risk.)*
   - W/M: two confirmed pivots 5–60 bars apart, within 0.25·ATR_d of each other. Neckline = the extreme
     between them.
   - IHS/HS: three pivots. The head exceeds both shoulders by ≥ 0.10·ATR_d, and the shoulders are within
@@ -669,7 +733,7 @@ def walk_forward(grid: Grid, folds: list[Fold]) -> WFResult
 | target | 1R, 2R, next zone | risk |
 - **Test A:** 3·2·2·2·2·3 = **144** variants. **Test B:** the same 144. *(Superseded by v1.1 A1: 192 each, with `k_confirm` added and `k_cluster` fixed at 0.25.)*
 - **Formations alone:** 4 kinds × TF (2) × target (3) × pivot tolerance {0.15, 0.25 ATR_d} (2) = **48**,
-  i.e. 12 per kind.
+  i.e. 12 per kind. *(v1.3.5 S1–S3: per-kind selection within 12; DSR N = 48 per kind; folds with no ≥ 200-train-trade variant count non-positive. FORMATIONS runs before Test B; Test B runs only if P1 does not screen it out.)*
 - **Options overlay:** applied only to frozen equity finalists, never used to re-select them. *(v1.3.2 O1 dual books.)*
   - **Books (required):** every scenario runs `daily` and `weekly` side-by-side (O1). Daily-only scaffolding is forbidden.
   - **Baseline sleeve (6):** structure {long ATM, long 1 strike OTM, debit vertical (long ATM, short at the strike
