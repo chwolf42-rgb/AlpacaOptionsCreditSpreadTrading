@@ -125,7 +125,8 @@ def frontier_png(rows: Sequence[dict], path: Path) -> Optional[Path]:
         ax[k].axhline(0, color="k", lw=.6)
         ax[k].set_xlabel("trades / month")
         ax[k].set_ylabel(lab)
-        ax[k].legend(fontsize=8)
+        if ax[k].get_legend_handles_labels()[1]:
+            ax[k].legend(fontsize=8)
     fig.suptitle("Trade-off frontier, all logged variants (shaded: 150-250 trades/mo)")
     fig.tight_layout()
     fig.savefig(path, dpi=110)
@@ -135,14 +136,22 @@ def frontier_png(rows: Sequence[dict], path: Path) -> Optional[Path]:
 
 # ------------------------------------------------------------------ headline / pass bar
 def headline(trades: pd.DataFrame, daily: pd.Series, n_trials: Optional[int] = None,
-             var_sr: Optional[float] = None) -> dict:
-    """Primary-configuration headline. DSR N = max(declared program N 456, trials logged) (SPEC v1.3.2 O1.9)."""
-    n_trials = max(int(n_trials or 0), N_PROGRAM)
+             var_sr: Optional[float] = None, *, dsr_floor: Optional[int] = None) -> dict:
+    """Primary-configuration headline.
+
+    Program DSR N = max(declared program N 456, trials logged) (SPEC v1.3.2 O1.9).
+    A formation kind passes dsr_floor=48 (SPEC v1.3.5 S2) and that N is used as-is.
+    """
+    if dsr_floor is None:
+        n_trials = max(int(n_trials or 0), N_PROGRAM)
+    else:
+        n_trials = int(dsr_floor)
     n_sessions = len(daily)
     day = pd.to_datetime(trades["session"]).dt.date.to_numpy() if len(trades) else np.array([])
     s = S.trade_summary(trades["r"].to_numpy(float) if len(trades) else np.array([]),
                         trades["pnl"].to_numpy(float) if len(trades) else np.array([]), day, n_sessions, daily)
     s["dsr"] = S.deflated_sharpe(daily, n_trials, var_sr)
+    s["dsr_scope_n"] = None if dsr_floor is None else int(dsr_floor)
     if len(trades):
         yrs = pd.to_datetime(trades["session"]).dt.year
         my = S.monthly_returns(daily)
@@ -232,6 +241,18 @@ def guardrail_rows(stats: Sequence[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def r7_table(block: Mapping) -> pd.DataFrame:
+    """Selected path beside the pool of every variant's exact OOS trades (SPEC v1.3.5 R7)."""
+    rows = []
+    for scope, key in (("selected path", "selected"), ("pooled all variants", "pooled")):
+        m = block.get(key) or {}
+        rows.append({"scope": scope, "trades": int(m.get("trades") or 0),
+                     "gross mean R": _num(m.get("gross_mean_r")),
+                     "mean cost R": _num(m.get("cost_mean_r")),
+                     "net mean R": _num(m.get("net_mean_r"))})
+    return pd.DataFrame(rows)
+
+
 def trades_per_month_words(stats: Sequence[dict]) -> str:
     parts = []
     for g in stats:
@@ -274,6 +295,11 @@ class ReadoutInputs:
     interim: bool = True               # A1b ruling: dev-window runs stay INTERIM / informational even at 33/33 (to CP4)
     errored: Mapping[str, pd.DataFrame] = field(default_factory=dict)  # test -> errored variants (variant_id, error)
     not_for_cp4: str = ""              # attribution checks (legacy flags): banner, never a CP4/selection input
+    r7: Mapping[str, Mapping] = field(default_factory=dict)            # test -> {selected, pooled} gross/cost/net
+    fold_83: Mapping[str, Mapping] = field(default_factory=dict)        # test -> §8.3 summary (S3)
+    spec_doc: str = ""                 # set on F/B runs: v1.3.5
+    spec_doc_commit: str = ""
+    engine_spec: str = ""              # F/B stamp; A-only readouts leave this empty
 
 
 def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
@@ -302,6 +328,11 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
           "every result, selection, pass-bar item and the DSR. 'none' and 'd2+w6' are comparison rows only.",
           f"- Symbols ({len(inp.symbols)}): {' '.join(inp.symbols)}",
           "- Model-based research only; holdout 2026-04-01..2026-09-30 not opened; CP4 review before Trading.", ""]
+    if inp.spec_doc:
+        line = f"- spec_doc {inp.spec_doc} ({inp.spec_doc_commit})"
+        if inp.engine_spec:
+            line += f"; engine_spec {inp.engine_spec}"
+        L += [line, ""]
     for test, er in inp.errored.items():
         n_er = 0 if er is None else len(er)
         L += [f"## Test {test}: errored variants ({n_er})", "",
@@ -319,6 +350,18 @@ def write_readout(inp: ReadoutInputs, out_dir: Path) -> Path:
               f"(N {h['dsr'].get('n_trials')}, var source: {h['dsr'].get('var_sr_source', 'n/a')})", "",
               "Pass bar (SPEC section 8)" + (" — informational only in an interim run:" if interim else ":"), ""]
         L += [f"- {x}" for x in pass_bar_words(h)] + [""]
+        if h.get("dsr_scope_n"):
+            L += [f"- DSR N for this test is **{int(h['dsr_scope_n'])}** (formations grid, SPEC v1.3.5 S2).", ""]
+        crit = inp.fold_83.get(test) if inp.fold_83 else None
+        if crit:
+            L += [f"- §8.3: {crit['n_non_positive']} of {crit['n_folds']} folds are non-positive "
+                  f"({crit['n_unselected']} with no variant at >= 200 train trades).", ""]
+        if int(h.get("trades") or 0) < 500:
+            L += [f"- FINDING (G5/S4): selected-path OOS has {int(h.get('trades') or 0)} trades (under 500). "
+                  "Underpowered. This result cannot pass.", ""]
+        block = inp.r7.get(test) if inp.r7 else None
+        if block:
+            L += ["Gross, cost, and net mean R (SPEC v1.3.5 R7):", "", _md(r7_table(block))]
         if h.get("years_positive"):
             L += ["Per year:", "", _md(pd.DataFrame([{"year": y, "mean R": _num(v),
                                                       "monthly mean": _pct(h["monthly_by_year"].get(y))}

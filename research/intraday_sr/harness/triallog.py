@@ -27,6 +27,8 @@ SCHEMA = {
     "trades": "int32", "trades_per_day": "float64", "win_rate": "float64", "mean_r": "float64",
     "sum_r": "float64", "profit_factor": "float64", "monthly_mean": "float64", "sharpe_daily": "float64",
     "cap_limited_share": "float64", "overlay": "string", "created_at_ct": "string",
+    # SPEC v1.3.5: formations ledger rows carry grid family "formations". Empty for A/B.
+    "grid_family": "string",
 }
 
 
@@ -57,6 +59,7 @@ class TrialRow:
     cap_limited_share: float = float("nan")
     overlay: str = ""
     created_at_ct: str = field(default_factory=lambda: datetime.now(CT).isoformat(timespec="seconds"))
+    grid_family: str = ""
 
 
 def git_sha(repo: Path | str = ".") -> str:

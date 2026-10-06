@@ -39,7 +39,7 @@ from research.intraday_sr.harness import costs as K
 from research.intraday_sr.harness.config import CostCfg, RiskCfg, canonical_target
 from research.intraday_sr.types import Fill, Trade
 from research.intraday_sr.harness.fills import STOP, TARGET, exit_on_bar, stop_entry_fill, widen_stop
-from research.intraday_sr.harness.guard import Guard, Guarded
+from research.intraday_sr.harness.guard import Guard, Guarded, LookaheadError
 
 BAR_5M = timedelta(minutes=5)
 
@@ -145,6 +145,18 @@ class SimResult:
 
 class SignalContractError(ValueError):
     """A signal violates the harness input contract (e.g. Zone.atr_d NaN). Raised per signal, never swallowed."""
+
+
+def _consume_formation(guard: Guard, sig) -> None:
+    """F/B: signal.formation is an engine object, consumed through Guard.
+
+    The decision bar is the signal's available_at, not the later entry-bar open. A formation
+    whose available_at is after that bar is lookahead and raises LookaheadError.
+    """
+    form = getattr(sig, "formation", None)
+    if form is None:
+        return
+    guard.check(form, decision_ts=sig.available_at)
 
 
 def _sig_name(sig) -> str:
@@ -319,7 +331,9 @@ def _run_day(d, sigs, bars, risk, costs, tier_fn, guard, fold, day_start, week_l
     for ts in timeline:
         guard.advance(ts)                                  # decision time = previous bar's close = this open
         while ai < len(inactive) and inactive[ai].available_at <= ts:
-            g = guard.wrap(inactive[ai])
+            raw = inactive[ai]
+            _consume_formation(guard, raw)             # formation.available_at must be <= the decision bar
+            g = guard.wrap(raw)
             ai += 1
             if blocked():                                  # arrives while a limit is active: never armed
                 st["signals_arrived_blocked"] += 1                   # became available while blocked

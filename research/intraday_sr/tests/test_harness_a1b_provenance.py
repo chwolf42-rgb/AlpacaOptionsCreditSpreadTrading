@@ -51,3 +51,5 @@ def test_manifest_records_launch_pass2_start_and_provenance(tmp_path, monkeypatc
         assert m[k] and m[k] != "unknown", k
     assert m["harness_commit"] == m["git_sha"] and m["spec_version"] == "v1.3.1"
     assert m["dsr_n"] == 456
+    assert m["engine_spec"] == "v1.3.3"
+    assert "spec_doc" not in m and "spec_doc_commit" not in m and "dsr_by_test" not in m

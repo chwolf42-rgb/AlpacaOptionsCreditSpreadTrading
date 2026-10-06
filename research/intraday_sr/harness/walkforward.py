@@ -75,6 +75,7 @@ class VariantRun:
     # exact fixed-variant OOS path: each fold test window simulated from its own start (counters 0, $100k)
     exact_oos_trades: Optional[pd.DataFrame] = None
     exact_oos_daily: Optional[pd.Series] = None
+    n_signals: int = 0
 
 
 def _win(df: pd.DataFrame, a: date, b: date) -> pd.DataFrame:
@@ -142,9 +143,49 @@ class WFResult:
     fold_table: pd.DataFrame          # per (variant, fold): test mean R, trades (for finalist rule + trial log)
     finalists: dict = field(default_factory=dict)
     oos_exact: bool = False           # True when OOS fold paths were re-simulated exactly from each fold start
+    # SPEC v1.3.5 S3: unselected folds (no variant with >= 200 train trades) count as non-positive for §8.3.
+    fold_criterion: dict = field(default_factory=dict)
 
 
 ExactWindow = Callable[[str, date, date], VariantRun]
+
+
+def section_8_3(picks: Sequence[Mapping], oos_trades: pd.DataFrame | None) -> dict:
+    """§8.3 fold criterion on the selected path (SPEC v1.3.5 S3).
+
+    A fold with no selected variant has no OOS trades and counts as non-positive.
+    A selected fold is positive only when its OOS mean R is > 0.
+    """
+    means: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    frame = oos_trades
+    if frame is not None and len(frame) and {"fold", "r"} <= set(frame.columns):
+        for fold, group in frame.groupby("fold"):
+            counts[int(fold)] = int(len(group))
+            means[int(fold)] = float(group["r"].mean()) if len(group) else float("nan")
+    folds_out = []
+    n_pos = 0
+    n_unselected = 0
+    for pick in picks:
+        vid = pick.get("variant")
+        fold = int(pick["fold"])
+        if not vid:
+            n_unselected += 1
+            folds_out.append({"fold": fold, "selected": None, "oos_trades": 0, "mean_r": None,
+                              "positive": False, "reason": "no variant with >= 200 train trades"})
+            continue
+        n = counts.get(fold, 0)
+        mean = means.get(fold)
+        positive = mean is not None and mean > 0 and n > 0
+        n_pos += int(positive)
+        folds_out.append({"fold": fold, "selected": vid, "oos_trades": n,
+                          "mean_r": None if mean is None else float(mean), "positive": bool(positive),
+                          "reason": "" if positive else "OOS mean R is not > 0"})
+    n_folds = len(picks)
+    share = (n_pos / n_folds) if n_folds else 0.0
+    return {"n_folds": n_folds, "n_positive": n_pos, "n_non_positive": n_folds - n_pos,
+            "n_unselected": n_unselected, "share_positive": share,
+            "passes": bool(n_folds) and share >= 0.60, "folds": folds_out}
 
 
 def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = None,
@@ -180,7 +221,12 @@ def walk_forward(runs: Mapping[str, VariantRun], folds: Sequence[Fold] | None = 
     oos_t = pd.concat(tparts, ignore_index=True) if tparts else pd.DataFrame()
     oos_d = pd.concat(dparts) if dparts else pd.Series(dtype=float)
     ft = pd.DataFrame(rows)
-    return WFResult(picks, oos_t, oos_d, ft, finalists(runs, ft), oos_exact=exact_window is not None)
+    crit = section_8_3(picks, oos_t)
+    by_fold = {row["fold"]: row for row in crit["folds"]}
+    for pick in picks:
+        pick["fold_positive"] = bool(by_fold[int(pick["fold"])]["positive"])
+    return WFResult(picks, oos_t, oos_d, ft, finalists(runs, ft), oos_exact=exact_window is not None,
+                    fold_criterion=crit)
 
 
 def finalists(runs: Mapping[str, VariantRun], fold_table: pd.DataFrame) -> dict:
