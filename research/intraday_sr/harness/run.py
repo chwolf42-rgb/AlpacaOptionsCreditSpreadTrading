@@ -21,6 +21,7 @@ The holdout is never touched here (see walkforward.run_holdout).
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import json
 import multiprocessing as mp
@@ -89,6 +90,18 @@ def resolve_symbol_parquet(cache_root: Path, symbol: str) -> Path:
         raise FileNotFoundError(f"no 5m cache file for {symbol} under {cache_root} "
                                 f"(looked for {direct.name} and part_*_{stem}.parquet)")
     raise FileNotFoundError(f"ambiguous cache files for {symbol}: {hits}")
+
+
+# The only bar columns the simulator (portfolio._run_day, FrameBarSource.daily, the adj-factor coverage check) reads.
+# The bar source keeps just these, which roughly halves its per-session frames (~10 vs ~20 MB per symbol), memory that
+# the parent holds through pass 2 and every forked pass-2 worker maps.
+SIM_BAR_COLUMNS = ("ts", "open", "high", "low", "close", "adj_factor", "volume", "session",
+                   "high_unclamped", "high_raw", "low_unclamped", "low_raw", "available_at")
+
+
+def sim_bar_frame(fr: pd.DataFrame) -> pd.DataFrame:
+    """Column subset of a loaded frame for the bar source (all simulator inputs kept, in the frame's order)."""
+    return fr[[c for c in fr.columns if c in SIM_BAR_COLUMNS]]
 
 
 class S0Adapter:
@@ -166,10 +179,10 @@ class S0Adapter:
                     if s_ not in ad._frames and s_ in ad._frame_files:
                         fr = pd.read_pickle(ad._frame_files[s_])
                         ad._sessions_by_sym[s_] = set(fr["session"].unique())
-                        yield s_, fr
+                        yield s_, sim_bar_frame(fr)
                         del fr
                     else:
-                        yield s_, ad.frame(s_)
+                        yield s_, sim_bar_frame(ad.frame(s_))
         return FrameBarSource(_Lazy())
 
     # Per-symbol chunking: a pass-1 worker loads its symbol and hands the loaded frame to the parent. With a frame
@@ -464,8 +477,15 @@ def _timed_run_variant(variant: dict):
 def _par(fn, items, workers):
     if workers <= 1:
         return [fn(x) for x in items]
-    with mp.get_context("fork").Pool(workers) as pool:
-        return pool.map(fn, items, chunksize=1)
+    # gc.freeze(): the forked workers' garbage collector then never walks (and so never copy-on-write dirties) the
+    # parent's objects, chiefly the bar source; results are unaffected.
+    gc.collect()
+    gc.freeze()
+    try:
+        with mp.get_context("fork").Pool(workers) as pool:
+            return pool.map(fn, items, chunksize=1)
+    finally:
+        gc.unfreeze()
 
 
 def _trial_sr_var(runs) -> float | None:

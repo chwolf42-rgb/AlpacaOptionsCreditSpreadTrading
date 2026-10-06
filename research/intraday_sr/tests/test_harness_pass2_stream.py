@@ -199,3 +199,19 @@ def test_pass1_releases_engine_signals_after_each_spill(tmp_path, monkeypatch):
             "--keep-signals"])
     assert len(seen) == len(SYMS) * 4 and len(clears) == len(SYMS)
     assert [len(x) for x in seen] == list(range(1, len(SYMS) * 4 + 1))      # file k exists before release k
+
+
+def test_lean_bar_source_gives_identical_simulation():
+    """S0Adapter's bar source keeps only SIM_BAR_COLUMNS; extra frame columns must not change any result."""
+    from research.intraday_sr.harness.portfolio import FrameBarSource
+    ad = FixtureAdapter()
+    full = {s: f.assign(vwap=f["close"] * 1.001, symbol=s, bad_print=False, trades=7) for s, f in ad._frames.items()}
+    lean = {s: R.sim_bar_frame(f) for s, f in full.items()}
+    assert all(set(f.columns) <= set(R.SIM_BAR_COLUMNS) for f in lean.values())
+    sigs = [x for s in SYMS for x in ad.signals(s, {"variant_id": "A-fx0"})]
+    for target in ("1R", "zone"):
+        risk = PRIMARY.apply(RiskCfg(target=target))
+        a = simulate(sigs, FrameBarSource(full), risk, CostCfg(), sessions=ad.days)
+        b = simulate(sigs, FrameBarSource(lean), risk, CostCfg(), sessions=ad.days)
+        assert len(a.trades) and _trade_rows(a) == _trade_rows(b) and a.counters == b.counters
+        pd.testing.assert_series_equal(a.daily, b.daily)
