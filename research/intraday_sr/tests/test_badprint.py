@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -15,10 +16,13 @@ from research.intraday_sr.data.badprint import flag_summary, prices_as_of, repai
 from research.intraday_sr.data.cache import iter_symbol_bars, normalize_bars
 from research.intraday_sr.data.calendar import sessions_between
 from research.intraday_sr.data.holdout import HoldoutLocked, HoldoutToken
-from research.intraday_sr.engine import levels_at, zones_at
+from research.intraday_sr.engine import levels_at, signals, zones_at
+from research.intraday_sr.engine.levels import _LevelTape
+from research.intraday_sr.engine.zone_cache import clear_zone_cache
+from research.intraday_sr.engine.zones import fast_zones
 from research.intraday_sr.harness.walkforward import run_holdout
 from research.intraday_sr.tests.fixtures.synthetic import session_opens
-from research.intraday_sr.types import BarSet, EngineCfg
+from research.intraday_sr.types import BarSet, EngineCfg, SignalCfg
 
 _PACKAGE = Path(__file__).resolve().parents[1]
 
@@ -64,14 +68,15 @@ def test_spike_clamps_at_t_plus_2_and_pivots_at_t_plus_1_stay_raw():
     closes = np.full(78, 100.0)
     raw = _session(day, closes, spike_at=10)
     peak = 8
-    raw.loc[peak, "high"] = 101.0
+    peak_high = 100.15
+    raw.loc[peak, "high"] = peak_high
     raw_high = float(raw["high"].iloc[10])
     repaired, count = repair_bad_prints(raw, {("SPY", day): 2.0})
     assert count == 1
     assert bool(repaired["bad_print"].iloc[10])
     assert float(repaired["high_unclamped"].iloc[10]) == pytest.approx(raw_high)
     assert float(repaired["high"].iloc[10]) < raw_high
-    assert float(repaired["high"].iloc[peak]) == pytest.approx(101.0)
+    assert float(repaired["high"].iloc[peak]) == pytest.approx(peak_high)
     visible_at = pd.Timestamp(repaired["bad_print_visible_at"].iloc[10])
     t1 = pd.Timestamp(raw["available_at"].iloc[11])
     seen = prices_as_of(repaired, t1.to_pydatetime())
@@ -91,25 +96,28 @@ def test_spike_clamps_at_t_plus_2_and_pivots_at_t_plus_1_stay_raw():
     tape = pd.concat(history + [repaired], ignore_index=True).sort_values("ts").reset_index(drop=True)
     bars = BarSet(tape)
     cfg = EngineCfg()
+    # Zones recompute on 15m closes. 10:30 is t+1 (raw). The clamp is visible
+    # at 10:35, so the next zone set that can see it is the 10:45 close.
+    zone_late = pd.Timestamp(raw["available_at"].iloc[14])
     early = levels_at(bars, t1.to_pydatetime(), cfg)
     late = levels_at(bars, visible_at.to_pydatetime(), cfg)
     early_zones = zones_at(bars, t1.to_pydatetime(), cfg)
-    late_zones = zones_at(bars, visible_at.to_pydatetime(), cfg)
+    late_zones = zones_at(bars, zone_late.to_pydatetime(), cfg)
 
     def _near(prices, target: float) -> bool:
         return any(abs(price - target) < 1e-3 for price in prices)
 
     early_prices = [level.price for level in early]
     late_prices = [level.price for level in late]
-    assert not _near(early_prices, 101.0)
+    assert not _near(early_prices, peak_high)
     assert not _near(early_prices, raw_high)
-    assert _near(late_prices, 101.0)
+    assert _near(late_prices, peak_high)
     assert not _near(late_prices, raw_high)
     early_centers = [0.5 * (zone.low + zone.high) for zone in early_zones]
     late_centers = [0.5 * (zone.low + zone.high) for zone in late_zones]
-    assert not _near(early_centers, 101.0)
+    assert not _near(early_centers, peak_high)
     assert not _near(early_centers, raw_high)
-    assert _near(late_centers, 101.0)
+    assert _near(late_centers, peak_high)
     assert not _near(late_centers, raw_high)
 
 
@@ -133,6 +141,16 @@ def test_normalize_flags_a_spike_from_wilder_atr():
     assert int(flagged["session"].iloc[0]) == spike_day
     assert float(flagged["high_unclamped"].iloc[0]) == pytest.approx(120.0)
     assert float(flagged["high"].iloc[0]) == pytest.approx(100.0)
+
+
+def test_session_end_bars_are_unchecked_and_unclamped():
+    day = date(2024, 6, 12)
+    raw = _session(day, np.full(78, 100.0), spike_at=77)
+    repaired, count = repair_bad_prints(raw, {("SPY", day): 2.0})
+    assert count == 0
+    assert repaired.attrs["session_end_unchecked"] == 2
+    assert not bool(repaired["bad_print"].iloc[-2:].any())
+    assert float(repaired["high"].iloc[-1]) == float(raw["high"].iloc[-1])
 
 
 def test_a_real_move_that_does_not_revert_is_left_alone():
@@ -206,11 +224,11 @@ def test_aapl_factor_is_the_inverse_of_trading(tmp_path):
 def test_iterator_does_not_require_every_symbol_up_front(tmp_path):
     day = date(2024, 6, 12)
     factors = pd.Series({("SPY", day): 1.0, ("QQQ", day): 1.0})
-    for symbol, level in (("SPY", 100.0), ("QQQ", 200.0)):
+    for part, (symbol, level) in enumerate((("SPY", 100.0), ("QQQ", 200.0))):
         frame = _session(day, np.full(78, level))
         frame["symbol"] = symbol
         frame["ts"] = [ts.replace(tzinfo=None) for ts in frame["ts"]]
-        frame.to_parquet(tmp_path / f"{symbol}.parquet", index=False)
+        frame.to_parquet(tmp_path / f"part_{part:04d}_{symbol}.parquet", index=False)
     seen = []
     for symbol, frame, report in iter_symbol_bars(tmp_path, factors=factors, symbols=("SPY", "QQQ"), start=day, end=day):
         seen.append(symbol)
@@ -258,6 +276,121 @@ def test_named_sessions_keep_every_bar_unflagged(symbol: str, day: date):
     assert len(kept) == int((raw_days == day).sum())
     assert int(kept["bad_print"].sum()) == 0
     assert report.kept > 0
+
+
+def _bad_print_tape() -> tuple[pd.DataFrame, float, datetime, datetime]:
+    """History plus one spike at 10:20. Returns tape, peak high, 10:30, and 10:45."""
+    day = date(2024, 6, 12)
+    closes = np.full(78, 100.0)
+    raw = _session(day, closes, spike_at=10)
+    peak_high = 100.15
+    raw.loc[8, "high"] = peak_high
+    repaired, count = repair_bad_prints(raw, {("SPY", day): 2.0})
+    assert count == 1
+    history = []
+    for prior in sessions_between(date(2024, 5, 13), date(2024, 6, 11)):
+        prior_frame = _session(prior, np.full(78, 100.0))
+        prior_frame["high_unclamped"] = prior_frame["high"]
+        prior_frame["low_unclamped"] = prior_frame["low"]
+        prior_frame["bad_print"] = False
+        prior_frame["bad_print_visible_at"] = prior_frame["available_at"]
+        history.append(prior_frame)
+    tape = pd.concat(history + [repaired], ignore_index=True).sort_values("ts").reset_index(drop=True)
+    early = pd.Timestamp(raw["available_at"].iloc[11]).to_pydatetime()
+    late = pd.Timestamp(raw["available_at"].iloc[14]).to_pydatetime()
+    return tape, peak_high, early, late
+
+
+def _signal_cfg() -> SignalCfg:
+    return SignalCfg(
+        oscillator="rsi14_30_70",
+        rvol_min=1.5,
+        entry_tf="5m",
+        target="1R",
+        k_confirm=0,
+        variant_id="A-K3-rsi14_30_70-rvol1.5-5m-1R-k0",
+        test="A",
+    )
+
+
+def _level_key(level) -> tuple:
+    return (level.symbol, level.available_at, level.kind, round(level.price, 6))
+
+
+def _zone_key(zone) -> tuple:
+    return (
+        zone.symbol,
+        zone.available_at,
+        zone.side,
+        round(zone.low, 6),
+        round(zone.high, 6),
+        round(zone.score, 8),
+        zone.kinds,
+        tuple(sorted(zone.components.items())),
+    )
+
+
+def test_signals_levels_match_levels_at_at_every_15m_stamp(monkeypatch):
+    tape, _peak, _early, _late = _bad_print_tape()
+    bars = BarSet(tape)
+    cfg = EngineCfg(k_zones=3)
+    start = tape["available_at"].iloc[0].to_pydatetime()
+    end = tape["available_at"].iloc[-1].to_pydatetime()
+    seen: dict[datetime, list] = {}
+    zones_seen: dict[datetime, list] = {}
+    real_levels = _LevelTape.levels_at
+    real_zones = fast_zones
+
+    def spy_levels(self, cutoff, stamp):
+        found = real_levels(self, cutoff, stamp)
+        seen[stamp] = found
+        return found
+
+    def spy_zones(*args, **kwargs):
+        found = real_zones(*args, **kwargs)
+        zones_seen[kwargs["stamp"]] = found
+        return found
+
+    monkeypatch.setattr(_LevelTape, "levels_at", spy_levels)
+    signal_engine = importlib.import_module("research.intraday_sr.engine.signals")
+    monkeypatch.setattr(signal_engine, "fast_zones", spy_zones)
+    clear_zone_cache()
+    list(signals(bars, start, end, cfg, _signal_cfg()))
+    assert seen
+    assert set(seen) == set(zones_seen)
+    for stamp, used in seen.items():
+        direct = levels_at(bars, stamp, cfg)
+        assert [_level_key(level) for level in used] == [_level_key(level) for level in direct]
+        direct_zones = zones_at(bars, stamp, cfg)
+        assert sorted(_zone_key(zone) for zone in zones_seen[stamp]) == sorted(_zone_key(zone) for zone in direct_zones)
+
+
+def test_ten_thirty_stamp_hides_the_pivot_inside_signals(monkeypatch):
+    tape, peak_high, early, late = _bad_print_tape()
+    bars = BarSet(tape)
+    cfg = EngineCfg(k_zones=3)
+    start = tape["available_at"].iloc[0].to_pydatetime()
+    end = tape["available_at"].iloc[-1].to_pydatetime()
+    seen: dict[datetime, list] = {}
+    real_levels = _LevelTape.levels_at
+
+    def spy_levels(self, cutoff, stamp):
+        found = real_levels(self, cutoff, stamp)
+        seen[stamp] = found
+        return found
+
+    monkeypatch.setattr(_LevelTape, "levels_at", spy_levels)
+    clear_zone_cache()
+    list(signals(bars, start, end, cfg, _signal_cfg()))
+    assert early in seen and late in seen
+
+    def _near(levels, target: float) -> bool:
+        return any(abs(level.price - target) < 1e-3 and level.kind == "pivot_5m" for level in levels)
+
+    assert not _near(seen[early], peak_high)
+    assert not _near(levels_at(bars, early, cfg), peak_high)
+    assert _near(seen[late], peak_high)
+    assert _near(levels_at(bars, late, cfg), peak_high)
 
 
 def test_flag_census_for_amzn_spy_iwm():

@@ -60,6 +60,10 @@ PROFILE_SESSIONS = 5
 PROFILE_PERCENTILE = 0.70
 PROFILE_BIN_ATR = 0.05
 ZONE_PAD_ATR = 0.05
+# SPEC v1.3.3 locks. Fixed, not grid axes. They are not part of the
+# canonical grid document, so GRID_SHA256 stays on the v1.3.1 axes.
+MAX_ZONE_WIDTH_ATR = 1.0
+MIN_CLEARANCE_ATR = 0.10
 CANDIDATE_BAND_ATR = 2.0
 TOUCH_SESSIONS = 20
 RECENCY_HALF_LIFE_SESSIONS = 5.0

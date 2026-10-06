@@ -22,6 +22,7 @@ import pandas as pd
 
 from research.intraday_sr.data.resample import resample
 from research.intraday_sr.engine import formations_at, levels_at, signals, zones_at
+from research.intraday_sr.tests.test_badprint import _bad_print_tape
 from research.intraday_sr.grids import TEST_A
 from research.intraday_sr.tests.fixtures import FIXTURES, early_close_bars, trend_bars
 from research.intraday_sr.types import ET, BarSet, EngineCfg, SignalCfg
@@ -122,6 +123,16 @@ def test_nan_poison_after_t_b():
             for column in ("open", "high", "low", "close", "vwap"):
                 poisoned.loc[mask, column] = np.nan
             assert _same(_output(poisoned, as_of), expected)
+
+
+def test_truncation_invariance_with_a_bad_print():
+    """A clamp visible only at t+2 must not leak into an earlier as-of."""
+    frame, _peak, _early, _late = _bad_print_tape()
+    rng = np.random.default_rng(_SEED)
+    for as_of in _sample_times(frame, rng):
+        full = _output(frame, as_of)
+        truncated = frame.loc[frame["available_at"] <= as_of].reset_index(drop=True)
+        assert _same(_output(truncated, as_of), full)
 
 
 def test_gate_is_non_empty_on_the_long_trend():

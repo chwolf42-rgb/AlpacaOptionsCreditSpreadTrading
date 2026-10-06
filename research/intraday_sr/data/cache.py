@@ -63,6 +63,7 @@ class CleanReport:
     bad_prints: int
     flagged_rate: float
     review: bool
+    session_end_unchecked: int = 0
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,20 @@ def symbol_from_cache_name(name: str) -> str:
 
 
 def symbol_cache_path(cache_root: str | Path, symbol: str) -> Path:
-    return Path(cache_root) / f"{cache_filename(symbol)}.parquet"
+    """Resolve Trading's ``part_NNNN_<SYMBOL>.parquet`` for one symbol.
+
+    Only top-level files count. ``adj_factors/`` and a bare ``SPY.parquet``
+    are not matches. Exactly one file is required.
+    """
+    root = Path(cache_root)
+    name = cache_filename(symbol)
+    matches = sorted(path for path in root.glob(f"part_*_{name}.parquet") if path.is_file())
+    if len(matches) != 1:
+        found = ", ".join(path.name for path in matches) or "none"
+        raise FileNotFoundError(
+            f"{symbol}: expected exactly one part_*_{name}.parquet under {root}, found {len(matches)} ({found})"
+        )
+    return matches[0]
 
 
 def expected_bar_count(day: date) -> int | None:
@@ -317,6 +331,7 @@ def normalize_bars(
         frame["trades"] = 0
     atr = _atr_by_session(frame)
     frame, flagged = repair_bad_prints(frame, atr)
+    unchecked = int(frame.attrs.get("session_end_unchecked", 0))
     rate = flagged / len(frame) if len(frame) else 0.0
     session_days = [_as_session_date(value) for value in frame["session"].tolist()]
     frame["session"] = np.asarray(
@@ -342,6 +357,7 @@ def normalize_bars(
         bad_prints=flagged,
         flagged_rate=rate,
         review=rate > 0.001,
+        session_end_unchecked=unchecked,
     )
     return frame, report
 
