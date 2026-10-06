@@ -6,8 +6,8 @@ from research.intraday_sr.engine.version import engine_stamp
 from research.intraday_sr.grids import GRID_SHA256
 
 
-def test_engine_stamp_names_v1_3_3():
-    assert engine_stamp() == {"engine_spec": "v1.3.3"}
+def test_engine_stamp_names_v1_3_5():
+    assert engine_stamp() == {"engine_spec": "v1.3.5"}
 
 
 def test_grid_hash_stays_on_v1_3_1():

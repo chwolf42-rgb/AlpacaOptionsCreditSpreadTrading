@@ -1,9 +1,13 @@
-"""Test A signal stack.
+"""Test A, Test B, and formation-only signal stacks.
 
-The hold and the re-confirmation entry are mandatory. ``k_confirm`` is how
-many of the three optional conditions (oscillator, MACD, RVOL) must also
-hold. Test B and the formation-only tests stay empty until D2-4 fills
-``formations_at``.
+The hold and the re-confirmation entry are mandatory for Test A.
+``k_confirm`` is how many of the three optional conditions (oscillator,
+MACD, RVOL) must also hold. Test B keeps conditions 1–5 with that same
+``k_confirm`` rule and replaces step 6 with the F8 neckline retest.
+``F_W``, ``F_IHS``, ``F_M``, and ``F_HS`` are the formation trigger alone.
+
+spec_doc v1.3.5 (8504fd7c19136141a32746234b63dd084106369d).
+engine_spec v1.3.5.
 
 Stops are derived from the clamped zone and the pullback. Whether a later
 bar trades through that stop is the harness's job, and it uses the
@@ -20,7 +24,7 @@ snapshot at ``as_of``; the stable id is internal.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from typing import Iterator
 
@@ -48,8 +52,9 @@ from research.intraday_sr.engine.zone_cache import (
     tape_token,
     zone_cfg_token,
 )
-from research.intraday_sr.engine.zones import fast_zones
-from research.intraday_sr.types import ET, BarSet, EngineCfg, Signal, SignalCfg, Zone, as_et
+from research.intraday_sr.engine.formations import FormationStats, formations_at
+from research.intraday_sr.engine.zones import _cfg_id, fast_zones
+from research.intraday_sr.types import ET, BarSet, EngineCfg, Formation, Signal, SignalCfg, Zone, as_et
 
 
 class _ZoneSetup:
@@ -192,6 +197,12 @@ class SignalFunnel:
     emits: int = 0
     build_fail_no_ahead_zone: int = 0
     build_fail_zone_lt_1R: int = 0
+    # Formation detector, for tests B and F_*. Test A leaves these at 0.
+    # ``emits`` is the emitted-signal count for every test.
+    candidates: int = 0
+    broken: int = 0
+    invalidated: int = 0
+    retest: int = 0
 
 
 def signals_funnel(
@@ -201,7 +212,11 @@ def signals_funnel(
     cfg: EngineCfg,
     sig: SignalCfg,
 ) -> SignalFunnel:
-    """Run Test A and return the touch → hold → arm → emit counts."""
+    """Run ``sig.test`` and return the funnel counts.
+
+    Test A fills touch, hold, arm, and emit. Test B and ``F_*`` fill
+    ``candidates``, ``broken``, ``invalidated``, ``retest``, and ``emits``.
+    """
     funnel = SignalFunnel()
     list(signals(bars, start, end, cfg, sig, funnel=funnel))
     return funnel
@@ -215,9 +230,14 @@ def signals(
     sig: SignalCfg,
     funnel: SignalFunnel | None = None,
 ) -> Iterator[Signal]:
-    """Armed Test A entries whose ``available_at`` is inside ``[start, end]``."""
+    """Armed entries whose ``available_at`` is inside ``[start, end]``.
+
+    ``sig.test`` selects Test A, Test B, or one formation kind
+    (``F_W``, ``F_IHS``, ``F_M``, ``F_HS``). Formation tolerance is
+    ``sig.pivot_tol_atr`` (FORMATIONS grid key). Test B forces 0.25.
+    """
     if sig.test != "A":
-        return iter(())
+        return _signals_fb(bars, start, end, cfg, sig, funnel)
     visible = bars.visible(end)
     if visible.empty or "symbol" not in visible.columns:
         return iter(())
@@ -1105,3 +1125,476 @@ def _as_dt(value) -> datetime:
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()
     return value
+
+
+_FORMATION_KIND = {"F_W": "W", "F_IHS": "IHS", "F_M": "M", "F_HS": "HS"}
+
+
+def _signals_fb(
+    bars: BarSet,
+    start: datetime,
+    end: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    funnel: SignalFunnel | None,
+):
+    """Test B and formation-only entries. Test A does not call this."""
+    if sig.test not in ("B", "F_W", "F_IHS", "F_M", "F_HS"):
+        return iter(())
+    visible = bars.visible(end)
+    if visible.empty or "symbol" not in visible.columns:
+        return iter(())
+    clamped = prices_as_of(visible, end)
+    raw = _entry_prices(visible)
+    start_at = as_et(start, "start")
+    end_at = as_et(end, "end")
+    tol = float(cfg.formation_pivot_tol if sig.test == "B" else sig.pivot_tol_atr)
+    kind = None if sig.test == "B" else _FORMATION_KIND[sig.test]
+    cache_key = None
+    if funnel is None:
+        cache_key = (
+            "v1.3.5-fb",
+            tape_token(clamped),
+            start_at,
+            end_at,
+            zone_cfg_token(cfg),
+            sig.variant_id,
+            sig.target,
+            int(sig.k_confirm),
+            sig.entry_tf,
+            sig.oscillator,
+            float(sig.rvol_min),
+            sig.test,
+            tol,
+        )
+        hit = cached_signals(cache_key)
+        if hit is not None:
+            return iter(hit)
+        release_oversized_signals()
+    detector_stats = FormationStats()
+    patterns = formations_at(
+        bars,
+        end_at,
+        cfg,
+        tol,
+        tf=sig.entry_tf,
+        kind=kind,
+        stats=detector_stats,
+    )
+    if funnel is not None:
+        funnel.candidates += detector_stats.candidates
+        funnel.broken += detector_stats.broken
+        funnel.invalidated += detector_stats.invalidated
+        funnel.retest += detector_stats.retest
+    by_symbol: dict[str, list[Formation]] = {}
+    for formed in patterns:
+        if formed.retest_ts is None:
+            continue
+        by_symbol.setdefault(formed.symbol, []).append(formed)
+    found: list[Signal] = []
+    source_ptr = _open_ptr(clamped) if len(clamped) and "open" in clamped.columns else 0
+    raw_groups = {symbol: group for symbol, group in _symbol_frames(raw)}
+    for symbol, group in _symbol_frames(clamped):
+        entry = raw_groups.get(symbol)
+        if entry is None or entry.empty:
+            continue
+        prep = _ensure_prep(symbol, group, entry, end_at, cfg, sig, source_ptr)
+        if prep is None or not prep.available:
+            continue
+        found.extend(
+            _emit_fb(
+                prep,
+                by_symbol.get(symbol, []),
+                start_at,
+                end_at,
+                cfg,
+                sig,
+                funnel,
+            )
+        )
+    found.sort(key=lambda item: (item.available_at, item.symbol, -item.zone.score, item.zone.zone_id))
+    if funnel is not None:
+        funnel.emits += len(found)
+    elif cache_key is not None:
+        store_signals(cache_key, found)
+    return iter(found)
+
+
+def _emit_fb(prep, patterns: list[Formation], start, end, cfg: EngineCfg, sig: SignalCfg, funnel: SignalFunnel | None) -> list[Signal]:
+    if not patterns:
+        return []
+    avail = [as_et(stamp, "available_at") for stamp in prep.available]
+    index_of = {stamp: index for index, stamp in enumerate(avail)}
+    width = prep.width
+    opens = [as_et(_as_dt(stamp), "ts") for stamp in _entry_opens(prep, sig.entry_tf)]
+    if len(opens) != len(avail):
+        opens = [stamp - width for stamp in avail]
+    retest_at: dict[datetime, list[Formation]] = {}
+    touch_at: dict[datetime, list[Formation]] = {}
+    for formed in patterns:
+        retest = as_et(formed.retest_ts, "retest_ts") if formed.retest_ts is not None else None
+        if retest is None or retest not in index_of:
+            continue
+        retest_at.setdefault(retest, []).append(formed)
+        touch_at.setdefault(as_et(formed.pivots[-1][0], "pivot"), []).append(formed)
+    # stable_id -> zones touched by a formation's last pivot, plus the hold bar.
+    armed: dict[str, list[tuple[str, Zone, int]]] = {}
+    out: list[Signal] = []
+    warmup = datetime.fromisoformat(str(cfg.warmup_date)).date()
+    plan = prep.plan
+    segments = prep.segments
+    history = prep.history
+    zones_key_cfg = zone_cfg_token(cfg)
+    levels_key_cfg = level_cfg_token(cfg)
+    current_key = None
+    current_zones: list[Zone] = []
+    current_ids: list[str] = []
+    tracked_day = None
+    previous_book: list[_StableZone] = []
+    setups: dict[str, _ZoneSetup] = {}
+    cutoff_cursor = 0
+    tape_avail = prep.tape_avail
+    for index, stamp in enumerate(avail):
+        if prep.sessions[index] < warmup:
+            continue
+        if stamp.astimezone(ET).time() > time(15, 0):
+            continue
+        recompute = floor_15m(stamp, prep.sessions[index])
+        if recompute is None:
+            continue
+        if recompute != current_key:
+            current_key = recompute
+            current_zones, current_ids, tracked_day, previous_book, setups, cutoff_cursor = _book_at(
+                prep,
+                index,
+                recompute,
+                cfg,
+                sig,
+                plan,
+                segments,
+                history,
+                zones_key_cfg,
+                levels_key_cfg,
+                tape_avail,
+                cutoff_cursor,
+                tracked_day,
+                previous_book,
+                setups,
+            )
+        bar_open = opens[index]
+        if sig.test == "B" and bar_open in touch_at:
+            _remember_touches(
+                armed,
+                touch_at[bar_open],
+                index,
+                current_zones,
+                current_ids,
+                prep,
+                cfg,
+            )
+        if stamp < start or stamp > end or stamp not in retest_at:
+            continue
+        for formed in retest_at[stamp]:
+            built = _signals_from_formation(
+                formed,
+                index,
+                index_of,
+                current_zones,
+                current_ids,
+                armed,
+                prep,
+                cfg,
+                sig,
+            )
+            for signal, reason in built:
+                if funnel is not None and reason == "no_ahead":
+                    funnel.build_fail_no_ahead_zone += 1
+                elif funnel is not None and reason == "zone_lt_1r":
+                    funnel.build_fail_zone_lt_1R += 1
+                if signal is not None:
+                    out.append(signal)
+    return out
+
+
+def _entry_opens(prep, tf: str) -> list:
+    """Bar opens aligned with ``prep.available``. Falls back to close minus width."""
+    frame = prep.plan.frame
+    if tf != "5m":
+        built = timeframe_frame(frame, tf)
+        if built is None:
+            return []
+        frame = built
+    if "ts" not in frame.columns:
+        return []
+    if len(frame) > 1 and not frame["ts"].is_monotonic_increasing:
+        frame = frame.sort_values("ts")
+    if frame["available_at"].iloc[-1] > prep.available[-1] or not frame["available_at"].is_monotonic_increasing:
+        frame = frame.loc[frame["available_at"] <= prep.available[-1]]
+    return list(frame["ts"])
+
+
+def _book_at(
+    prep,
+    index: int,
+    recompute: datetime,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    plan,
+    segments,
+    history,
+    zones_key_cfg: str,
+    levels_key_cfg: str,
+    tape_avail,
+    cutoff_cursor: int,
+    tracked_day,
+    previous_book,
+    setups,
+):
+    current_day = prep.sessions[index]
+    atr = plan.atr_by_day.get(current_day)
+    if atr is None:
+        atr = _atr_from_segments(segments, recompute, int(cfg.atr_length))
+    if atr is None:
+        zones: list[Zone] = []
+    else:
+        while cutoff_cursor < len(tape_avail) and tape_avail[cutoff_cursor] <= recompute:
+            cutoff_cursor += 1
+        cutoff = cutoff_cursor
+        if cutoff == 0:
+            zones = []
+        else:
+            origin = prep.ordered_days[max(0, prep.day_pos[current_day] - int(cfg.touch_sessions))]
+            begin = prep.first_of_day[origin]
+            sl = slice(begin, cutoff)
+            ages = prep.day_index[current_day] - prep.session_ord[begin:cutoff]
+            digest = prefix_digest(history, cutoff - 1)
+            level_key = (digest, prep.symbol, recompute, levels_key_cfg)
+            zone_key = (digest, prep.symbol, sig.entry_tf, recompute, zones_key_cfg)
+
+            def build_zones(
+                symbol=prep.symbol,
+                cutoff=cutoff,
+                recompute=recompute,
+                atr=atr,
+                sl=sl,
+                ages=ages,
+                level_key=level_key,
+                begin=begin,
+                origin=origin,
+            ):
+                live = cached_levels(level_key, lambda: plan.pack(plan.levels_at(cutoff, recompute)))
+                touch_low, touch_high = plan.asof_high_low(begin, cutoff, recompute)
+                return fast_zones(
+                    live,
+                    symbol=symbol,
+                    lows=touch_low,
+                    highs=touch_high,
+                    opens=prep.tape_open[sl],
+                    closes=prep.tape_close[sl],
+                    volume=prep.tape_volume[sl],
+                    ages=ages,
+                    last_close=float(prep.tape_close[cutoff - 1]),
+                    atr=float(atr),
+                    stamp=recompute,
+                    cfg=cfg,
+                    pivot_not_before=origin,
+                )
+
+            zones = cached_zones(zone_key, build_zones)
+    tracked_day, previous_book, setups, ids = _book_for_recompute(
+        current_day,
+        tracked_day,
+        previous_book,
+        setups,
+        zones,
+    )
+    return zones, ids, tracked_day, previous_book, setups, cutoff_cursor
+
+
+def _remember_touches(armed, formed_list, index: int, zones, ids, prep, cfg: EngineCfg) -> None:
+    if not zones:
+        return
+    window = int(cfg.touch_window_bars)
+    for formed in formed_list:
+        side = "support" if formed.kind in ("W", "IHS") else "resistance"
+        saved = armed.setdefault(formed.formation_id, [])
+        seen = {item[0] for item in saved}
+        for zone, sid in zip(zones, ids):
+            if sid in seen or zone.side != side:
+                continue
+            if not _is_touch(index, zone, prep.lows, prep.highs, prep.closes):
+                continue
+            rc = _hold_index(index, zone, prep.opens, prep.highs, prep.lows, prep.closes, window)
+            if rc is None:
+                continue
+            saved.append((sid, zone, index, rc))
+            seen.add(sid)
+
+
+def _signals_from_formation(formed, index, index_of, zones, ids, armed, prep, cfg: EngineCfg, sig: SignalCfg):
+    """Zero or more ``(signal, reason)`` rows. ``reason`` is set when a zone target is skipped."""
+    direction = 1 if formed.kind in ("W", "IHS") else -1
+    break_index = index_of.get(as_et(formed.break_ts, "break_ts"))
+    if break_index is None:
+        return []
+    atr = prep.plan.atr_by_day.get(prep.sessions[index])
+    if atr is None or not np.isfinite(atr) or atr <= 0.0:
+        return []
+    atr = float(atr)
+    if sig.test == "B":
+        touches = armed.get(formed.formation_id) or []
+        if not touches:
+            return []
+        live = {sid: zone for zone, sid in zip(zones, ids)}
+        built = []
+        for sid, touched, touch_index, rc in touches:
+            zone = live.get(sid, touched)
+            flags = _optional_flags(
+                touch_index,
+                rc,
+                index,
+                touched,
+                prep.osc,
+                prep.hist,
+                prep.macd_line,
+                prep.macd_signal,
+                prep.volume_ratio,
+                prep.oversold,
+                prep.overbought,
+                sig.rvol_min,
+            )
+            if sum(flags.values()) < int(sig.k_confirm):
+                continue
+            built.append(
+                _formation_signal(
+                    formed,
+                    zone,
+                    direction,
+                    index,
+                    atr,
+                    prep,
+                    cfg,
+                    sig,
+                    flags,
+                    zones,
+                    pattern_and_zone=True,
+                )
+            )
+        return built
+    zone = _anchor_zone(formed, direction, atr, prep.available[index], cfg, sig.entry_tf)
+    flags = {"oscillator": 0.0, "macd": 0.0, "rvol": 0.0}
+    return [
+        _formation_signal(
+            formed,
+            zone,
+            direction,
+            index,
+            atr,
+            prep,
+            cfg,
+            sig,
+            flags,
+            zones,
+            pattern_and_zone=False,
+        )
+    ]
+
+
+def _anchor_zone(formed: Formation, direction: int, atr: float, stamp, cfg: EngineCfg, tf: str) -> Zone:
+    """Placeholder so a formation-only signal satisfies ``Signal.zone``.
+
+    ``Formation.zone_id`` stays ``None``. The price is the pattern extreme.
+    The zone target still comes from the real zone book.
+    """
+    price = float(formed.extreme[1])
+    side = "support" if direction == 1 else "resistance"
+    when = as_et(_as_dt(stamp), "available_at")
+    return Zone(
+        symbol=formed.symbol,
+        low=price,
+        high=price,
+        side=side,
+        score=0.0,
+        components={},
+        kinds=("formation",),
+        as_of_ts=when,
+        valid_from_ts=when,
+        available_at=when,
+        engine_cfg=_cfg_id(cfg),
+        tf=tf,
+        atr_d=float(atr),
+    )
+
+
+def _formation_signal(
+    formed: Formation,
+    zone: Zone,
+    direction: int,
+    index: int,
+    atr: float,
+    prep,
+    cfg: EngineCfg,
+    sig: SignalCfg,
+    flags,
+    zones,
+    *,
+    pattern_and_zone: bool,
+):
+    offset = _adjusted_offset(cfg, float(prep.factors[index]))
+    extreme = float(formed.extreme[1])
+    if direction == 1:
+        trigger = float(prep.highs[index]) + offset
+        anchor = min(float(zone.low), extreme) if pattern_and_zone else extreme
+        natural = anchor - float(cfg.stop_buffer_atr) * atr
+        floor = trigger - float(cfg.stop_floor_atr) * atr
+        stop = min(natural, floor)
+        risk = trigger - stop
+        ahead = [float(item.low) for item in zones if item.side == "resistance" and float(item.low) > trigger]
+        target_zone = min(ahead) if ahead else None
+        one_r = trigger + risk
+        two_r = trigger + 2.0 * risk
+        room = None if target_zone is None else target_zone - trigger
+    else:
+        trigger = float(prep.lows[index]) - offset
+        anchor = max(float(zone.high), extreme) if pattern_and_zone else extreme
+        natural = anchor + float(cfg.stop_buffer_atr) * atr
+        floor = trigger + float(cfg.stop_floor_atr) * atr
+        stop = max(natural, floor)
+        risk = stop - trigger
+        ahead = [float(item.high) for item in zones if item.side == "support" and float(item.high) < trigger]
+        target_zone = max(ahead) if ahead else None
+        one_r = trigger - risk
+        two_r = trigger - 2.0 * risk
+        room = None if target_zone is None else trigger - target_zone
+    if risk <= 0.0 or not np.isfinite(risk):
+        return None, None
+    if sig.target == "zone":
+        if target_zone is None:
+            return None, "no_ahead"
+        if room < risk:
+            return None, "zone_lt_1r"
+    targets = {"1R": one_r, "2R": two_r}
+    if target_zone is not None:
+        targets["zone"] = float(target_zone)
+    linked = replace(formed, zone_id=zone.zone_id) if pattern_and_zone else formed
+    if linked.retest_ts is None:
+        linked = replace(linked, retest_ts=as_et(prep.available[index], "retest_ts"))
+    count = int(sum(flags.values()))
+    signal = Signal(
+        symbol=formed.symbol,
+        tf=sig.entry_tf,
+        direction=direction,
+        test=sig.test,
+        zone=zone,
+        formation=linked,
+        trigger=trigger,
+        stop=stop,
+        targets=targets,
+        expires_at=as_et(prep.available[index], "available_at") + int(cfg.formation_retest_bars) * prep.width,
+        components=flags,
+        as_of_ts=as_et(prep.available[index], "available_at"),
+        available_at=as_et(prep.available[index], "available_at"),
+        variant_id=sig.variant_id,
+        confluence=count,
+    )
+    return signal, None

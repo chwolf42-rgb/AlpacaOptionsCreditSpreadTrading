@@ -652,6 +652,15 @@ class EngineCfg:
     formation_pivot_gap_max: int = _grids.FORMATION_PIVOT_GAP_MAX
     shoulder_atr: float = _grids.SHOULDER_ATR
     hvn_rejection_wick: float = _grids.HVN_REJECTION_WICK
+    # v1.3.5 formation constants. ClassVars stay out of asdict and GRID_SHA256.
+    # ``formation_pivot_tol`` is the default; FORMATIONS rows select
+    # ``SignalCfg.pivot_tol_atr`` from ``formation_pivot_tol_grid``.
+    formation_break_bars: ClassVar[int] = 60
+    formation_head_margin_atr: ClassVar[float] = 0.10
+    formation_retest_bars: ClassVar[int] = 6
+    formation_retest_tol_atr: ClassVar[float] = 0.10
+    formation_pivot_tol: ClassVar[float] = 0.25
+    formation_pivot_tol_grid: ClassVar[tuple[float, float]] = (0.15, 0.25)
 
     def __post_init__(self) -> None:
         if self.k_zones not in (3, 5):
@@ -672,11 +681,16 @@ class SignalCfg:
     k_confirm: int
     variant_id: str
     test: TestName = "A"
+    # FORMATIONS grid key. Test B forces 0.25. Test A does not read it.
+    pivot_tol_atr: float = 0.25
 
     def __post_init__(self) -> None:
         if self.k_confirm not in (0, 1, 2, 3):
             raise ValueError("k_confirm must be 0, 1, 2, or 3")
         object.__setattr__(self, "rvol_min", float(self.rvol_min))
+        object.__setattr__(self, "pivot_tol_atr", float(self.pivot_tol_atr))
+        if not math.isfinite(self.pivot_tol_atr) or self.pivot_tol_atr <= 0.0:
+            raise ValueError("pivot_tol_atr must be finite and > 0")
 
 
 def nearest_zones_at(
